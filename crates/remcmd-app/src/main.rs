@@ -88,44 +88,27 @@ impl Render for RemCmdApp {
 
 impl RemCmdApp {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut sidebar = div().w(px(300.0)).h_full().p_4().bg(rgb(0x1b1f2a)).child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child("Connections")
-                .child(
-                    div()
-                        .id("add-connection")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(rgb(0x3b82f6))
-                        .cursor_pointer()
-                        .child("Add")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.add_profile(cx);
-                        })),
-                ),
-        );
+        let mut connection_list = div()
+            .id("connection_list")
+            .flex_1()
+            .overflow_y_scroll()
+            .mt_3();
 
         for profile in &self.profiles {
             let profile_id = profile.id.clone();
             let is_selected = self.selected_profile_id.as_ref() == Some(&profile.id);
 
-            let bg_color = if is_selected {
-                rgb(0x334155)
-            } else {
-                rgb(0x252b38)
-            };
-
-            sidebar = sidebar.child(
+            connection_list = connection_list.child(
                 div()
-                    .id(SharedString::from(format!("profile-{}", profile_id)))
-                    .mt_3()
+                    .id(SharedString::from(format!("profile-{}", profile.id)))
+                    .mb_2()
                     .p_3()
                     .rounded_md()
-                    .bg(bg_color)
+                    .bg(if is_selected {
+                        rgb(0x334155)
+                    } else {
+                        rgb(0x252b38)
+                    })
                     .cursor_pointer()
                     .child(profile.name.clone())
                     .child(profile.address())
@@ -135,7 +118,35 @@ impl RemCmdApp {
             );
         }
 
-        sidebar
+        div()
+            .flex()
+            .flex_col()
+            .w(px(300.0))
+            .h_full()
+            .p_4()
+            .bg(rgb(0x1b1f2a))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .flex_none()
+                    .child("Connections")
+                    .child(
+                        div()
+                            .id("add_connection")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x3b82f6))
+                            .cursor_pointer()
+                            .child("Add")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.add_profile(cx);
+                            })),
+                    ),
+            )
+            .child(connection_list)
     }
 
     fn render_detail_panel(
