@@ -31,7 +31,7 @@ impl RemCmdApp {
         let profile = ConnectionProfile::new(
             format!("demo-{number}"),
             format!("Demo Server {number}"),
-            format!("192.168.1.{number}"),
+            format!("demo-{number}.example.com"),
             22,
             "ubuntu",
         );
