@@ -8,13 +8,30 @@ pub struct ConnectionProfile {
 }
 
 impl ConnectionProfile {
-    pub fn sample() -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+    ) -> Self {
         Self {
-            id: "local-dev".into(),
-            name: "Local Dev".into(),
-            host: "127.0.0.1".into(),
-            port: 22,
-            username: "dev".into(),
+            id: id.into(),
+            name: name.into(),
+            host: host.into(),
+            port: port,
+            username: username.into(),
         }
+    }
+
+    pub fn samples() -> Vec<Self> {
+        vec![
+            Self::new("local-dev", "Local Dev", "127.0.0.1", 22, "dev"),
+            Self::new("staging", "Staging", "192.168.1.10", 22, "ubuntu"),
+        ]
+    }
+
+    pub fn address(&self) -> String {
+        format!("{}@{}:{}", self.username, self.host, self.port)
     }
 }
