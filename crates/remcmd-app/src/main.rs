@@ -44,7 +44,7 @@ impl RemCmdApp {
     }
 
     fn delete_selected_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(selected_id) = self.selected_profile_id.clone() else {
+        let Some(selected_id) = self.selected_profile_id.as_deref() else {
             return;
         };
 
@@ -53,10 +53,12 @@ impl RemCmdApp {
             .iter()
             .position(|profile| profile.id == selected_id)
         else {
+            self.selected_profile_id = None;
+            cx.notify();
             return;
         };
 
-        self.profiles.retain(|profile| profile.id != selected_id);
+        self.profiles.remove(selected_index);
 
         self.selected_profile_id = if self.profiles.is_empty() {
             None
