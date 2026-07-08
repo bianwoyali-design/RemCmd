@@ -19,7 +19,7 @@ impl ConnectionProfile {
             id: id.into(),
             name: name.into(),
             host: host.into(),
-            port: port,
+            port,
             username: username.into(),
         }
     }
