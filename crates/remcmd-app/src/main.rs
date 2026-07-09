@@ -390,7 +390,12 @@ fn main() {
 
                     let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
 
-                    let next_profile_number = profiles.len() + 1;
+                    let next_profile_number = profiles
+                        .iter()
+                        .filter_map(|profile| profile.id.strip_prefix("demo-")?.parse::<usize>().ok())
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
 
                     let mut app = RemCmdApp {
                         profiles,
