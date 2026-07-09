@@ -403,7 +403,7 @@ impl EntityInputHandler for TextField {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(line_point.x)?;
 
         Some(self.offset_to_utf16(utf8_index))
     }
