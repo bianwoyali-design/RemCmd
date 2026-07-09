@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowOptions,
-    div, px, rgb, size,
+    App, Application, Bounds, Context, IntoElement, Render, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, px, rgb, rgba, size,
 };
 use gpui::{SharedString, prelude::*};
 use remcmd_core::ConnectionProfile;
@@ -79,7 +79,7 @@ impl Render for RemCmdApp {
         div()
             .flex()
             .size_full()
-            .bg(rgb(0x111318))
+            .bg(rgba(0x18181880))
             .text_color(rgb(0xf4f4f5))
             .child(self.render_sidebar(cx))
             .child(self.render_detail_panel(selected_profile, cx))
@@ -98,24 +98,28 @@ impl RemCmdApp {
             let profile_id = profile.id.clone();
             let is_selected = self.selected_profile_id.as_ref() == Some(&profile.id);
 
-            connection_list = connection_list.child(
-                div()
-                    .id(SharedString::from(format!("profile-{}", profile.id)))
-                    .mb_2()
-                    .p_3()
-                    .rounded_md()
-                    .bg(if is_selected {
-                        rgb(0x334155)
-                    } else {
-                        rgb(0x252b38)
-                    })
-                    .cursor_pointer()
-                    .child(profile.name.clone())
-                    .child(profile.address())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_profile(profile_id.clone(), cx);
-                    })),
-            );
+            let mut profile_item = div()
+                .id(SharedString::from(format!("profile-{}", profile.id)))
+                .mb_2()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgba(0xffffff00))
+                .cursor_pointer()
+                .hover(|this| this.bg(rgba(0xd0d0d033)).border_color(rgba(0xe0e0e080)))
+                .child(profile.name.clone())
+                .child(profile.address())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_profile(profile_id.clone(), cx);
+                }));
+
+            if is_selected {
+                profile_item = profile_item
+                    .bg(rgba(0xd0d0d033))
+                    .border_color(rgba(0xe0e0e080));
+            }
+
+            connection_list = connection_list.child(profile_item);
         }
 
         div()
@@ -123,8 +127,10 @@ impl RemCmdApp {
             .flex_col()
             .w(px(300.0))
             .h_full()
-            .p_4()
-            .bg(rgb(0x1b1f2a))
+            .bg(rgba(0x18181833))
+            .px_4()
+            .pb_4()
+            .pt(px(52.0))
             .child(
                 div()
                     .flex()
@@ -154,7 +160,15 @@ impl RemCmdApp {
         selected_profile: Option<ConnectionProfile>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut panel = div().flex_1().h_full().p_4();
+        let mut panel = div()
+            .flex_1()
+            .h_full()
+            .px_4()
+            .pb_4()
+            .pt(px(52.0))
+            .bg(rgb(0x181818))
+            .border_l_1()
+            .border_color(rgba(0xffffff2e));
 
         match selected_profile {
             Some(profile) => {
@@ -204,6 +218,11 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_background: WindowBackgroundAppearance::Blurred,
+                titlebar: Some(TitlebarOptions {
+                    appears_transparent: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             |_, cx| {
