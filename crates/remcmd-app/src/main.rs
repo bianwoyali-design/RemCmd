@@ -38,10 +38,7 @@ impl RemCmdApp {
 
     fn persist_profiles(&mut self) {
         if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
-            self.form_error = Some(format!(
-                "Failed to save profiles:
-            {error}"
-            ));
+            self.form_error = Some(format!("Failed to save profiles:\n{error}"));
         }
     }
 
