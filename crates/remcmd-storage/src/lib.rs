@@ -8,11 +8,7 @@ use remcmd_core::ConnectionProfile;
 
 pub fn default_profiles_path() -> io::Result<PathBuf> {
     let project_dirs = ProjectDirs::from("", "", "RemCmd").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "app
-              data directory not found",
-        )
+        io::Error::new(io::ErrorKind::NotFound, "app data directory not found")
     })?;
 
     Ok(project_dirs.data_dir().join("profiles.json"))
