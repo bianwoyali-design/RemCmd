@@ -48,7 +48,6 @@ pub fn save_profiles(path: &Path, profiles: &[ConnectionProfile]) -> io::Result<
     }
 
     let content = serde_json::to_string_pretty(profiles)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
     fs::write(path, content)
 }
