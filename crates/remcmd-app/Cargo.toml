@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 gpui.workspace = true
 remcmd-core.workspace = true
+unicode-segmentation = "1"
