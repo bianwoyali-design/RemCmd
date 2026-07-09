@@ -1,14 +1,16 @@
 mod text_field;
-
-use gpui::Entity;
-use gpui::{
-    App, Application, Bounds, Context, IntoElement, Render, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, px, rgb, rgba, size,
-};
-use gpui::{SharedString, prelude::*};
-use remcmd_core::ConnectionProfile;
-
 use text_field::{TextField, bind_text_field_keys};
+
+use std::path::PathBuf;
+
+use gpui::{
+    App, Application, Bounds, Context, Entity, IntoElement, Render, SharedString, TitlebarOptions,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
+    rgba, size,
+};
+
+use remcmd_core::ConnectionProfile;
+use remcmd_storage::{default_profiles_path, ensure_profiles_file, load_profiles, save_profiles};
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -16,6 +18,7 @@ struct RemCmdApp {
     next_profile_number: usize,
     editor: Option<ProfileEditor>,
     form_error: Option<String>,
+    profiles_path: PathBuf,
 }
 
 impl RemCmdApp {
@@ -31,6 +34,12 @@ impl RemCmdApp {
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
         cx.notify();
+    }
+
+    fn persist_profiles(&mut self) {
+        if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
+            self.form_error = Some(format!("Failed to save profiles:\n{error}"));
+        }
     }
 
     fn add_profile(&mut self, cx: &mut Context<Self>) {
@@ -49,6 +58,7 @@ impl RemCmdApp {
         self.next_profile_number += 1;
 
         self.load_editor_for_selected_profile(cx);
+        self.persist_profiles();
 
         cx.notify();
     }
@@ -79,6 +89,7 @@ impl RemCmdApp {
         };
 
         self.load_editor_for_selected_profile(cx);
+        self.persist_profiles();
 
         cx.notify();
     }
@@ -134,6 +145,8 @@ impl RemCmdApp {
         }
 
         self.form_error = None;
+        self.persist_profiles();
+
         cx.notify();
     }
 
@@ -362,12 +375,37 @@ fn main() {
             },
             |_, cx| {
                 cx.new(|cx| {
+                    let profiles_path =
+                        default_profiles_path().expect("failed to resolve profiles path");
+
+                    let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
+                        .and_then(|_| load_profiles(&profiles_path))
+                    {
+                        Ok(profiles) => (profiles, None),
+                        Err(error) => (
+                            Vec::new(),
+                            Some(format!("Failed to load profiles: {error}")),
+                        ),
+                    };
+
+                    let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
+
+                    let next_profile_number = profiles
+                        .iter()
+                        .filter_map(|profile| {
+                            profile.id.strip_prefix("demo-")?.parse::<usize>().ok()
+                        })
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+
                     let mut app = RemCmdApp {
-                        profiles: ConnectionProfile::samples(),
-                        selected_profile_id: Some("local-dev".into()),
-                        next_profile_number: 3,
+                        profiles,
+                        profiles_path,
+                        selected_profile_id,
+                        next_profile_number,
                         editor: None,
-                        form_error: None,
+                        form_error,
                     };
 
                     app.load_editor_for_selected_profile(cx);
