@@ -7,9 +7,8 @@ use directories::ProjectDirs;
 use remcmd_core::ConnectionProfile;
 
 pub fn default_profiles_path() -> io::Result<PathBuf> {
-    let project_dirs = ProjectDirs::from("", "", "RemCmd").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "app data directory not found")
-    })?;
+    let project_dirs = ProjectDirs::from("", "", "RemCmd")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "app data directory not found"))?;
 
     Ok(project_dirs.data_dir().join("profiles.json"))
 }
@@ -47,7 +46,6 @@ pub fn save_profiles(path: &Path, profiles: &[ConnectionProfile]) -> io::Result<
         fs::create_dir_all(parent)?;
     }
 
-    let content = serde_json::to_string_pretty(profiles)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let content = serde_json::to_string_pretty(profiles).map_err(io::Error::other)?;
     fs::write(path, content)
 }

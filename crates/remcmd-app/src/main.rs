@@ -392,7 +392,9 @@ fn main() {
 
                     let next_profile_number = profiles
                         .iter()
-                        .filter_map(|profile| profile.id.strip_prefix("demo-")?.parse::<usize>().ok())
+                        .filter_map(|profile| {
+                            profile.id.strip_prefix("demo-")?.parse::<usize>().ok()
+                        })
                         .max()
                         .unwrap_or(0)
                         + 1;
