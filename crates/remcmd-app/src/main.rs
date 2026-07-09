@@ -381,16 +381,15 @@ fn main() {
                     let profiles_path =
                         default_profiles_path().expect("failed to resolve profiles path");
 
-                    let (profiles, form_error) =
-                        match ensure_profiles_file(&profiles_path)
-                            .and_then(|_| load_profiles(&profiles_path))
-                        {
-                            Ok(profiles) => (profiles, None),
-                            Err(error) => (
-                                Vec::new(),
-                                Some(format!("Failed to load profiles: {error}")),
-                            ),
-                        };
+                    let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
+                        .and_then(|_| load_profiles(&profiles_path))
+                    {
+                        Ok(profiles) => (profiles, None),
+                        Err(error) => (
+                            Vec::new(),
+                            Some(format!("Failed to load profiles: {error}")),
+                        ),
+                    };
 
                     let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
 
