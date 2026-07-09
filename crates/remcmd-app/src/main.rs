@@ -1,3 +1,6 @@
+mod text_field;
+
+use gpui::Entity;
 use gpui::{
     App, Application, Bounds, Context, IntoElement, Render, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, div, px, rgb, rgba, size,
@@ -5,10 +8,14 @@ use gpui::{
 use gpui::{SharedString, prelude::*};
 use remcmd_core::ConnectionProfile;
 
+use text_field::{TextField, bind_text_field_keys};
+
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
     selected_profile_id: Option<String>,
     next_profile_number: usize,
+    editor: Option<ProfileEditor>,
+    form_error: Option<String>,
 }
 
 impl RemCmdApp {
@@ -22,6 +29,7 @@ impl RemCmdApp {
 
     fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
         self.selected_profile_id = Some(profile_id);
+        self.load_editor_for_selected_profile(cx);
         cx.notify();
     }
 
@@ -39,6 +47,8 @@ impl RemCmdApp {
         self.selected_profile_id = Some(profile.id.clone());
         self.profiles.push(profile);
         self.next_profile_number += 1;
+
+        self.load_editor_for_selected_profile(cx);
 
         cx.notify();
     }
@@ -68,6 +78,61 @@ impl RemCmdApp {
             Some(self.profiles[selected_index - 1].id.clone())
         };
 
+        self.load_editor_for_selected_profile(cx);
+
+        cx.notify();
+    }
+
+    fn load_editor_for_selected_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_profile().cloned() else {
+            self.editor = None;
+            return;
+        };
+
+        self.editor = Some(ProfileEditor {
+            profile_id: profile.id.clone(),
+            name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
+            host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
+            port: cx.new(|cx| TextField::new(cx, profile.port.to_string(), "Port")),
+            username: cx.new(|cx| TextField::new(cx, profile.username, "Username")),
+        });
+
+        self.form_error = None;
+    }
+
+    fn save_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+
+        let name = editor.name.read(cx).text();
+        let host = editor.host.read(cx).text();
+        let port_text = editor.port.read(cx).text();
+        let username = editor.username.read(cx).text();
+
+        let Ok(port) = port_text.trim().parse::<u16>() else {
+            self.form_error = Some("Port must be a number from 1 to 65535".into());
+            cx.notify();
+            return;
+        };
+
+        if let Some(profile) = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == editor.profile_id)
+        {
+            profile.name = name;
+            profile.host = host;
+            profile.port = port;
+            profile.username = username;
+        }
+
+        self.form_error = None;
+        cx.notify();
+    }
+
+    fn cancel_editor(&mut self, cx: &mut Context<Self>) {
+        self.load_editor_for_selected_profile(cx);
         cx.notify();
     }
 }
@@ -143,7 +208,7 @@ impl RemCmdApp {
                             .id("add_connection")
                             .px_2()
                             .py_1()
-                            .rounded_md()
+                            .rounded_lg()
                             .bg(rgb(0x3b82f6))
                             .cursor_pointer()
                             .child("Add")
@@ -172,6 +237,10 @@ impl RemCmdApp {
 
         match selected_profile {
             Some(profile) => {
+                let Some(editor) = self.editor.as_ref() else {
+                    return panel.child("No editor loaded");
+                };
+
                 panel = panel
                     .child(
                         div()
@@ -184,7 +253,7 @@ impl RemCmdApp {
                                     .id("delete_connection")
                                     .px_2()
                                     .py_1()
-                                    .rounded_md()
+                                    .rounded_lg()
                                     .bg(rgb(0xdc2626))
                                     .cursor_pointer()
                                     .child("Delete")
@@ -193,14 +262,45 @@ impl RemCmdApp {
                                     })),
                             ),
                     )
-                    .child(div().mt_4().child(format!("Host: {}", profile.host)))
-                    .child(div().mt_2().child(format!("Port: {}", profile.port)))
+                    .child(self.render_form_row("Name", editor.name.clone()))
+                    .child(self.render_form_row("Host", editor.host.clone()))
+                    .child(self.render_form_row("Port", editor.port.clone()))
+                    .child(self.render_form_row("Username", editor.username.clone()))
+                    .when_some(self.form_error.as_ref(), |this, error| {
+                        this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                    })
                     .child(
                         div()
-                            .mt_2()
-                            .child(format!("Username: {}", profile.username)),
-                    )
-                    .child(div().mt_6().child("Terminal placeholder"));
+                            .flex()
+                            .mt_6()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("save_profile")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(rgb(0x2563eb))
+                                    .cursor_pointer()
+                                    .child("Save")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_editor(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("cancel_profile")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(rgba(0xffffff18))
+                                    .cursor_pointer()
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_editor(cx);
+                                    })),
+                            ),
+                    );
             }
             None => {
                 panel = panel.child("No connection selected");
@@ -209,11 +309,40 @@ impl RemCmdApp {
 
         panel
     }
+
+    fn render_form_row(&self, label: &'static str, field: Entity<TextField>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .mt_3()
+            .child(div().w(px(96.0)).child(label))
+            .child(
+                div()
+                    .flex_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgba(0xffffff26))
+                    .bg(rgba(0xffffff12))
+                    .child(field),
+            )
+    }
+}
+
+#[derive(Clone)]
+struct ProfileEditor {
+    profile_id: String,
+
+    name: Entity<TextField>,
+    host: Entity<TextField>,
+    port: Entity<TextField>,
+    username: Entity<TextField>,
 }
 
 fn main() {
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+
+        bind_text_field_keys(cx);
 
         cx.open_window(
             WindowOptions {
@@ -226,10 +355,17 @@ fn main() {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|_| RemCmdApp {
-                    profiles: ConnectionProfile::samples(),
-                    selected_profile_id: Some("local-dev".into()),
-                    next_profile_number: 3,
+                cx.new(|cx| {
+                    let mut app = RemCmdApp {
+                        profiles: ConnectionProfile::samples(),
+                        selected_profile_id: Some("local-dev".into()),
+                        next_profile_number: 3,
+                        editor: None,
+                        form_error: None,
+                    };
+
+                    app.load_editor_for_selected_profile(cx);
+                    app
                 })
             },
         )
