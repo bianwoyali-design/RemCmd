@@ -116,6 +116,12 @@ impl RemCmdApp {
             return;
         };
 
+        if port == 0 {
+            self.form_error = Some("Port must be a number from 1 to 65535".into());
+            cx.notify();
+            return;
+        };
+
         if let Some(profile) = self
             .profiles
             .iter_mut()
