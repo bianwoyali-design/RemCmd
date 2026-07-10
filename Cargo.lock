@@ -4269,6 +4269,9 @@ dependencies = [
 [[package]]
 name = "remcmd-ssh"
 version = "0.1.0"
+dependencies = [
+ "remcmd-core",
+]
 
 [[package]]
 name = "remcmd-storage"
