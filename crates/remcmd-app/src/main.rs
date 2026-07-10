@@ -21,7 +21,51 @@ struct RemCmdApp {
     profiles_path: PathBuf,
 }
 
+#[derive(Clone)]
+struct ProfileEditor {
+    profile_id: String,
+    name: Entity<TextField>,
+    host: Entity<TextField>,
+    port: Entity<TextField>,
+    username: Entity<TextField>,
+}
+
+// Application construction and shared data helpers.
 impl RemCmdApp {
+    fn load(cx: &mut Context<Self>) -> Self {
+        let profiles_path = default_profiles_path().expect("failed to resolve profiles path");
+
+        let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
+            .and_then(|_| load_profiles(&profiles_path))
+        {
+            Ok(profiles) => (profiles, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("Failed to load profiles: {error}")),
+            ),
+        };
+
+        let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
+        let next_profile_number = profiles
+            .iter()
+            .filter_map(|profile| profile.id.strip_prefix("demo-")?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let mut app = Self {
+            profiles,
+            profiles_path,
+            selected_profile_id,
+            next_profile_number,
+            editor: None,
+            form_error,
+        };
+
+        app.load_editor_for_selected_profile(cx);
+        app
+    }
+
     fn selected_profile(&self) -> Option<&ConnectionProfile> {
         let selected_id = self.selected_profile_id.as_ref()?;
 
@@ -30,16 +74,36 @@ impl RemCmdApp {
             .find(|profile| &profile.id == selected_id)
     }
 
-    fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
-        self.selected_profile_id = Some(profile_id);
-        self.load_editor_for_selected_profile(cx);
-        cx.notify();
-    }
-
     fn persist_profiles(&mut self) {
         if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
             self.form_error = Some(format!("Failed to save profiles:\n{error}"));
         }
+    }
+
+    fn load_editor_for_selected_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_profile().cloned() else {
+            self.editor = None;
+            return;
+        };
+
+        self.editor = Some(ProfileEditor {
+            profile_id: profile.id.clone(),
+            name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
+            host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
+            port: cx.new(|cx| TextField::new(cx, profile.port.to_string(), "Port")),
+            username: cx.new(|cx| TextField::new(cx, profile.username, "Username")),
+        });
+
+        self.form_error = None;
+    }
+}
+
+// User interaction handlers.
+impl RemCmdApp {
+    fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        self.selected_profile_id = Some(profile_id);
+        self.load_editor_for_selected_profile(cx);
+        cx.notify();
     }
 
     fn add_profile(&mut self, cx: &mut Context<Self>) {
@@ -94,23 +158,6 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn load_editor_for_selected_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(profile) = self.selected_profile().cloned() else {
-            self.editor = None;
-            return;
-        };
-
-        self.editor = Some(ProfileEditor {
-            profile_id: profile.id.clone(),
-            name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
-            host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
-            port: cx.new(|cx| TextField::new(cx, profile.port.to_string(), "Port")),
-            username: cx.new(|cx| TextField::new(cx, profile.username, "Username")),
-        });
-
-        self.form_error = None;
-    }
-
     fn save_editor(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.editor.clone() else {
             return;
@@ -156,6 +203,7 @@ impl RemCmdApp {
     }
 }
 
+// Root rendering entry point and drawing helpers.
 impl Render for RemCmdApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_profile = self.selected_profile().cloned();
@@ -353,74 +401,34 @@ impl RemCmdApp {
     }
 }
 
-#[derive(Clone)]
-struct ProfileEditor {
-    profile_id: String,
+// Application startup functions stay outside main so startup remains testable and readable.
+fn main_window_options(cx: &App) -> WindowOptions {
+    let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
 
-    name: Entity<TextField>,
-    host: Entity<TextField>,
-    port: Entity<TextField>,
-    username: Entity<TextField>,
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_background: WindowBackgroundAppearance::Blurred,
+        titlebar: Some(TitlebarOptions {
+            appears_transparent: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn open_main_window(cx: &mut App) {
+    let options = main_window_options(cx);
+
+    cx.open_window(options, |_, cx| cx.new(RemCmdApp::load))
+        .expect("failed to open main window");
+}
+
+fn launch(cx: &mut App) {
+    bind_text_field_keys(cx);
+    open_main_window(cx);
+    cx.activate(true);
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
-
-        bind_text_field_keys(cx);
-
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_background: WindowBackgroundAppearance::Blurred,
-                titlebar: Some(TitlebarOptions {
-                    appears_transparent: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| {
-                cx.new(|cx| {
-                    let profiles_path =
-                        default_profiles_path().expect("failed to resolve profiles path");
-
-                    let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
-                        .and_then(|_| load_profiles(&profiles_path))
-                    {
-                        Ok(profiles) => (profiles, None),
-                        Err(error) => (
-                            Vec::new(),
-                            Some(format!("Failed to load profiles: {error}")),
-                        ),
-                    };
-
-                    let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
-
-                    let next_profile_number = profiles
-                        .iter()
-                        .filter_map(|profile| {
-                            profile.id.strip_prefix("demo-")?.parse::<usize>().ok()
-                        })
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
-
-                    let mut app = RemCmdApp {
-                        profiles,
-                        profiles_path,
-                        selected_profile_id,
-                        next_profile_number,
-                        editor: None,
-                        form_error,
-                    };
-
-                    app.load_editor_for_selected_profile(cx);
-                    app
-                })
-            },
-        )
-        .unwrap();
-
-        cx.activate(true);
-    });
+    Application::new().run(launch);
 }
