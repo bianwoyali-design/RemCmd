@@ -4,9 +4,9 @@ use text_field::{TextField, bind_text_field_keys};
 use std::path::PathBuf;
 
 use gpui::{
-    App, Application, Bounds, Context, Entity, IntoElement, Render, SharedString, TitlebarOptions,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
-    rgba, size,
+    App, Application, Bounds, BoxShadow, Context, Entity, IntoElement, Render, SharedString,
+    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, div, point,
+    prelude::*, px, rgb, rgba, size,
 };
 
 use remcmd_core::ConnectionProfile;
@@ -252,7 +252,13 @@ impl RemCmdApp {
             .pt(px(52.0))
             .bg(rgb(0x181818))
             .border_l_1()
-            .border_color(rgba(0xffffff2e));
+            .border_color(rgba(0xffffff26))
+            .shadow(vec![BoxShadow {
+                color: rgba(0x0000001f).into(),
+                offset: point(px(-1.0), px(0.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }]);
 
         match selected_profile {
             Some(profile) => {
