@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 remcmd-core.workspace = true
+tokio.workspace = true
+russh.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
