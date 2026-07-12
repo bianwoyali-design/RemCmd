@@ -13,6 +13,9 @@ use russh::{
     },
 };
 
+#[cfg(unix)]
+use russh::keys::agent::{AgentIdentity, client::AgentClient};
+
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{AuthMethod, SshError, SshErrorKind};
@@ -157,10 +160,20 @@ impl SshTransport {
                 Self::validate_authentication_result(result, username)
             }
 
-            AuthMethod::Agent => Err(SshError::new(
-                SshErrorKind::Authentication,
-                "SSH Agent authentication is not implemented yet",
-            )),
+            AuthMethod::Agent => {
+                // Apply one timeout to connecting, listing keys, signing,
+                // and waiting for the server's authentication response.
+                let authentication = Self::authenticate_with_agent(handle, username);
+
+                tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+            }
         }
     }
 
@@ -224,6 +237,106 @@ impl SshTransport {
             kind,
             format!("failed to load private key {}: {error}", path.display()),
         )
+    }
+
+    #[cfg(unix)]
+    async fn authenticate_with_agent(
+        handle: &mut client::Handle<ClientHandler>,
+        username: &str,
+    ) -> Result<(), SshError> {
+        // Connect to the Unix socket specified by SSH_AUTH_SOCK.
+        let mut agent = AgentClient::connect_env().await.map_err(|error| {
+            SshError::new(
+                SshErrorKind::Configuration,
+                format!("failed to connect to SSH Agent: {error}"),
+            )
+        })?;
+
+        let identities = agent.request_identities().await.map_err(|error| {
+            SshError::new(
+                SshErrorKind::Authentication,
+                format!("failed to list SSH Agent identities: {error}"),
+            )
+        })?;
+
+        if identities.is_empty() {
+            return Err(SshError::new(
+                SshErrorKind::Authentication,
+                "SSH Agent contains no identities",
+            ));
+        }
+
+        // Outer Option records whether RSA negotiation has already run.
+        // Inner Option is the hash algorithm returned by the server.
+        let mut cached_rsa_hash = None;
+
+        for identity in identities {
+            let is_rsa = matches!(identity.public_key().algorithm(), Algorithm::Rsa { .. });
+
+            let hash_algorithm = if is_rsa {
+                match cached_rsa_hash {
+                    Some(hash_algorithm) => hash_algorithm,
+                    None => {
+                        let hash_algorithm = handle
+                            .best_supported_rsa_hash()
+                            .await
+                            .map_err(SshError::from)?
+                            .flatten();
+
+                        cached_rsa_hash = Some(hash_algorithm);
+                        hash_algorithm
+                    }
+                }
+            } else {
+                None
+            };
+
+            let result = match identity {
+                AgentIdentity::PublicKey { key, .. } => {
+                    handle
+                        .authenticate_publickey_with(username, key, hash_algorithm, &mut agent)
+                        .await
+                }
+
+                AgentIdentity::Certificate { certificate, .. } => {
+                    handle
+                        .authenticate_certificate_with(
+                            username,
+                            certificate,
+                            hash_algorithm,
+                            &mut agent,
+                        )
+                        .await
+                }
+            }
+            .map_err(|error| {
+                SshError::new(
+                    SshErrorKind::Authentication,
+                    format!("SSH Agent signing failed: {error}"),
+                )
+            })?;
+
+            // Servers may reject one key but accept another, so continue trying.
+            if result.success() {
+                return Ok(());
+            }
+        }
+
+        Err(SshError::new(
+            SshErrorKind::Authentication,
+            format!("SSH Agent has no key accepted for user {username}"),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    async fn authenticate_with_agent(
+        _handle: &mut client::Handle<ClientHandler>,
+        _username: &str,
+    ) -> Result<(), SshError> {
+        Err(SshError::new(
+            SshErrorKind::Configuration,
+            "SSH Agent authentication is not supported on this platform",
+        ))
     }
 
     /// Establishes and authenticates an SSH connection.
