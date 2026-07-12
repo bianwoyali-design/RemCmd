@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -7,6 +9,8 @@ pub struct ConnectionProfile {
     pub host: String,
     pub port: u16,
     pub username: String,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl ConnectionProfile {
@@ -23,6 +27,7 @@ impl ConnectionProfile {
             host: host.into(),
             port,
             username: username.into(),
+            auth: AuthConfig::default(),
         }
     }
 
@@ -35,5 +40,54 @@ impl ConnectionProfile {
 
     pub fn address(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthConfig {
+    #[default]
+    Password,
+
+    PrivateKey {
+        path: PathBuf,
+    },
+
+    Agent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_profile_defaults_to_password_authentication() {
+        let json = r#"{
+            "id": "server-1",
+            "name": "Server",
+            "host": "127.0.0.1",
+            "port": 22,
+            "username": "root"
+        }"#;
+
+        let profile: ConnectionProfile =
+            serde_json::from_str(json).expect("old profile should remain valid");
+
+        assert_eq!(profile.auth, AuthConfig::Password);
+    }
+
+    #[test]
+    fn private_key_configuration_survives_json_round_trip() {
+        let mut profile = ConnectionProfile::new("server-1", "Server", "127.0.0.1", 22, "root");
+
+        profile.auth = AuthConfig::PrivateKey {
+            path: PathBuf::from("/Users/test/.ssh/id_ed25519"),
+        };
+
+        let json = serde_json::to_string(&profile).expect("profile should serialize");
+        let loaded: ConnectionProfile =
+            serde_json::from_str(&json).expect("profile should deserialize");
+
+        assert_eq!(loaded, profile);
     }
 }
