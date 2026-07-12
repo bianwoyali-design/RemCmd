@@ -1,12 +1,19 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use remcmd_core::ConnectionProfile;
 use russh::{
     client,
-    keys::{PublicKey, check_known_hosts, check_known_hosts_path},
+    keys::{
+        Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, check_known_hosts,
+        check_known_hosts_path,
+    },
 };
 
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::{AuthMethod, SshError, SshErrorKind};
 
@@ -70,23 +77,6 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
-    /// Establishes and authenticates an SSH connection.
-    ///
-    /// AuthMethod is consumed so credentials are dropped after authentication.
-    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
-        let mut handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
-
-        Self::authenticate_with_timeout(
-            &mut handle,
-            profile.username.as_str(),
-            auth,
-            AUTHENTICATION_TIMEOUT,
-        )
-        .await?;
-
-        Ok(Self { handle })
-    }
-
     /// Opens TCP and completes the SSH handshake without authenticating.
     async fn open_connection_with_timeout(
         profile: &ConnectionProfile,
@@ -137,10 +127,35 @@ impl SshTransport {
                 Self::validate_authentication_result(result, username)
             }
 
-            AuthMethod::PrivateKey { .. } => Err(SshError::new(
-                SshErrorKind::Authentication,
-                "private-key authentication is not implemented yet",
-            )),
+            AuthMethod::PrivateKey { path, passphrase } => {
+                let private_key = Self::load_private_key(path, passphrase).await?;
+
+                let hash_algorithm = if matches!(private_key.algorithm(), Algorithm::Rsa { .. }) {
+                    handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(SshError::from)?
+                        .flatten()
+                } else {
+                    None
+                };
+
+                let private_key = PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_algorithm);
+
+                let authentication = handle.authenticate_publickey(username, private_key);
+
+                let result = tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+                    .map_err(SshError::from)?;
+
+                Self::validate_authentication_result(result, username)
+            }
 
             AuthMethod::Agent => Err(SshError::new(
                 SshErrorKind::Authentication,
@@ -161,6 +176,71 @@ impl SshTransport {
             SshErrorKind::Authentication,
             format!("authentication failed for user {username}"),
         ))
+    }
+
+    /// Loads and optionally decrypts a private key outside Tokio's async workers.
+    async fn load_private_key(
+        path: PathBuf,
+        passphrase: Option<SecretString>,
+    ) -> Result<PrivateKey, SshError> {
+        // Keep a copy for the error message because the original path
+        // is moved into the blocking task.
+        let error_path = path.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let passphrase = passphrase
+                .as_ref()
+                .map(|passphrase| passphrase.expose_secret());
+
+            russh::keys::load_secret_key(path, passphrase)
+        })
+        .await
+        .map_err(|error| {
+            SshError::new(
+                SshErrorKind::Protocol,
+                format!("private-key loader task failed: {error}"),
+            )
+        })?;
+
+        result.map_err(|error| Self::private_key_load_error(&error_path, error))
+    }
+
+    /// Converts key-file and decryption failures into application errors.
+    fn private_key_load_error(path: &Path, error: russh::keys::Error) -> SshError {
+        let kind = match &error {
+            // These errors generally indicate a missing or incorrect passphrase.
+            russh::keys::Error::KeyIsEncrypted
+            | russh::keys::Error::Pad(_)
+            | russh::keys::Error::Unpad(_)
+            | russh::keys::Error::SshKey(russh::keys::ssh_key::Error::Crypto) => {
+                SshErrorKind::Authentication
+            }
+
+            // Missing, unreadable, corrupt, or unsupported files are configuration errors.
+            _ => SshErrorKind::Configuration,
+        };
+
+        SshError::new(
+            kind,
+            format!("failed to load private key {}: {error}", path.display()),
+        )
+    }
+
+    /// Establishes and authenticates an SSH connection.
+    ///
+    /// AuthMethod is consumed so credentials are dropped after authentication.
+    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
+        let mut handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
+
+        Self::authenticate_with_timeout(
+            &mut handle,
+            profile.username.as_str(),
+            auth,
+            AUTHENTICATION_TIMEOUT,
+        )
+        .await?;
+
+        Ok(Self { handle })
     }
 
     /// Sends a protocol-level disconnect request to the server.
@@ -328,5 +408,29 @@ mod tests {
 
         assert_eq!(error.kind(), SshErrorKind::Authentication);
         assert_eq!(error.message(), "authentication failed for user tester");
+    }
+
+    #[tokio::test]
+    async fn missing_private_key_maps_to_configuration_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing-key");
+
+        let result = SshTransport::load_private_key(path, None).await;
+
+        let Err(error) = result else {
+            panic!("missing private key should fail");
+        };
+
+        assert_eq!(error.kind(), SshErrorKind::Configuration);
+    }
+
+    #[test]
+    fn encrypted_private_key_requires_passphrase() {
+        let error = SshTransport::private_key_load_error(
+            Path::new("/tmp/encrypted-key"),
+            russh::keys::Error::KeyIsEncrypted,
+        );
+
+        assert_eq!(error.kind(), SshErrorKind::Authentication);
     }
 }
