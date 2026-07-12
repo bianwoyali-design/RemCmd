@@ -18,10 +18,11 @@ use russh::keys::agent::{AgentIdentity, client::AgentClient};
 
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::{AuthMethod, SshError, SshErrorKind};
+use crate::{AuthMethod, PtySize, SshError, SshErrorKind, SshShell};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+const SHELL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -354,6 +355,12 @@ impl SshTransport {
         .await?;
 
         Ok(Self { handle })
+    }
+
+    pub async fn open_shell(&self, size: PtySize) -> Result<SshShell, SshError> {
+        tokio::time::timeout(SHELL_OPEN_TIMEOUT, SshShell::open(&self.handle, size))
+            .await
+            .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote shell timed out"))?
     }
 
     /// Sends a protocol-level disconnect request to the server.

@@ -1,3 +1,9 @@
+use russh::{Channel, ChannelMsg, client};
+
+use crate::{SshError, SshErrorKind};
+
+const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
+
 /// Dimensions reported to the remote pseudo-terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -64,6 +70,81 @@ pub enum ShellEvent {
 
     /// The SSH channel has closed.
     Closed,
+}
+
+pub struct SshShell {
+    channel: Channel<client::Msg>,
+}
+
+impl SshShell {
+    pub(crate) async fn open<H>(handle: &client::Handle<H>, size: PtySize) -> Result<Self, SshError>
+    where
+        H: client::Handler,
+    {
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(SshError::from)?;
+
+        channel
+            .request_pty(
+                true,
+                DEFAULT_TERMINAL_TYPE,
+                size.columns,
+                size.rows,
+                size.pixel_width,
+                size.pixel_height,
+                &[],
+            )
+            .await
+            .map_err(SshError::from)?;
+
+        Self::wait_for_request_success(&mut channel, "PTY").await?;
+
+        channel.request_shell(true).await.map_err(SshError::from)?;
+
+        Self::wait_for_request_success(&mut channel, "shell").await?;
+
+        Ok(Self { channel })
+    }
+
+    async fn wait_for_request_success(
+        channel: &mut Channel<client::Msg>,
+        request: &str,
+    ) -> Result<(), SshError> {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+
+                Some(ChannelMsg::Failure) => {
+                    return Err(SshError::new(
+                        SshErrorKind::Protocol,
+                        format!("server rejected {request} request"),
+                    ));
+                }
+
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    return Err(SshError::new(
+                        SshErrorKind::Network,
+                        format!("channel closed while waiting for {request} request"),
+                    ));
+                }
+
+                // No output should normally arrive before shellstartup.
+                // Ignore protocol messages unrelated to this request.
+                Some(_) => {}
+            }
+        }
+    }
+
+    pub async fn close(&self) -> Result<(), SshError> {
+        // Attempt close even when sending EOF fails.
+        let eof_result = self.channel.eof().await;
+        let close_result = self.channel.close().await;
+
+        eof_result.map_err(SshError::from)?;
+        close_result.map_err(SshError::from)
+    }
 }
 
 #[cfg(test)]
