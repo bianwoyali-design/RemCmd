@@ -6,9 +6,12 @@ use russh::{
     keys::{PublicKey, check_known_hosts, check_known_hosts_path},
 };
 
-use crate::{SshError, SshErrorKind};
+use secrecy::ExposeSecret;
+
+use crate::{AuthMethod, SshError, SshErrorKind};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -67,16 +70,28 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
-    /// Uses the production connection timeout.
-    pub async fn connect(profile: &ConnectionProfile) -> Result<Self, SshError> {
-        Self::connect_with_timeout(profile, CONNECT_TIMEOUT).await
+    /// Establishes and authenticates an SSH connection.
+    ///
+    /// AuthMethod is consumed so credentials are dropped after authentication.
+    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
+        let mut handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
+
+        Self::authenticate_with_timeout(
+            &mut handle,
+            profile.username.as_str(),
+            auth,
+            AUTHENTICATION_TIMEOUT,
+        )
+        .await?;
+
+        Ok(Self { handle })
     }
 
-    /// Tests can provide a short timeout without waiting ten seconds.
-    async fn connect_with_timeout(
+    /// Opens TCP and completes the SSH handshake without authenticating.
+    async fn open_connection_with_timeout(
         profile: &ConnectionProfile,
         timeout: Duration,
-    ) -> Result<Self, SshError> {
+    ) -> Result<client::Handle<ClientHandler>, SshError> {
         let config = Arc::new(client::Config {
             nodelay: true,
             ..Default::default()
@@ -94,7 +109,58 @@ impl SshTransport {
                 )
             })??;
 
-        Ok(Self { handle })
+        Ok(handle)
+    }
+
+    async fn authenticate_with_timeout(
+        handle: &mut client::Handle<ClientHandler>,
+        username: &str,
+        auth: AuthMethod,
+        timeout: Duration,
+    ) -> Result<(), SshError> {
+        match auth {
+            AuthMethod::Password { password } => {
+                // Reading SecretString requires an explicit ExposeSecret call.
+                let authentication =
+                    handle.authenticate_password(username, password.expose_secret());
+
+                let result = tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+                    .map_err(SshError::from)?;
+
+                Self::validate_authentication_result(result, username)
+            }
+
+            AuthMethod::PrivateKey { .. } => Err(SshError::new(
+                SshErrorKind::Authentication,
+                "private-key authentication is not implemented yet",
+            )),
+
+            AuthMethod::Agent => Err(SshError::new(
+                SshErrorKind::Authentication,
+                "SSH Agent authentication is not implemented yet",
+            )),
+        }
+    }
+
+    fn validate_authentication_result(
+        result: client::AuthResult,
+        username: &str,
+    ) -> Result<(), SshError> {
+        if result.success() {
+            return Ok(());
+        }
+
+        Err(SshError::new(
+            SshErrorKind::Authentication,
+            format!("authentication failed for user {username}"),
+        ))
     }
 
     /// Sends a protocol-level disconnect request to the server.
@@ -204,7 +270,8 @@ mod tests {
         drop(listener);
 
         let result =
-            SshTransport::connect_with_timeout(&test_profile(port), Duration::from_secs(1)).await;
+            SshTransport::open_connection_with_timeout(&test_profile(port), Duration::from_secs(1))
+                .await;
 
         let Err(error) = result else {
             panic!("connection should have been refused");
@@ -226,9 +293,11 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
 
-        let result =
-            SshTransport::connect_with_timeout(&test_profile(port), Duration::from_millis(50))
-                .await;
+        let result = SshTransport::open_connection_with_timeout(
+            &test_profile(port),
+            Duration::from_millis(50),
+        )
+        .await;
 
         server_task.abort();
 
@@ -237,5 +306,27 @@ mod tests {
         };
 
         assert_eq!(error.kind(), SshErrorKind::Timeout);
+    }
+
+    #[test]
+    fn successful_authentication_result_is_accepted() {
+        let result =
+            SshTransport::validate_authentication_result(client::AuthResult::Success, "tester");
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejected_authentication_maps_to_authentication_error() {
+        let result = client::AuthResult::Failure {
+            remaining_methods: russh::MethodSet::empty(),
+            partial_success: false,
+        };
+
+        let error = SshTransport::validate_authentication_result(result, "tester")
+            .expect_err("authentication should be rejected");
+
+        assert_eq!(error.kind(), SshErrorKind::Authentication);
+        assert_eq!(error.message(), "authentication failed for user tester");
     }
 }
