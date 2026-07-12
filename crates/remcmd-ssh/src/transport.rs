@@ -1,14 +1,27 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use remcmd_core::ConnectionProfile;
 use russh::{
     client,
-    keys::{PublicKey, check_known_hosts, check_known_hosts_path},
+    keys::{
+        Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, check_known_hosts,
+        check_known_hosts_path,
+    },
 };
 
-use crate::{SshError, SshErrorKind};
+#[cfg(unix)]
+use russh::keys::agent::{AgentIdentity, client::AgentClient};
+
+use secrecy::{ExposeSecret, SecretString};
+
+use crate::{AuthMethod, SshError, SshErrorKind};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -67,16 +80,11 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
-    /// Uses the production connection timeout.
-    pub async fn connect(profile: &ConnectionProfile) -> Result<Self, SshError> {
-        Self::connect_with_timeout(profile, CONNECT_TIMEOUT).await
-    }
-
-    /// Tests can provide a short timeout without waiting ten seconds.
-    async fn connect_with_timeout(
+    /// Opens TCP and completes the SSH handshake without authenticating.
+    async fn open_connection_with_timeout(
         profile: &ConnectionProfile,
         timeout: Duration,
-    ) -> Result<Self, SshError> {
+    ) -> Result<client::Handle<ClientHandler>, SshError> {
         let config = Arc::new(client::Config {
             nodelay: true,
             ..Default::default()
@@ -93,6 +101,257 @@ impl SshTransport {
                     format!("connection to {}:{} timed out", profile.host, profile.port),
                 )
             })??;
+
+        Ok(handle)
+    }
+
+    async fn authenticate_with_timeout(
+        handle: &mut client::Handle<ClientHandler>,
+        username: &str,
+        auth: AuthMethod,
+        timeout: Duration,
+    ) -> Result<(), SshError> {
+        match auth {
+            AuthMethod::Password { password } => {
+                // Reading SecretString requires an explicit ExposeSecret call.
+                let authentication =
+                    handle.authenticate_password(username, password.expose_secret());
+
+                let result = tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+                    .map_err(SshError::from)?;
+
+                Self::validate_authentication_result(result, username)
+            }
+
+            AuthMethod::PrivateKey { path, passphrase } => {
+                let private_key = Self::load_private_key(path, passphrase).await?;
+
+                let hash_algorithm = if matches!(private_key.algorithm(), Algorithm::Rsa { .. }) {
+                    handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(SshError::from)?
+                        .flatten()
+                } else {
+                    None
+                };
+
+                let private_key = PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_algorithm);
+
+                let authentication = handle.authenticate_publickey(username, private_key);
+
+                let result = tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+                    .map_err(SshError::from)?;
+
+                Self::validate_authentication_result(result, username)
+            }
+
+            AuthMethod::Agent => {
+                // Apply one timeout to connecting, listing keys, signing,
+                // and waiting for the server's authentication response.
+                let authentication = Self::authenticate_with_agent(handle, username);
+
+                tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+            }
+        }
+    }
+
+    fn validate_authentication_result(
+        result: client::AuthResult,
+        username: &str,
+    ) -> Result<(), SshError> {
+        if result.success() {
+            return Ok(());
+        }
+
+        Err(SshError::new(
+            SshErrorKind::Authentication,
+            format!("authentication failed for user {username}"),
+        ))
+    }
+
+    /// Loads and optionally decrypts a private key outside Tokio's async workers.
+    async fn load_private_key(
+        path: PathBuf,
+        passphrase: Option<SecretString>,
+    ) -> Result<PrivateKey, SshError> {
+        // Keep a copy for the error message because the original path
+        // is moved into the blocking task.
+        let error_path = path.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let passphrase = passphrase
+                .as_ref()
+                .map(|passphrase| passphrase.expose_secret());
+
+            russh::keys::load_secret_key(path, passphrase)
+        })
+        .await
+        .map_err(|error| {
+            SshError::new(
+                SshErrorKind::Protocol,
+                format!("private-key loader task failed: {error}"),
+            )
+        })?;
+
+        result.map_err(|error| Self::private_key_load_error(&error_path, error))
+    }
+
+    /// Converts key-file and decryption failures into application errors.
+    fn private_key_load_error(path: &Path, error: russh::keys::Error) -> SshError {
+        let kind = match &error {
+            // These errors generally indicate a missing or incorrect passphrase.
+            russh::keys::Error::KeyIsEncrypted
+            | russh::keys::Error::Pad(_)
+            | russh::keys::Error::Unpad(_)
+            | russh::keys::Error::SshKey(russh::keys::ssh_key::Error::Crypto) => {
+                SshErrorKind::Authentication
+            }
+
+            // Missing, unreadable, corrupt, or unsupported files are configuration errors.
+            _ => SshErrorKind::Configuration,
+        };
+
+        SshError::new(
+            kind,
+            format!("failed to load private key {}: {error}", path.display()),
+        )
+    }
+
+    #[cfg(unix)]
+    async fn authenticate_with_agent(
+        handle: &mut client::Handle<ClientHandler>,
+        username: &str,
+    ) -> Result<(), SshError> {
+        // Connect to the Unix socket specified by SSH_AUTH_SOCK.
+        let mut agent = AgentClient::connect_env().await.map_err(|error| {
+            SshError::new(
+                SshErrorKind::Configuration,
+                format!("failed to connect to SSH Agent: {error}"),
+            )
+        })?;
+
+        let identities = agent.request_identities().await.map_err(|error| {
+            SshError::new(
+                SshErrorKind::Authentication,
+                format!("failed to list SSH Agent identities: {error}"),
+            )
+        })?;
+
+        if identities.is_empty() {
+            return Err(SshError::new(
+                SshErrorKind::Authentication,
+                "SSH Agent contains no identities",
+            ));
+        }
+
+        // Outer Option records whether RSA negotiation has already run.
+        // Inner Option is the hash algorithm returned by the server.
+        let mut cached_rsa_hash = None;
+
+        for identity in identities {
+            let is_rsa = matches!(identity.public_key().algorithm(), Algorithm::Rsa { .. });
+
+            let hash_algorithm = if is_rsa {
+                match cached_rsa_hash {
+                    Some(hash_algorithm) => hash_algorithm,
+                    None => {
+                        let hash_algorithm = handle
+                            .best_supported_rsa_hash()
+                            .await
+                            .map_err(SshError::from)?
+                            .flatten();
+
+                        cached_rsa_hash = Some(hash_algorithm);
+                        hash_algorithm
+                    }
+                }
+            } else {
+                None
+            };
+
+            let result = match identity {
+                AgentIdentity::PublicKey { key, .. } => {
+                    handle
+                        .authenticate_publickey_with(username, key, hash_algorithm, &mut agent)
+                        .await
+                }
+
+                AgentIdentity::Certificate { certificate, .. } => {
+                    handle
+                        .authenticate_certificate_with(
+                            username,
+                            certificate,
+                            hash_algorithm,
+                            &mut agent,
+                        )
+                        .await
+                }
+            }
+            .map_err(|error| {
+                SshError::new(
+                    SshErrorKind::Authentication,
+                    format!("SSH Agent signing failed: {error}"),
+                )
+            })?;
+
+            // Servers may reject one key but accept another, so continue trying.
+            if result.success() {
+                return Ok(());
+            }
+        }
+
+        Err(SshError::new(
+            SshErrorKind::Authentication,
+            format!("SSH Agent has no key accepted for user {username}"),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    async fn authenticate_with_agent(
+        _handle: &mut client::Handle<ClientHandler>,
+        _username: &str,
+    ) -> Result<(), SshError> {
+        Err(SshError::new(
+            SshErrorKind::Configuration,
+            "SSH Agent authentication is not supported on this platform",
+        ))
+    }
+
+    /// Establishes and authenticates an SSH connection.
+    ///
+    /// AuthMethod is consumed so credentials are dropped after authentication.
+    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
+        let mut handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
+
+        Self::authenticate_with_timeout(
+            &mut handle,
+            profile.username.as_str(),
+            auth,
+            AUTHENTICATION_TIMEOUT,
+        )
+        .await?;
 
         Ok(Self { handle })
     }
@@ -204,7 +463,8 @@ mod tests {
         drop(listener);
 
         let result =
-            SshTransport::connect_with_timeout(&test_profile(port), Duration::from_secs(1)).await;
+            SshTransport::open_connection_with_timeout(&test_profile(port), Duration::from_secs(1))
+                .await;
 
         let Err(error) = result else {
             panic!("connection should have been refused");
@@ -226,9 +486,11 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
 
-        let result =
-            SshTransport::connect_with_timeout(&test_profile(port), Duration::from_millis(50))
-                .await;
+        let result = SshTransport::open_connection_with_timeout(
+            &test_profile(port),
+            Duration::from_millis(50),
+        )
+        .await;
 
         server_task.abort();
 
@@ -237,5 +499,51 @@ mod tests {
         };
 
         assert_eq!(error.kind(), SshErrorKind::Timeout);
+    }
+
+    #[test]
+    fn successful_authentication_result_is_accepted() {
+        let result =
+            SshTransport::validate_authentication_result(client::AuthResult::Success, "tester");
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejected_authentication_maps_to_authentication_error() {
+        let result = client::AuthResult::Failure {
+            remaining_methods: russh::MethodSet::empty(),
+            partial_success: false,
+        };
+
+        let error = SshTransport::validate_authentication_result(result, "tester")
+            .expect_err("authentication should be rejected");
+
+        assert_eq!(error.kind(), SshErrorKind::Authentication);
+        assert_eq!(error.message(), "authentication failed for user tester");
+    }
+
+    #[tokio::test]
+    async fn missing_private_key_maps_to_configuration_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing-key");
+
+        let result = SshTransport::load_private_key(path, None).await;
+
+        let Err(error) = result else {
+            panic!("missing private key should fail");
+        };
+
+        assert_eq!(error.kind(), SshErrorKind::Configuration);
+    }
+
+    #[test]
+    fn encrypted_private_key_requires_passphrase() {
+        let error = SshTransport::private_key_load_error(
+            Path::new("/tmp/encrypted-key"),
+            russh::keys::Error::KeyIsEncrypted,
+        );
+
+        assert_eq!(error.kind(), SshErrorKind::Authentication);
     }
 }
