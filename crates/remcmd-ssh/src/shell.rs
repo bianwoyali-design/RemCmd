@@ -240,26 +240,4 @@ impl SshShellWriter {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_pty_size_is_eighty_by_twenty_four() {
-        let size = PtySize::default();
-
-        assert_eq!(size.columns, 80);
-        assert_eq!(size.rows, 24);
-        assert_eq!(size.pixel_width, 0);
-        assert_eq!(size.pixel_height, 0);
-    }
-
-    #[test]
-    fn pty_size_can_include_pixel_dimensions() {
-        let size = PtySize::new(120, 40).with_pixels(1440, 900);
-
-        assert_eq!(size.columns, 120);
-        assert_eq!(size.rows, 40);
-        assert_eq!(size.pixel_width, 1440);
-        assert_eq!(size.pixel_height, 900);
-    }
-}
+mod tests;

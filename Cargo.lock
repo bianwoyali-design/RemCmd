@@ -5019,6 +5019,7 @@ dependencies = [
 name = "remcmd-ssh"
 version = "0.1.0"
 dependencies = [
+ "rand 0.10.2",
  "remcmd-core",
  "russh",
  "secrecy",

@@ -169,13 +169,13 @@ impl RemCmdApp {
         let username = editor.username.read(cx).text();
 
         let Ok(port) = port_text.trim().parse::<u16>() else {
-            self.form_error = Some("Port must be a number from 1 to 65535".into());
+            self.form_error = Some("Port must be a number from 0 to 65535".into());
             cx.notify();
             return;
         };
 
         if port == 0 {
-            self.form_error = Some("Port must be a number from 1 to 65535".into());
+            self.form_error = Some("Port must be a number from 0 to 65535".into());
             cx.notify();
             return;
         };
