@@ -1,6 +1,9 @@
 mod text_field;
 use text_field::{TextField, bind_text_field_keys};
 
+mod ssh_runtime;
+use ssh_runtime::SshRuntime;
+
 use std::path::PathBuf;
 
 use gpui::{
@@ -9,7 +12,10 @@ use gpui::{
     prelude::*, px, rgb, rgba, size,
 };
 
-use remcmd_core::ConnectionProfile;
+use remcmd_core::{AuthConfig, ConnectionProfile};
+use remcmd_ssh::{
+    AuthMethod, ConnectionEvent, ConnectionHandle, PtySize, SessionState, ShellEvent, SshConnection,
+};
 use remcmd_storage::{default_profiles_path, ensure_profiles_file, load_profiles, save_profiles};
 
 struct RemCmdApp {
@@ -19,6 +25,11 @@ struct RemCmdApp {
     editor: Option<ProfileEditor>,
     form_error: Option<String>,
     profiles_path: PathBuf,
+    connection_state: SessionState,
+    connection_handle: Option<ConnectionHandle>,
+    connection_profile_id: Option<String>,
+    connection_error: Option<String>,
+    connection_message: Option<String>,
 }
 
 #[derive(Clone)]
@@ -60,6 +71,11 @@ impl RemCmdApp {
             next_profile_number,
             editor: None,
             form_error,
+            connection_state: SessionState::Disconnected,
+            connection_handle: None,
+            connection_profile_id: None,
+            connection_error: None,
+            connection_message: None,
         };
 
         app.load_editor_for_selected_profile(cx);
@@ -77,6 +93,16 @@ impl RemCmdApp {
     fn persist_profiles(&mut self) {
         if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
             self.form_error = Some(format!("Failed to save profiles:\n{error}"));
+        }
+    }
+
+    fn auth_method_for_profile(profile: &ConnectionProfile) -> Result<AuthMethod, String> {
+        match &profile.auth {
+            AuthConfig::Password => {
+                Err("Password authentication requires a password prompt".into())
+            }
+            AuthConfig::PrivateKey { path } => Ok(AuthMethod::private_key(path.clone(), None)),
+            AuthConfig::Agent => Ok(AuthMethod::Agent),
         }
     }
 
@@ -131,6 +157,12 @@ impl RemCmdApp {
         let Some(selected_id) = self.selected_profile_id.as_deref() else {
             return;
         };
+
+        if self.connection_profile_id.as_deref() == Some(selected_id) {
+            self.form_error = Some("Disconnect this profile before deleting it".into());
+            cx.notify();
+            return;
+        }
 
         let Some(selected_index) = self
             .profiles
@@ -200,6 +232,130 @@ impl RemCmdApp {
     fn cancel_editor(&mut self, cx: &mut Context<Self>) {
         self.load_editor_for_selected_profile(cx);
         cx.notify();
+    }
+
+    fn connect_selected_profile(&mut self, cx: &mut Context<Self>) {
+        if !self.connection_state.can_connect() {
+            return;
+        }
+
+        let Some(profile) = self.selected_profile().cloned() else {
+            return;
+        };
+
+        let auth = match Self::auth_method_for_profile(&profile) {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.connection_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+
+        let runtime = cx.global::<SshRuntime>().handle();
+        let connection = SshConnection::spawn(&runtime, profile.clone(), auth, PtySize::default());
+        let (handle, mut events) = connection.split();
+
+        self.connection_state = SessionState::Connecting;
+        self.connection_handle = Some(handle);
+        self.connection_profile_id = Some(profile.id);
+        self.connection_error = None;
+        self.connection_message = None;
+
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next_event().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.handle_connection_event(event, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    fn disconnect_active_connection(&mut self, cx: &mut Context<Self>) {
+        if !self.connection_state.can_disconnect() {
+            return;
+        }
+
+        let Some(handle) = self.connection_handle.as_ref() else {
+            self.connection_state = SessionState::Failed;
+            self.connection_error = Some("SSH connection handle is missing".into());
+            self.connection_profile_id = None;
+            cx.notify();
+            return;
+        };
+
+        if let Err(error) = handle.disconnect() {
+            self.connection_state = SessionState::Failed;
+            self.connection_handle = None;
+            self.connection_profile_id = None;
+            self.connection_error = Some(error.to_string());
+        } else {
+            // Disable repeated clicks before the worker publishes its event.
+            self.connection_state = SessionState::Disconnecting;
+        }
+
+        cx.notify();
+    }
+
+    fn handle_connection_event(&mut self, event: ConnectionEvent, cx: &mut Context<Self>) {
+        let should_notify = match event {
+            ConnectionEvent::StateChanged(state) => {
+                self.connection_state = state;
+
+                if state == SessionState::Disconnected {
+                    self.connection_handle = None;
+                    self.connection_profile_id = None;
+                }
+
+                true
+            }
+            ConnectionEvent::Failed(error) => {
+                self.connection_state = SessionState::Failed;
+                self.connection_handle = None;
+                self.connection_profile_id = None;
+                self.connection_error = Some(error.to_string());
+                true
+            }
+            ConnectionEvent::Shell(ShellEvent::Output(_) | ShellEvent::ExtendedOutput { .. }) => {
+                // Terminal output will be consumed by remcmd-terminal later.
+                false
+            }
+            ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
+                self.connection_message = Some(format!("Remote shell exited with status {status}"));
+                true
+            }
+            ConnectionEvent::Shell(ShellEvent::ExitSignal {
+                signal,
+                core_dumped,
+                message,
+            }) => {
+                let core_dump = if core_dumped { " (core dumped)" } else { "" };
+                self.connection_message = Some(format!(
+                    "Remote shell exited on signal {signal}{core_dump}: {message}"
+                ));
+                true
+            }
+            ConnectionEvent::Shell(ShellEvent::Eof) => {
+                self.connection_message = Some("Remote shell reached EOF".into());
+                true
+            }
+            ConnectionEvent::Shell(ShellEvent::Closed) => {
+                self.connection_message = Some("Remote shell closed".into());
+                true
+            }
+        };
+
+        if should_notify {
+            cx.notify();
+        }
     }
 }
 
@@ -323,16 +479,23 @@ impl RemCmdApp {
                             .child(profile.name.clone())
                             .child(
                                 div()
-                                    .id("delete_connection")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_lg()
-                                    .bg(rgb(0xdc2626))
-                                    .cursor_pointer()
-                                    .child("Delete")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.delete_selected_profile(cx);
-                                    })),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(self.render_connection_controls(cx))
+                                    .child(
+                                        div()
+                                            .id("delete_connection")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_lg()
+                                            .bg(rgb(0xdc2626))
+                                            .cursor_pointer()
+                                            .child("Delete")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.delete_selected_profile(cx);
+                                            })),
+                                    ),
                             ),
                     )
                     .child(self.render_form_row("Name", editor.name.clone()))
@@ -341,6 +504,17 @@ impl RemCmdApp {
                     .child(self.render_form_row("Username", editor.username.clone()))
                     .when_some(self.form_error.as_ref(), |this, error| {
                         this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                    })
+                    .when_some(self.connection_error.as_ref(), |this, error| {
+                        this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                    })
+                    .when_some(self.connection_message.as_ref(), |this, message| {
+                        this.child(
+                            div()
+                                .mt_3()
+                                .text_color(rgb(0xa1a1aa))
+                                .child(message.clone()),
+                        )
                     })
                     .child(
                         div()
@@ -381,6 +555,93 @@ impl RemCmdApp {
         }
 
         panel
+    }
+
+    fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_connect = self.connection_state.can_connect();
+        let can_disconnect = self.connection_state.can_disconnect();
+
+        let label = match self.connection_state {
+            SessionState::Failed => "Retry",
+            SessionState::Disconnecting => "Disconnecting",
+            _ if can_disconnect => "Disconnect",
+            _ => "Connect",
+        };
+
+        let button_color = if can_disconnect {
+            rgb(0xdc2626)
+        } else {
+            rgb(0x2563eb)
+        };
+
+        let status_color = match self.connection_state {
+            SessionState::Connected => rgb(0x86efac),
+            SessionState::Failed => rgb(0xfca5a5),
+            SessionState::Connecting
+            | SessionState::Authenticating
+            | SessionState::Disconnecting => rgb(0xfde68a),
+            SessionState::Disconnected => rgb(0xa1a1aa),
+        };
+
+        let mut button = div()
+            .id("connection_action")
+            .px_3()
+            .py_1()
+            .rounded_lg()
+            .bg(button_color)
+            .child(label);
+
+        if can_connect {
+            button = button
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.connect_selected_profile(cx);
+                }));
+        } else if can_disconnect {
+            button = button
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.disconnect_active_connection(cx);
+                }));
+        } else {
+            button = button.opacity(0.55);
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(status_color)
+                    .child(self.connection_status_text()),
+            )
+            .child(button)
+    }
+
+    fn connection_status_text(&self) -> String {
+        let state = match self.connection_state {
+            SessionState::Disconnected => "Disconnected",
+            SessionState::Connecting => "Connecting",
+            SessionState::Authenticating => "Authenticating",
+            SessionState::Connected => "Connected",
+            SessionState::Disconnecting => "Disconnecting",
+            SessionState::Failed => "Failed",
+        };
+
+        let Some(profile_id) = self.connection_profile_id.as_deref() else {
+            return state.into();
+        };
+
+        let profile_name = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| profile.name.as_str())
+            .unwrap_or(profile_id);
+
+        format!("{state} - {profile_name}")
     }
 
     fn render_form_row(&self, label: &'static str, field: Entity<TextField>) -> impl IntoElement {
@@ -424,6 +685,8 @@ fn open_main_window(cx: &mut App) {
 }
 
 fn launch(cx: &mut App) {
+    cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
+
     bind_text_field_keys(cx);
     open_main_window(cx);
     cx.activate(true);

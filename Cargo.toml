@@ -40,4 +40,5 @@ russh = { version = "0.62.2", default-features = false, features = [
 ]}
 
 remcmd-core = { path = "crates/remcmd-core"}
+remcmd-ssh = { path = "crates/remcmd-ssh" }
 remcmd-storage = { path = "crates/remcmd-storage" }
