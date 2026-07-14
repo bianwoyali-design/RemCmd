@@ -7,9 +7,9 @@ use ssh_runtime::SshRuntime;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Application, Bounds, BoxShadow, Context, Entity, IntoElement, Render, SharedString,
-    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, div, point,
-    prelude::*, px, rgb, rgba, size,
+    App, Application, Bounds, BoxShadow, Context, Entity, FontWeight, IntoElement, Render,
+    SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    div, point, prelude::*, px, rgb, rgba, size,
 };
 
 use remcmd_core::{AuthConfig, ConnectionProfile};
@@ -367,7 +367,6 @@ impl Render for RemCmdApp {
         div()
             .flex()
             .size_full()
-            .bg(rgba(0x18181880))
             .text_color(rgb(0xf4f4f5))
             .child(self.render_sidebar(cx))
             .child(self.render_detail_panel(selected_profile, cx))
@@ -379,33 +378,56 @@ impl RemCmdApp {
         let mut connection_list = div()
             .id("connection_list")
             .flex_1()
+            .overflow_x_hidden()
             .overflow_y_scroll()
-            .mt_3();
+            .mt_2();
 
         for profile in &self.profiles {
             let profile_id = profile.id.clone();
             let is_selected = self.selected_profile_id.as_ref() == Some(&profile.id);
+            let item_background = if is_selected {
+                rgb(0x4f4d50)
+            } else {
+                rgba(0xffffff00)
+            };
 
-            let mut profile_item = div()
+            let profile_item = div()
                 .id(SharedString::from(format!("profile-{}", profile.id)))
-                .mb_2()
-                .p_3()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgba(0xffffff00))
+                .mb_1()
+                .w_full()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(item_background)
                 .cursor_pointer()
-                .hover(|this| this.bg(rgba(0xd0d0d033)).border_color(rgba(0xe0e0e080)))
-                .child(profile.name.clone())
-                .child(profile.address())
+                .hover(move |this| {
+                    let background = if is_selected {
+                        rgb(0x59575b)
+                    } else {
+                        rgb(0x454347)
+                    };
+
+                    this.bg(background)
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(profile.name.clone()),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .w_full()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(0xa1a1aa))
+                        .child(profile.address()),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_profile(profile_id.clone(), cx);
                 }));
-
-            if is_selected {
-                profile_item = profile_item
-                    .bg(rgba(0xd0d0d033))
-                    .border_color(rgba(0xe0e0e080));
-            }
 
             connection_list = connection_list.child(profile_item);
         }
@@ -415,7 +437,7 @@ impl RemCmdApp {
             .flex_col()
             .w(px(300.0))
             .h_full()
-            .bg(rgba(0x18181833))
+            .bg(rgba(0x212121e8))
             .px_4()
             .pb_4()
             .pt(px(52.0))
