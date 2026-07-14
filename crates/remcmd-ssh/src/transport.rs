@@ -340,21 +340,40 @@ impl SshTransport {
         ))
     }
 
-    /// Establishes and authenticates an SSH connection.
+    /// Opens TCP and completes the SSH handshake without authenticating.
     ///
-    /// AuthMethod is consumed so credentials are dropped after authentication.
-    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
-        let mut handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
-
-        Self::authenticate_with_timeout(
-            &mut handle,
-            profile.username.as_str(),
-            auth,
-            AUTHENTICATION_TIMEOUT,
-        )
-        .await?;
+    /// This remains crate-private so callers outside remcmd-ssh cannot retain
+    /// an unauthenticated transport accidentally.
+    pub(crate) async fn open(profile: &ConnectionProfile) -> Result<Self, SshError> {
+        let handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
 
         Ok(Self { handle })
+    }
+
+    /// Authenticates an already-open SSH transport.
+    ///
+    /// AuthMethod is consumed so credentials are dropped after this attempt.
+    pub(crate) async fn authenticate(
+        &mut self,
+        username: &str,
+        auth: AuthMethod,
+    ) -> Result<(), SshError> {
+        Self::authenticate_with_timeout(&mut self.handle, username, auth, AUTHENTICATION_TIMEOUT)
+            .await
+    }
+
+    /// Establishes and authenticates an SSH connection.
+    ///
+    /// This convenience API remains available to callers that do not need
+    /// progress events for the individual connection stages.
+    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
+        let mut transport = Self::open(profile).await?;
+
+        transport
+            .authenticate(profile.username.as_str(), auth)
+            .await?;
+
+        Ok(transport)
     }
 
     pub async fn open_shell(&self, size: PtySize) -> Result<SshShell, SshError> {

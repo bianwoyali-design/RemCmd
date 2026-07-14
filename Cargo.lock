@@ -5003,7 +5003,9 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "remcmd-core",
+ "remcmd-ssh",
  "remcmd-storage",
+ "tokio",
  "unicode-segmentation",
 ]
 
