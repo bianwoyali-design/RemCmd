@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use directories::BaseDirs;
 use remcmd_core::ConnectionProfile;
 use russh::{
     client,
@@ -197,6 +198,12 @@ impl SshTransport {
         path: PathBuf,
         passphrase: Option<SecretString>,
     ) -> Result<PrivateKey, SshError> {
+        let base_dirs = BaseDirs::new();
+        let path = Self::expand_home_path(
+            &path,
+            base_dirs.as_ref().map(|base_dirs| base_dirs.home_dir()),
+        )?;
+
         // Keep a copy for the error message because the original path
         // is moved into the blocking task.
         let error_path = path.clone();
@@ -217,6 +224,21 @@ impl SshTransport {
         })?;
 
         result.map_err(|error| Self::private_key_load_error(&error_path, error))
+    }
+
+    fn expand_home_path(path: &Path, home_dir: Option<&Path>) -> Result<PathBuf, SshError> {
+        let Ok(relative_path) = path.strip_prefix("~") else {
+            return Ok(path.to_path_buf());
+        };
+
+        let home_dir = home_dir.ok_or_else(|| {
+            SshError::new(
+                SshErrorKind::Configuration,
+                "cannot expand private-key path because the home directory is unavailable",
+            )
+        })?;
+
+        Ok(home_dir.join(relative_path))
     }
 
     /// Converts key-file and decryption failures into application errors.
@@ -559,6 +581,46 @@ mod tests {
         let Err(error) = result else {
             panic!("missing private key should fail");
         };
+
+        assert_eq!(error.kind(), SshErrorKind::Configuration);
+    }
+
+    #[test]
+    fn private_key_path_expands_home_directory() {
+        assert_eq!(
+            SshTransport::expand_home_path(
+                Path::new("~/.ssh/id_ed25519"),
+                Some(Path::new("/Users/test")),
+            )
+            .expect("home-relative path should expand"),
+            PathBuf::from("/Users/test/.ssh/id_ed25519")
+        );
+        assert_eq!(
+            SshTransport::expand_home_path(Path::new("~"), Some(Path::new("/Users/test")))
+                .expect("home path should expand"),
+            PathBuf::from("/Users/test")
+        );
+    }
+
+    #[test]
+    fn private_key_path_only_expands_a_standalone_tilde_component() {
+        for path in [
+            Path::new("/tmp/id_ed25519"),
+            Path::new(".ssh/id_ed25519"),
+            Path::new("~other/.ssh/id_ed25519"),
+        ] {
+            assert_eq!(
+                SshTransport::expand_home_path(path, None)
+                    .expect("non-home-relative path should remain unchanged"),
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn home_relative_private_key_path_requires_a_home_directory() {
+        let error = SshTransport::expand_home_path(Path::new("~/.ssh/id_ed25519"), None)
+            .expect_err("home-relative path should require a home directory");
 
         assert_eq!(error.kind(), SshErrorKind::Configuration);
     }

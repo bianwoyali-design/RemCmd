@@ -5001,11 +5001,16 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "remcmd-app"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "gpui",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "remcmd-core",
  "remcmd-ssh",
  "remcmd-storage",
  "secrecy",
+ "tempfile",
  "tokio",
  "unicode-segmentation",
 ]
@@ -5022,6 +5027,7 @@ dependencies = [
 name = "remcmd-ssh"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "rand 0.10.2",
  "remcmd-core",
  "russh",
