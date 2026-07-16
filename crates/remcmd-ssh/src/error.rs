@@ -7,6 +7,7 @@ pub enum SshErrorKind {
     Network,
     HostKey,
     Authentication,
+    PrivateKeyPassphrase,
     Timeout,
     Protocol,
 }

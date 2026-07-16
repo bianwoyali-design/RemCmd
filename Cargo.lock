@@ -5005,6 +5005,7 @@ dependencies = [
  "remcmd-core",
  "remcmd-ssh",
  "remcmd-storage",
+ "secrecy",
  "tokio",
  "unicode-segmentation",
 ]

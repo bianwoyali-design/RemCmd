@@ -7,16 +7,19 @@ use ssh_runtime::SshRuntime;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Application, Bounds, BoxShadow, Context, Entity, FontWeight, IntoElement, Render,
-    SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
-    div, point, prelude::*, px, rgb, rgba, size,
+    App, Application, Bounds, BoxShadow, Context, Entity, Focusable, FontWeight, IntoElement,
+    KeyBinding, Render, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
 };
 
 use remcmd_core::{AuthConfig, ConnectionProfile};
 use remcmd_ssh::{
-    AuthMethod, ConnectionEvent, ConnectionHandle, PtySize, SessionState, ShellEvent, SshConnection,
+    AuthMethod, ConnectionEvent, ConnectionHandle, PtySize, SessionState, ShellEvent,
+    SshConnection, SshErrorKind,
 };
 use remcmd_storage::{default_profiles_path, ensure_profiles_file, load_profiles, save_profiles};
+
+gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -30,6 +33,7 @@ struct RemCmdApp {
     connection_profile_id: Option<String>,
     connection_error: Option<String>,
     connection_message: Option<String>,
+    credential_prompt: Option<CredentialPrompt>,
 }
 
 #[derive(Clone)]
@@ -39,6 +43,19 @@ struct ProfileEditor {
     host: Entity<TextField>,
     port: Entity<TextField>,
     username: Entity<TextField>,
+}
+
+struct CredentialPrompt {
+    profile_id: String,
+    kind: CredentialPromptKind,
+    input: Entity<TextField>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+enum CredentialPromptKind {
+    Password,
+    PrivateKeyPassphrase { path: PathBuf },
 }
 
 // Application construction and shared data helpers.
@@ -76,6 +93,7 @@ impl RemCmdApp {
             connection_profile_id: None,
             connection_error: None,
             connection_message: None,
+            credential_prompt: None,
         };
 
         app.load_editor_for_selected_profile(cx);
@@ -93,16 +111,6 @@ impl RemCmdApp {
     fn persist_profiles(&mut self) {
         if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
             self.form_error = Some(format!("Failed to save profiles:\n{error}"));
-        }
-    }
-
-    fn auth_method_for_profile(profile: &ConnectionProfile) -> Result<AuthMethod, String> {
-        match &profile.auth {
-            AuthConfig::Password => {
-                Err("Password authentication requires a password prompt".into())
-            }
-            AuthConfig::PrivateKey { path } => Ok(AuthMethod::private_key(path.clone(), None)),
-            AuthConfig::Agent => Ok(AuthMethod::Agent),
         }
     }
 
@@ -126,7 +134,50 @@ impl RemCmdApp {
 
 // User interaction handlers.
 impl RemCmdApp {
+    fn open_credential_prompt(
+        &mut self,
+        profile_id: String,
+        kind: CredentialPromptKind,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextField> {
+        self.dismiss_credential_prompt(cx);
+
+        let placeholder = match kind {
+            CredentialPromptKind::Password => "Password",
+            CredentialPromptKind::PrivateKeyPassphrase { .. } => "Passphrase",
+        };
+        let input = cx.new(|cx| TextField::new_secure(cx, placeholder));
+        cx.observe(&input, |this, input, cx| {
+            if let Some(prompt) = this.credential_prompt.as_mut()
+                && prompt.input == input
+                && prompt.error.take().is_some()
+            {
+                cx.notify();
+            }
+        })
+        .detach();
+
+        self.credential_prompt = Some(CredentialPrompt {
+            profile_id,
+            kind,
+            input: input.clone(),
+            error,
+        });
+        self.connection_error = None;
+        cx.notify();
+
+        input
+    }
+
+    fn dismiss_credential_prompt(&mut self, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.credential_prompt.take() {
+            prompt.input.update(cx, |input, cx| input.clear(cx));
+        }
+    }
+
     fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        self.dismiss_credential_prompt(cx);
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
         cx.notify();
@@ -234,7 +285,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn connect_selected_profile(&mut self, cx: &mut Context<Self>) {
+    fn connect_selected_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.connection_state.can_connect() {
             return;
         }
@@ -243,14 +294,31 @@ impl RemCmdApp {
             return;
         };
 
-        let auth = match Self::auth_method_for_profile(&profile) {
-            Ok(auth) => auth,
-            Err(error) => {
-                self.connection_error = Some(error);
-                cx.notify();
+        let auth = match &profile.auth {
+            AuthConfig::Password => {
+                let input = self.open_credential_prompt(
+                    profile.id.clone(),
+                    CredentialPromptKind::Password,
+                    None,
+                    cx,
+                );
+                window.focus(&input.focus_handle(cx));
                 return;
             }
+            AuthConfig::PrivateKey { path } => AuthMethod::private_key(path.clone(), None),
+            AuthConfig::Agent => AuthMethod::Agent,
         };
+
+        self.start_connection(profile, auth, cx);
+    }
+
+    fn start_connection(
+        &mut self,
+        profile: ConnectionProfile,
+        auth: AuthMethod,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_credential_prompt(cx);
 
         let runtime = cx.global::<SshRuntime>().handle();
         let connection = SshConnection::spawn(&runtime, profile.clone(), auth, PtySize::default());
@@ -277,6 +345,97 @@ impl RemCmdApp {
         .detach();
 
         cx.notify();
+    }
+
+    fn submit_credential_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.credential_prompt.as_mut() else {
+            return;
+        };
+
+        if prompt.input.read(cx).is_empty() {
+            let label = match prompt.kind {
+                CredentialPromptKind::Password => "Password",
+                CredentialPromptKind::PrivateKeyPassphrase { .. } => "Passphrase",
+            };
+            prompt.error = Some(format!("{label} is required"));
+            window.focus(&prompt.input.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+
+        let profile_id = prompt.profile_id.clone();
+        let kind = prompt.kind.clone();
+        let input = prompt.input.clone();
+
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            self.dismiss_credential_prompt(cx);
+            self.connection_error = Some("Connection profile no longer exists".into());
+            cx.notify();
+            return;
+        };
+
+        let secret = input.update(cx, |input, cx| input.take_text(cx));
+        self.credential_prompt = None;
+
+        let auth = match kind {
+            CredentialPromptKind::Password => AuthMethod::password(secret),
+            CredentialPromptKind::PrivateKeyPassphrase { path } => {
+                AuthMethod::private_key(path, Some(secret))
+            }
+        };
+
+        self.start_connection(profile, auth, cx);
+    }
+
+    fn on_submit_credential(
+        &mut self,
+        _: &SubmitCredential,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_credential_prompt(window, cx);
+    }
+
+    fn on_cancel_credential(
+        &mut self,
+        _: &CancelCredential,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_credential_prompt(cx);
+        cx.notify();
+    }
+
+    fn prompt_for_private_key_passphrase(
+        &mut self,
+        profile_id: String,
+        error: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(path) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .and_then(|profile| match &profile.auth {
+                AuthConfig::PrivateKey { path } => Some(path.clone()),
+                AuthConfig::Password | AuthConfig::Agent => None,
+            })
+        else {
+            return false;
+        };
+
+        self.open_credential_prompt(
+            profile_id,
+            CredentialPromptKind::PrivateKeyPassphrase { path },
+            Some(error),
+            cx,
+        );
+        true
     }
 
     fn disconnect_active_connection(&mut self, cx: &mut Context<Self>) {
@@ -318,10 +477,28 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::Failed(error) => {
+                let failed_profile_id = self.connection_profile_id.take();
                 self.connection_state = SessionState::Failed;
                 self.connection_handle = None;
-                self.connection_profile_id = None;
-                self.connection_error = Some(error.to_string());
+
+                let prompted_for_passphrase = if error.kind() == SshErrorKind::PrivateKeyPassphrase
+                {
+                    failed_profile_id
+                        .map(|profile_id| {
+                            self.prompt_for_private_key_passphrase(
+                                profile_id,
+                                error.to_string(),
+                                cx,
+                            )
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if !prompted_for_passphrase {
+                    self.connection_error = Some(error.to_string());
+                }
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Output(_) | ShellEvent::ExtendedOutput { .. }) => {
@@ -361,19 +538,162 @@ impl RemCmdApp {
 
 // Root rendering entry point and drawing helpers.
 impl Render for RemCmdApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_profile = self.selected_profile().cloned();
 
-        div()
+        let mut root = div()
+            .relative()
             .flex()
             .size_full()
             .text_color(rgb(0xf4f4f5))
             .child(self.render_sidebar(cx))
-            .child(self.render_detail_panel(selected_profile, cx))
+            .child(self.render_detail_panel(selected_profile, cx));
+
+        if let Some(prompt) = self.credential_prompt.as_ref() {
+            let focus_handle = prompt.input.focus_handle(cx);
+            if !focus_handle.is_focused(window) {
+                window.focus(&focus_handle);
+            }
+
+            root = root.child(self.render_credential_prompt(cx));
+        }
+
+        root
     }
 }
 
 impl RemCmdApp {
+    fn render_credential_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let prompt = self
+            .credential_prompt
+            .as_ref()
+            .expect("credential prompt should exist before rendering");
+        let profile_label = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == prompt.profile_id)
+            .map(ConnectionProfile::address)
+            .unwrap_or_else(|| prompt.profile_id.clone());
+        let (title, field_label, key_path) = match &prompt.kind {
+            CredentialPromptKind::Password => ("Password", "Password", None),
+            CredentialPromptKind::PrivateKeyPassphrase { path } => (
+                "Private key passphrase",
+                "Passphrase",
+                Some(path.display().to_string()),
+            ),
+        };
+
+        let mut modal = div()
+            .w(px(420.0))
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgba(0xffffff24))
+            .bg(rgb(0x242424))
+            .shadow(vec![BoxShadow {
+                color: rgba(0x00000066).into(),
+                offset: point(px(0.0), px(8.0)),
+                blur_radius: px(24.0),
+                spread_radius: px(-8.0),
+            }])
+            .child(div().font_weight(FontWeight::MEDIUM).child(title))
+            .child(
+                div()
+                    .mt_1()
+                    .text_sm()
+                    .text_color(rgb(0xa1a1aa))
+                    .child(profile_label),
+            );
+
+        if let Some(path) = key_path {
+            modal = modal.child(
+                div()
+                    .mt_1()
+                    .w_full()
+                    .truncate()
+                    .text_sm()
+                    .text_color(rgb(0x71717a))
+                    .child(path),
+            );
+        }
+
+        modal = modal
+            .child(div().mt_4().text_sm().child(field_label))
+            .child(
+                div()
+                    .mt_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgba(0xffffff2e))
+                    .bg(rgb(0x181818))
+                    .child(prompt.input.clone()),
+            );
+
+        if let Some(error) = prompt.error.as_ref() {
+            modal = modal.child(
+                div()
+                    .mt_2()
+                    .text_sm()
+                    .text_color(rgb(0xfca5a5))
+                    .child(error.clone()),
+            );
+        }
+
+        modal = modal.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .mt_4()
+                .child(
+                    div()
+                        .id("credential_cancel")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgba(0xffffff12))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(rgba(0xffffff1f)))
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.dismiss_credential_prompt(cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("credential_submit")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(0x2563eb))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(rgb(0x3b82f6)))
+                        .child("Connect")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_credential_prompt(window, cx);
+                        })),
+                ),
+        );
+
+        div()
+            .id("credential_prompt")
+            .key_context("CredentialPrompt")
+            .on_action(cx.listener(Self::on_submit_credential))
+            .on_action(cx.listener(Self::on_cancel_credential))
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000008f))
+            .occlude()
+            .child(modal)
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut connection_list = div()
             .id("connection_list")
@@ -616,8 +936,8 @@ impl RemCmdApp {
         if can_connect {
             button = button
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.connect_selected_profile(cx);
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.connect_selected_profile(window, cx);
                 }));
         } else if can_disconnect {
             button = button
@@ -706,10 +1026,18 @@ fn open_main_window(cx: &mut App) {
         .expect("failed to open main window");
 }
 
+fn bind_credential_prompt_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("enter", SubmitCredential, Some("CredentialPrompt")),
+        KeyBinding::new("escape", CancelCredential, Some("CredentialPrompt")),
+    ]);
+}
+
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
 
     bind_text_field_keys(cx);
+    bind_credential_prompt_keys(cx);
     open_main_window(cx);
     cx.activate(true);
 }
