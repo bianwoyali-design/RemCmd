@@ -8,8 +8,9 @@ use std::path::PathBuf;
 
 use gpui::{
     App, Application, Bounds, BoxShadow, Context, Entity, Focusable, FontWeight, IntoElement,
-    KeyBinding, Render, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
+    KeyBinding, PathPromptOptions, Render, SharedString, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba,
+    size,
 };
 
 use remcmd_core::{AuthConfig, ConnectionProfile};
@@ -43,6 +44,42 @@ struct ProfileEditor {
     host: Entity<TextField>,
     port: Entity<TextField>,
     username: Entity<TextField>,
+    auth_kind: ProfileAuthKind,
+    private_key_path: Entity<TextField>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileAuthKind {
+    Password,
+    PrivateKey,
+    Agent,
+}
+
+impl ProfileAuthKind {
+    fn from_config(config: &AuthConfig) -> Self {
+        match config {
+            AuthConfig::Password => Self::Password,
+            AuthConfig::PrivateKey { .. } => Self::PrivateKey,
+            AuthConfig::Agent => Self::Agent,
+        }
+    }
+
+    fn into_config(self, private_key_path: &str) -> Result<AuthConfig, &'static str> {
+        match self {
+            Self::Password => Ok(AuthConfig::Password),
+            Self::PrivateKey => {
+                let path = private_key_path.trim();
+                if path.is_empty() {
+                    return Err("Private key path is required");
+                }
+
+                Ok(AuthConfig::PrivateKey {
+                    path: PathBuf::from(path),
+                })
+            }
+            Self::Agent => Ok(AuthConfig::Agent),
+        }
+    }
 }
 
 struct CredentialPrompt {
@@ -120,12 +157,20 @@ impl RemCmdApp {
             return;
         };
 
+        let auth_kind = ProfileAuthKind::from_config(&profile.auth);
+        let private_key_path = match &profile.auth {
+            AuthConfig::PrivateKey { path } => path.to_string_lossy().into_owned(),
+            AuthConfig::Password | AuthConfig::Agent => String::new(),
+        };
+
         self.editor = Some(ProfileEditor {
             profile_id: profile.id.clone(),
             name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
             host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
             port: cx.new(|cx| TextField::new(cx, profile.port.to_string(), "Port")),
             username: cx.new(|cx| TextField::new(cx, profile.username, "Username")),
+            auth_kind,
+            private_key_path: cx.new(|cx| TextField::new(cx, private_key_path, "Private key path")),
         });
 
         self.form_error = None;
@@ -241,6 +286,72 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn select_auth_method(
+        &mut self,
+        auth_kind: ProfileAuthKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+
+        editor.auth_kind = auth_kind;
+        let private_key_path = editor.private_key_path.clone();
+        self.form_error = None;
+
+        if auth_kind == ProfileAuthKind::PrivateKey {
+            window.focus(&private_key_path.focus_handle(cx));
+        }
+
+        cx.notify();
+    }
+
+    fn browse_private_key(&mut self, cx: &mut Context<Self>) {
+        let Some(profile_id) = self.editor.as_ref().map(|editor| editor.profile_id.clone()) else {
+            return;
+        };
+
+        let selected_paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select".into()),
+        });
+
+        cx.spawn(async move |this, cx| match selected_paths.await {
+            Ok(Ok(Some(paths))) => {
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+
+                let _ = this.update(cx, |this, cx| {
+                    let Some(editor) = this
+                        .editor
+                        .as_mut()
+                        .filter(|editor| editor.profile_id == profile_id)
+                    else {
+                        return;
+                    };
+
+                    let path = path.to_string_lossy().into_owned();
+                    editor.private_key_path =
+                        cx.new(|cx| TextField::new(cx, path, "Private key path"));
+                    this.form_error = None;
+                    cx.notify();
+                });
+            }
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.form_error = Some(format!("Failed to open file picker: {error}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn save_editor(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.editor.clone() else {
             return;
@@ -250,6 +361,7 @@ impl RemCmdApp {
         let host = editor.host.read(cx).text();
         let port_text = editor.port.read(cx).text();
         let username = editor.username.read(cx).text();
+        let private_key_path = editor.private_key_path.read(cx).text();
 
         let Ok(port) = port_text.trim().parse::<u16>() else {
             self.form_error = Some("Port must be a number from 1 to 65535".into());
@@ -263,6 +375,15 @@ impl RemCmdApp {
             return;
         };
 
+        let auth = match editor.auth_kind.into_config(&private_key_path) {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.form_error = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+
         if let Some(profile) = self
             .profiles
             .iter_mut()
@@ -272,6 +393,7 @@ impl RemCmdApp {
             profile.host = host;
             profile.port = port;
             profile.username = username;
+            profile.auth = auth;
         }
 
         self.form_error = None;
@@ -798,7 +920,7 @@ impl RemCmdApp {
             .pt(px(52.0))
             .bg(rgb(0x181818))
             .border_l_1()
-            .border_color(rgba(0xffffff26))
+            .border_color(rgba(0xffffff40))
             .shadow(vec![BoxShadow {
                 color: rgba(0x0000001f).into(),
                 offset: point(px(-1.0), px(0.0)),
@@ -844,6 +966,10 @@ impl RemCmdApp {
                     .child(self.render_form_row("Host", editor.host.clone()))
                     .child(self.render_form_row("Port", editor.port.clone()))
                     .child(self.render_form_row("Username", editor.username.clone()))
+                    .child(self.render_auth_method_row(editor.auth_kind, cx))
+                    .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
+                        this.child(self.render_private_key_row(editor.private_key_path.clone(), cx))
+                    })
                     .when_some(self.form_error.as_ref(), |this, error| {
                         this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
                     })
@@ -986,12 +1112,158 @@ impl RemCmdApp {
         format!("{state} - {profile_name}")
     }
 
+    fn render_auth_method_row(
+        &self,
+        selected: ProfileAuthKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .mt_3()
+            .child(div().w(px(112.0)).child("Authentication"))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .h(px(38.0))
+                    .p(px(2.0))
+                    .gap(px(2.0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgba(0xffffff26))
+                    .bg(rgba(0xffffff0d))
+                    .child(self.render_auth_method_option(
+                        "auth_password",
+                        "Password",
+                        ProfileAuthKind::Password,
+                        selected,
+                        cx,
+                    ))
+                    .child(self.render_auth_method_option(
+                        "auth_private_key",
+                        "Private Key",
+                        ProfileAuthKind::PrivateKey,
+                        selected,
+                        cx,
+                    ))
+                    .child(self.render_auth_method_option(
+                        "auth_agent",
+                        "SSH Agent",
+                        ProfileAuthKind::Agent,
+                        selected,
+                        cx,
+                    )),
+            )
+    }
+
+    fn render_auth_method_option(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        auth_kind: ProfileAuthKind,
+        selected: ProfileAuthKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = auth_kind == selected;
+        let background = if is_selected {
+            rgb(0x4f4d50)
+        } else {
+            rgba(0xffffff00)
+        };
+        let border = if is_selected {
+            rgba(0xffffff40)
+        } else {
+            rgba(0xffffff00)
+        };
+
+        div()
+            .id(id)
+            .flex()
+            .flex_1()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| {
+                if is_selected {
+                    this.bg(rgb(0x59575b))
+                } else {
+                    this.bg(rgba(0xffffff18))
+                }
+            })
+            .when(is_selected, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: rgba(0x0000002e).into(),
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(3.0),
+                    spread_radius: px(-1.0),
+                }])
+            })
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_auth_method(auth_kind, window, cx);
+            }))
+    }
+
+    fn render_private_key_row(
+        &self,
+        field: Entity<TextField>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .mt_3()
+            .child(div().w(px(112.0)).child("Key file"))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgba(0xffffff26))
+                            .bg(rgba(0xffffff12))
+                            .child(field),
+                    )
+                    .child(
+                        div()
+                            .id("browse_private_key")
+                            .flex()
+                            .flex_none()
+                            .h(px(34.0))
+                            .items_center()
+                            .px_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgba(0xffffff26))
+                            .bg(rgba(0xffffff12))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgba(0xffffff1f)))
+                            .child("Browse")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.browse_private_key(cx);
+                            })),
+                    ),
+            )
+    }
+
     fn render_form_row(&self, label: &'static str, field: Entity<TextField>) -> impl IntoElement {
         div()
             .flex()
             .items_center()
             .mt_3()
-            .child(div().w(px(96.0)).child(label))
+            .child(div().w(px(112.0)).child(label))
             .child(
                 div()
                     .flex_1()
@@ -1044,4 +1316,57 @@ fn launch(cx: &mut App) {
 
 fn main() {
     Application::new().run(launch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_auth_kind_reflects_saved_configuration() {
+        assert_eq!(
+            ProfileAuthKind::from_config(&AuthConfig::Password),
+            ProfileAuthKind::Password
+        );
+        assert_eq!(
+            ProfileAuthKind::from_config(&AuthConfig::PrivateKey {
+                path: PathBuf::from("/tmp/id_ed25519"),
+            }),
+            ProfileAuthKind::PrivateKey
+        );
+        assert_eq!(
+            ProfileAuthKind::from_config(&AuthConfig::Agent),
+            ProfileAuthKind::Agent
+        );
+    }
+
+    #[test]
+    fn private_key_authentication_requires_a_path() {
+        assert_eq!(
+            ProfileAuthKind::PrivateKey.into_config("   "),
+            Err("Private key path is required")
+        );
+    }
+
+    #[test]
+    fn private_key_authentication_trims_the_path() {
+        assert_eq!(
+            ProfileAuthKind::PrivateKey.into_config("  /Users/test/.ssh/id_ed25519  "),
+            Ok(AuthConfig::PrivateKey {
+                path: PathBuf::from("/Users/test/.ssh/id_ed25519"),
+            })
+        );
+    }
+
+    #[test]
+    fn password_and_agent_authentication_do_not_use_the_key_path() {
+        assert_eq!(
+            ProfileAuthKind::Password.into_config("ignored"),
+            Ok(AuthConfig::Password)
+        );
+        assert_eq!(
+            ProfileAuthKind::Agent.into_config("ignored"),
+            Ok(AuthConfig::Agent)
+        );
+    }
 }
