@@ -16,6 +16,8 @@ version = "0.1.0"
 [workspace.dependencies]
 gpui = "0.2.2"
 
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+
 secrecy = "0.10.3"
 
 serde = { version = "1", features = ["derive"] }
