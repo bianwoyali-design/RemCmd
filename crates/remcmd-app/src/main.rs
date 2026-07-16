@@ -4,14 +4,19 @@ use text_field::{TextField, bind_text_field_keys};
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
+#[cfg(target_os = "macos")]
+mod private_key_picker;
+
 use std::path::PathBuf;
 
 use gpui::{
     App, Application, Bounds, BoxShadow, Context, Entity, Focusable, FontWeight, IntoElement,
-    KeyBinding, PathPromptOptions, Render, SharedString, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba,
-    size,
+    KeyBinding, Render, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
 };
+
+#[cfg(not(target_os = "macos"))]
+use gpui::PathPromptOptions;
 
 use remcmd_core::{AuthConfig, ConnectionProfile};
 use remcmd_ssh::{
@@ -307,6 +312,33 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    #[cfg(target_os = "macos")]
+    fn browse_private_key(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+
+        let profile_id = editor.profile_id.clone();
+        let current_path = editor.private_key_path.read(cx).text();
+        let current_path =
+            (!current_path.trim().is_empty()).then(|| PathBuf::from(current_path.trim()));
+
+        cx.spawn(async move |this, cx| {
+            let result = private_key_picker::pick_private_key(current_path.as_deref());
+
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(Some(path)) => this.set_private_key_path(&profile_id, path, cx),
+                Ok(None) => {}
+                Err(error) => {
+                    this.form_error = Some(format!("Failed to open file picker: {error}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn browse_private_key(&mut self, cx: &mut Context<Self>) {
         let Some(profile_id) = self.editor.as_ref().map(|editor| editor.profile_id.clone()) else {
             return;
@@ -326,30 +358,39 @@ impl RemCmdApp {
                 };
 
                 let _ = this.update(cx, |this, cx| {
-                    let Some(editor) = this
-                        .editor
-                        .as_mut()
-                        .filter(|editor| editor.profile_id == profile_id)
-                    else {
-                        return;
-                    };
-
-                    let path = path.to_string_lossy().into_owned();
-                    editor.private_key_path =
-                        cx.new(|cx| TextField::new(cx, path, "Private key path"));
-                    this.form_error = None;
-                    cx.notify();
+                    this.set_private_key_path(&profile_id, path, cx);
                 });
             }
             Ok(Ok(None)) | Err(_) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |this, cx| {
-                    this.form_error = Some(format!("Failed to open file picker: {error}"));
-                    cx.notify();
+                    if this
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.profile_id == profile_id)
+                    {
+                        this.form_error = Some(format!("Failed to open file picker: {error}"));
+                        cx.notify();
+                    }
                 });
             }
         })
         .detach();
+    }
+
+    fn set_private_key_path(&mut self, profile_id: &str, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .editor
+            .as_mut()
+            .filter(|editor| editor.profile_id == profile_id)
+        else {
+            return;
+        };
+
+        let path = path.to_string_lossy().into_owned();
+        editor.private_key_path = cx.new(|cx| TextField::new(cx, path, "Private key path"));
+        self.form_error = None;
+        cx.notify();
     }
 
     fn save_editor(&mut self, cx: &mut Context<Self>) {
