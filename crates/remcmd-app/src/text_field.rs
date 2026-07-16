@@ -7,6 +7,7 @@ use gpui::{
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, hsla, point, prelude::*, px, relative, rgba, size,
 };
+use secrecy::zeroize::Zeroize;
 use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
@@ -28,10 +29,30 @@ actions!(
     ]
 );
 
+fn secure_mask(content: &str) -> String {
+    "*".repeat(content.graphemes(true).count())
+}
+
+fn secure_display_offset(content: &str, content_offset: usize) -> usize {
+    content
+        .grapheme_indices(true)
+        .take_while(|(offset, _)| *offset < content_offset)
+        .count()
+}
+
+fn secure_content_offset(content: &str, display_offset: usize) -> usize {
+    content
+        .grapheme_indices(true)
+        .nth(display_offset)
+        .map(|(offset, _)| offset)
+        .unwrap_or(content.len())
+}
+
 pub struct TextField {
     focus_handle: FocusHandle,
-    content: SharedString,
+    content: String,
     placeholder: SharedString,
+    is_secure: bool,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -43,16 +64,29 @@ pub struct TextField {
 impl TextField {
     pub fn new(
         cx: &mut Context<Self>,
-        value: impl Into<SharedString>,
+        value: impl Into<String>,
         placeholder: impl Into<SharedString>,
     ) -> Self {
-        let content = value.into();
+        Self::with_mode(cx, value.into(), placeholder.into(), false)
+    }
+
+    pub fn new_secure(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
+        Self::with_mode(cx, String::new(), placeholder.into(), true)
+    }
+
+    fn with_mode(
+        cx: &mut Context<Self>,
+        content: String,
+        placeholder: SharedString,
+        is_secure: bool,
+    ) -> Self {
         let cursor = content.len();
 
         Self {
             focus_handle: cx.focus_handle(),
             content,
-            placeholder: placeholder.into(),
+            placeholder,
+            is_secure,
             selected_range: cursor..cursor,
             selection_reversed: false,
             marked_range: None,
@@ -63,7 +97,28 @@ impl TextField {
     }
 
     pub fn text(&self) -> String {
-        self.content.to_string()
+        self.content.clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    pub fn take_text(&mut self, cx: &mut Context<Self>) -> String {
+        let content = std::mem::take(&mut self.content);
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+        content
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.content.zeroize();
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -158,6 +213,10 @@ impl TextField {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_secure {
+            return;
+        }
+
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -166,6 +225,10 @@ impl TextField {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_secure {
+            return;
+        }
+
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -205,7 +268,29 @@ impl TextField {
             return self.content.len();
         }
 
-        line.closest_index_for_x(position.x - bounds.left())
+        let display_offset = line.closest_index_for_x(position.x - bounds.left());
+        self.content_offset_for_display_offset(display_offset)
+    }
+
+    fn display_offset_for_content_offset(&self, content_offset: usize) -> usize {
+        if self.is_secure {
+            secure_display_offset(&self.content, content_offset)
+        } else {
+            content_offset
+        }
+    }
+
+    fn content_offset_for_display_offset(&self, display_offset: usize) -> usize {
+        if self.is_secure {
+            secure_content_offset(&self.content, display_offset)
+        } else {
+            display_offset
+        }
+    }
+
+    fn display_range_for_content_range(&self, range: &Range<usize>) -> Range<usize> {
+        self.display_offset_for_content_offset(range.start)
+            ..self.display_offset_for_content_offset(range.end)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -331,9 +416,7 @@ impl EntityInputHandler for TextField {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        self.content.replace_range(range.clone(), new_text);
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
@@ -354,9 +437,7 @@ impl EntityInputHandler for TextField {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        self.content.replace_range(range.clone(), new_text);
 
         if new_text.is_empty() {
             self.marked_range = None;
@@ -382,14 +463,15 @@ impl EntityInputHandler for TextField {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        let display_range = self.display_range_for_content_range(&range);
 
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(display_range.start),
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(display_range.end),
                 bounds.bottom(),
             ),
         ))
@@ -403,7 +485,8 @@ impl EntityInputHandler for TextField {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(line_point.x)?;
+        let display_offset = last_layout.index_for_x(line_point.x)?;
+        let utf8_index = self.content_offset_for_display_offset(display_offset);
 
         Some(self.offset_to_utf16(utf8_index))
     }
@@ -463,9 +546,17 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content = input.content.clone();
-        let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let content: SharedString = if input.is_secure {
+            secure_mask(&input.content).into()
+        } else {
+            input.content.clone().into()
+        };
+        let selected_range = input.display_range_for_content_range(&input.selected_range);
+        let cursor = input.display_offset_for_content_offset(input.cursor_offset());
+        let marked_range = input
+            .marked_range
+            .as_ref()
+            .map(|range| input.display_range_for_content_range(range));
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
@@ -483,7 +574,7 @@ impl Element for TextElement {
             strikethrough: None,
         };
 
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+        let runs = if let Some(marked_range) = marked_range.as_ref() {
             vec![
                 TextRun {
                     len: marked_range.start,
@@ -636,6 +727,14 @@ impl Focusable for TextField {
     }
 }
 
+impl Drop for TextField {
+    fn drop(&mut self) {
+        if self.is_secure {
+            self.content.zeroize();
+        }
+    }
+}
+
 pub fn bind_text_field_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, None),
@@ -652,4 +751,37 @@ pub fn bind_text_field_keys(cx: &mut App) {
         KeyBinding::new("end", End, None),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_mask_uses_one_character_per_grapheme() {
+        let content = "a\u{5bc6}e\u{301}\u{1f511}";
+
+        assert_eq!(secure_mask(content), "****");
+    }
+
+    #[test]
+    fn secure_offsets_round_trip_at_grapheme_boundaries() {
+        let content = "a\u{5bc6}e\u{301}\u{1f511}";
+        let mut boundaries = content
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        boundaries.push(content.len());
+
+        for (display_offset, content_offset) in boundaries.into_iter().enumerate() {
+            assert_eq!(
+                secure_display_offset(content, content_offset),
+                display_offset
+            );
+            assert_eq!(
+                secure_content_offset(content, display_offset),
+                content_offset
+            );
+        }
+    }
 }

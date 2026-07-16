@@ -227,7 +227,7 @@ impl SshTransport {
             | russh::keys::Error::Pad(_)
             | russh::keys::Error::Unpad(_)
             | russh::keys::Error::SshKey(russh::keys::ssh_key::Error::Crypto) => {
-                SshErrorKind::Authentication
+                SshErrorKind::PrivateKeyPassphrase
             }
 
             // Missing, unreadable, corrupt, or unsupported files are configuration errors.
@@ -570,6 +570,6 @@ mod tests {
             russh::keys::Error::KeyIsEncrypted,
         );
 
-        assert_eq!(error.kind(), SshErrorKind::Authentication);
+        assert_eq!(error.kind(), SshErrorKind::PrivateKeyPassphrase);
     }
 }
