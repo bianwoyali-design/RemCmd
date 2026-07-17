@@ -43,6 +43,17 @@ impl ConnectionProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    System,
+
+    Light,
+
+    Dark,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
@@ -89,5 +100,17 @@ mod tests {
             serde_json::from_str(&json).expect("profile should deserialize");
 
         assert_eq!(loaded, profile);
+    }
+
+    #[test]
+    fn theme_mode_serializes_as_a_stable_lowercase_value() {
+        assert_eq!(
+            serde_json::to_string(&ThemeMode::System).unwrap(),
+            r#""system""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ThemeMode>(r#""light""#).unwrap(),
+            ThemeMode::Light
+        );
     }
 }

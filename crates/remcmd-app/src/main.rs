@@ -4,6 +4,9 @@ use text_field::{TextField, bind_text_field_keys};
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
+mod theme;
+use theme::{ButtonVariant, Theme, button, set_global_theme};
+
 mod terminal_input;
 use terminal_input::{
     encode_alternate_scroll, encode_focus, encode_key, encode_paste,
@@ -22,20 +25,23 @@ use gpui::{
     App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, Pixels, Render,
-    ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TitlebarOptions,
+    ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, Subscription, TitlebarOptions,
     UTF16Selection, UnderlineStyle as GpuiUnderlineStyle, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba, size,
+    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
 use gpui::PathPromptOptions;
 
-use remcmd_core::{AuthConfig, ConnectionProfile};
+use remcmd_core::{AuthConfig, ConnectionProfile, ThemeMode};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, PtySize, SessionState, ShellEvent,
     SshConnection, SshErrorKind,
 };
-use remcmd_storage::{default_profiles_path, ensure_profiles_file, load_profiles, save_profiles};
+use remcmd_storage::{
+    AppSettings, default_profiles_path, default_settings_path, ensure_profiles_file, load_profiles,
+    load_settings, save_profiles, save_settings,
+};
 use remcmd_terminal::{
     Clipboard as TerminalClipboard, CursorShape, Scroll as TerminalScroll, TerminalEngine,
     TerminalEvent, TerminalModes, TerminalSnapshot, TextAreaSize,
@@ -72,6 +78,12 @@ struct RemCmdApp {
     terminal_focus_handle: FocusHandle,
     terminal_marked_text: String,
     terminal_scroll_accumulator: f32,
+    active_panel: ActivePanel,
+    theme_mode: ThemeMode,
+    theme: Theme,
+    settings_path: PathBuf,
+    settings_error: Option<String>,
+    _appearance_subscription: Subscription,
 }
 
 struct ActiveTerminal {
@@ -129,6 +141,13 @@ struct TerminalLayout {
     pty_size: PtySize,
     cell_width: u16,
     cell_height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ActivePanel {
+    #[default]
+    Connection,
+    Settings,
 }
 
 #[derive(Clone)]
@@ -193,6 +212,7 @@ enum CredentialPromptKind {
 impl RemCmdApp {
     fn load(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let profiles_path = default_profiles_path().expect("failed to resolve profiles path");
+        let settings_path = default_settings_path().expect("failed to resolve settings path");
 
         let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
             .and_then(|_| load_profiles(&profiles_path))
@@ -212,6 +232,21 @@ impl RemCmdApp {
             .unwrap_or(0)
             + 1;
 
+        let (settings, settings_error) = match load_settings(&settings_path) {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                AppSettings::default(),
+                Some(format!("Failed to load settings: {error}")),
+            ),
+        };
+        let theme_mode = settings.theme_mode;
+        let theme = Theme::resolve(theme_mode, window);
+        set_global_theme(theme, cx);
+
+        let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
+            this.refresh_system_theme(window, cx);
+        });
+
         let terminal_focus_handle = cx.focus_handle();
         let mut app = Self {
             profiles,
@@ -230,6 +265,12 @@ impl RemCmdApp {
             terminal_focus_handle: terminal_focus_handle.clone(),
             terminal_marked_text: String::new(),
             terminal_scroll_accumulator: 0.0,
+            active_panel: ActivePanel::Connection,
+            theme_mode,
+            theme,
+            settings_path,
+            settings_error,
+            _appearance_subscription: appearance_subscription,
         };
 
         cx.on_focus(&terminal_focus_handle, window, |this, _, cx| {
@@ -257,6 +298,28 @@ impl RemCmdApp {
         if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
             self.form_error = Some(format!("Failed to save profiles:\n{error}"));
         }
+    }
+
+    fn refresh_system_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.theme_mode != ThemeMode::System {
+            return;
+        }
+
+        self.theme = Theme::resolve(self.theme_mode, window);
+        set_global_theme(self.theme, cx);
+        cx.notify();
+    }
+
+    fn set_theme_mode(&mut self, theme_mode: ThemeMode, window: &Window, cx: &mut Context<Self>) {
+        self.theme_mode = theme_mode;
+        self.theme = Theme::resolve(theme_mode, window);
+        set_global_theme(self.theme, cx);
+
+        let settings = AppSettings { theme_mode };
+        self.settings_error = save_settings(&self.settings_path, &settings)
+            .err()
+            .map(|error| format!("Failed to save settings: {error}"));
+        cx.notify();
     }
 
     fn load_editor_for_selected_profile(&mut self, cx: &mut Context<Self>) {
@@ -331,6 +394,7 @@ impl RemCmdApp {
 
     fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
+        self.active_panel = ActivePanel::Connection;
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
         cx.notify();
@@ -347,6 +411,7 @@ impl RemCmdApp {
             "ubuntu",
         );
 
+        self.active_panel = ActivePanel::Connection;
         self.selected_profile_id = Some(profile.id.clone());
         self.profiles.push(profile);
         self.next_profile_number += 1;
@@ -354,6 +419,12 @@ impl RemCmdApp {
         self.load_editor_for_selected_profile(cx);
         self.persist_profiles();
 
+        cx.notify();
+    }
+
+    fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_credential_prompt(cx);
+        self.active_panel = ActivePanel::Settings;
         cx.notify();
     }
 
@@ -1082,15 +1153,16 @@ impl RemCmdApp {
 impl Render for RemCmdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_profile = self.selected_profile().cloned();
-        let should_focus_terminal = selected_profile
-            .as_ref()
-            .is_some_and(|profile| self.is_terminal_visible(&profile.id));
+        let should_focus_terminal = self.active_panel == ActivePanel::Connection
+            && selected_profile
+                .as_ref()
+                .is_some_and(|profile| self.is_terminal_visible(&profile.id));
 
         let mut root = div()
             .relative()
             .flex()
             .size_full()
-            .text_color(rgb(0xf4f4f5))
+            .text_color(self.theme.text_primary)
             .child(self.render_sidebar(cx))
             .child(self.render_detail_panel(selected_profile, cx));
 
@@ -1187,13 +1259,13 @@ impl RemCmdApp {
             .overflow_hidden()
             .rounded_md()
             .border_1()
-            .border_color(rgba(0xffffff24))
+            .border_color(self.theme.border)
             .bg(rgb(DEFAULT_BACKGROUND.hex()))
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(14.0))
             .line_height(px(f32::from(cell_height)))
             .cursor(CursorStyle::IBeam)
-            .focus(|style| style.border_color(rgba(0xffffff40)))
+            .focus(|style| style.border_color(self.theme.border_strong))
             .on_key_down(cx.listener(Self::on_terminal_key_down))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 click_focus_handle.focus(window);
@@ -1233,14 +1305,16 @@ impl RemCmdApp {
         };
 
         let mut modal = div()
-            .w(px(420.0))
+            .w_full()
+            .max_w(px(420.0))
+            .mx_4()
             .p_4()
             .rounded_lg()
             .border_1()
-            .border_color(rgba(0xffffff24))
-            .bg(rgb(0x242424))
+            .border_color(self.theme.border)
+            .bg(self.theme.modal_bg)
             .shadow(vec![BoxShadow {
-                color: rgba(0x00000066).into(),
+                color: self.theme.shadow,
                 offset: point(px(0.0), px(8.0)),
                 blur_radius: px(24.0),
                 spread_radius: px(-8.0),
@@ -1250,7 +1324,7 @@ impl RemCmdApp {
                 div()
                     .mt_1()
                     .text_sm()
-                    .text_color(rgb(0xa1a1aa))
+                    .text_color(self.theme.text_muted)
                     .child(profile_label),
             );
 
@@ -1261,7 +1335,7 @@ impl RemCmdApp {
                     .w_full()
                     .truncate()
                     .text_sm()
-                    .text_color(rgb(0x71717a))
+                    .text_color(self.theme.text_faint)
                     .child(path),
             );
         }
@@ -1273,8 +1347,8 @@ impl RemCmdApp {
                     .mt_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgba(0xffffff2e))
-                    .bg(rgb(0x181818))
+                    .border_color(self.theme.border)
+                    .bg(self.theme.surface_bg)
                     .child(prompt.input.clone()),
             );
 
@@ -1283,7 +1357,7 @@ impl RemCmdApp {
                 div()
                     .mt_2()
                     .text_sm()
-                    .text_color(rgb(0xfca5a5))
+                    .text_color(self.theme.error_text)
                     .child(error.clone()),
             );
         }
@@ -1295,33 +1369,29 @@ impl RemCmdApp {
                 .gap_2()
                 .mt_4()
                 .child(
-                    div()
-                        .id("credential_cancel")
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgba(0xffffff12))
-                        .cursor_pointer()
-                        .hover(|this| this.bg(rgba(0xffffff1f)))
-                        .child("Cancel")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.dismiss_credential_prompt(cx);
-                            cx.notify();
-                        })),
+                    button(
+                        "credential_cancel",
+                        "Cancel",
+                        ButtonVariant::Secondary,
+                        true,
+                        &self.theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.dismiss_credential_prompt(cx);
+                        cx.notify();
+                    })),
                 )
                 .child(
-                    div()
-                        .id("credential_submit")
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x2563eb))
-                        .cursor_pointer()
-                        .hover(|this| this.bg(rgb(0x3b82f6)))
-                        .child("Connect")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.submit_credential_prompt(window, cx);
-                        })),
+                    button(
+                        "credential_submit",
+                        "Connect",
+                        ButtonVariant::Primary,
+                        true,
+                        &self.theme,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.submit_credential_prompt(window, cx);
+                    })),
                 ),
         );
 
@@ -1338,7 +1408,7 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x0000008f))
+            .bg(self.theme.overlay_bg)
             .occlude()
             .child(modal)
     }
@@ -1347,17 +1417,24 @@ impl RemCmdApp {
         let mut connection_list = div()
             .id("connection_list")
             .flex_1()
+            .min_h(px(0.0))
             .overflow_x_hidden()
             .overflow_y_scroll()
             .mt_2();
 
         for profile in &self.profiles {
             let profile_id = profile.id.clone();
-            let is_selected = self.selected_profile_id.as_ref() == Some(&profile.id);
+            let is_selected = self.active_panel == ActivePanel::Connection
+                && self.selected_profile_id.as_ref() == Some(&profile.id);
             let item_background = if is_selected {
-                rgb(0x4f4d50)
+                self.theme.list_selected_bg
             } else {
-                rgba(0xffffff00)
+                self.theme.transparent
+            };
+            let hover_background = if is_selected {
+                self.theme.list_selected_hover_bg
+            } else {
+                self.theme.list_hover_bg
             };
 
             let profile_item = div()
@@ -1369,15 +1446,7 @@ impl RemCmdApp {
                 .rounded_md()
                 .bg(item_background)
                 .cursor_pointer()
-                .hover(move |this| {
-                    let background = if is_selected {
-                        rgb(0x59575b)
-                    } else {
-                        rgb(0x454347)
-                    };
-
-                    this.bg(background)
-                })
+                .hover(move |this| this.bg(hover_background))
                 .child(
                     div()
                         .w_full()
@@ -1391,7 +1460,7 @@ impl RemCmdApp {
                         .w_full()
                         .truncate()
                         .text_sm()
-                        .text_color(rgb(0xa1a1aa))
+                        .text_color(self.theme.text_muted)
                         .child(profile.address()),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1401,12 +1470,56 @@ impl RemCmdApp {
             connection_list = connection_list.child(profile_item);
         }
 
+        let settings_selected = self.active_panel == ActivePanel::Settings;
+        let settings_background = if settings_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let settings_hover = if settings_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.list_hover_bg
+        };
+        let settings_footer = div()
+            .flex_none()
+            .mt_2()
+            .pt_3()
+            .border_t_1()
+            .border_color(self.theme.border)
+            .child(
+                div()
+                    .id("show_settings")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(settings_background)
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(settings_hover))
+                    .child(
+                        div()
+                            .w(px(18.0))
+                            .text_center()
+                            .text_size(px(16.0))
+                            .child("\u{2699}"),
+                    )
+                    .child("Settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_settings(cx);
+                    })),
+            );
+
         div()
             .flex()
             .flex_col()
+            .flex_none()
             .w(px(300.0))
             .h_full()
-            .bg(rgba(0x212121e8))
+            .bg(self.theme.sidebar_bg)
             .px_4()
             .pb_4()
             .pt(px(52.0))
@@ -1418,44 +1531,32 @@ impl RemCmdApp {
                     .flex_none()
                     .child("Connections")
                     .child(
-                        div()
-                            .id("add_connection")
-                            .px_2()
-                            .py_1()
-                            .rounded_lg()
-                            .bg(rgb(0x3b82f6))
-                            .cursor_pointer()
-                            .child("Add")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.add_profile(cx);
-                            })),
+                        button(
+                            "add_connection",
+                            "Add",
+                            ButtonVariant::Ghost,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.add_profile(cx);
+                        })),
                     ),
             )
             .child(connection_list)
+            .child(settings_footer)
     }
 
     fn render_detail_panel(
         &self,
         selected_profile: Option<ConnectionProfile>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .h_full()
-            .px_4()
-            .pb_4()
-            .pt(px(52.0))
-            .bg(rgb(0x181818))
-            .border_l_1()
-            .border_color(rgba(0xffffff40))
-            .shadow(vec![BoxShadow {
-                color: rgba(0x0000001f).into(),
-                offset: point(px(-1.0), px(0.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }]);
+    ) -> gpui::Div {
+        if self.active_panel == ActivePanel::Settings {
+            return self.render_settings(cx);
+        }
+
+        let mut panel = self.detail_panel_shell();
 
         match selected_profile {
             Some(profile) => {
@@ -1467,27 +1568,40 @@ impl RemCmdApp {
                     div()
                         .flex()
                         .flex_none()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
-                        .child(profile.name.clone())
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(120.0))
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(profile.name.clone()),
+                        )
                         .child(
                             div()
                                 .flex()
+                                .flex_none()
+                                .flex_wrap()
                                 .items_center()
+                                .justify_end()
                                 .gap_2()
                                 .child(self.render_connection_controls(cx))
                                 .child(
-                                    div()
-                                        .id("delete_connection")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_lg()
-                                        .bg(rgb(0xdc2626))
-                                        .cursor_pointer()
-                                        .child("Delete")
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                    button(
+                                        "delete_connection",
+                                        "Delete",
+                                        ButtonVariant::Danger,
+                                        true,
+                                        &self.theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
                                             this.delete_selected_profile(cx);
-                                        })),
+                                        },
+                                    )),
                                 ),
                         ),
                 );
@@ -1495,7 +1609,15 @@ impl RemCmdApp {
                 if self.is_terminal_visible(&profile.id) {
                     panel = panel.child(self.render_terminal(cx));
                 } else {
-                    panel = panel
+                    let form = div()
+                        .id("connection_form")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_x_hidden()
+                        .overflow_y_scroll()
+                        .pr_1()
                         .child(self.render_form_row("Name", editor.name.clone()))
                         .child(self.render_form_row("Host", editor.host.clone()))
                         .child(self.render_form_row("Port", editor.port.clone()))
@@ -1507,59 +1629,218 @@ impl RemCmdApp {
                             )
                         })
                         .when_some(self.form_error.as_ref(), |this, error| {
-                            this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                            this.child(
+                                div()
+                                    .mt_3()
+                                    .text_color(self.theme.error_text)
+                                    .child(error.clone()),
+                            )
                         })
                         .when_some(self.connection_error.as_ref(), |this, error| {
-                            this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                            this.child(
+                                div()
+                                    .mt_3()
+                                    .text_color(self.theme.error_text)
+                                    .child(error.clone()),
+                            )
                         })
                         .when_some(self.connection_message.as_ref(), |this, message| {
                             this.child(
                                 div()
                                     .mt_3()
-                                    .text_color(rgb(0xa1a1aa))
+                                    .text_color(self.theme.text_muted)
                                     .child(message.clone()),
                             )
                         })
                         .child(
                             div()
                                 .flex()
+                                .flex_none()
+                                .flex_wrap()
                                 .mt_6()
                                 .gap_2()
+                                .pb_2()
                                 .child(
-                                    div()
-                                        .id("save_profile")
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_lg()
-                                        .bg(rgb(0x2563eb))
-                                        .cursor_pointer()
-                                        .child("Save")
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                    button(
+                                        "save_profile",
+                                        "Save",
+                                        ButtonVariant::Primary,
+                                        true,
+                                        &self.theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
                                             this.save_editor(cx);
-                                        })),
+                                        },
+                                    )),
                                 )
                                 .child(
-                                    div()
-                                        .id("cancel_profile")
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_lg()
-                                        .bg(rgba(0xffffff18))
-                                        .cursor_pointer()
-                                        .child("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                    button(
+                                        "cancel_profile",
+                                        "Cancel",
+                                        ButtonVariant::Secondary,
+                                        true,
+                                        &self.theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
                                             this.cancel_editor(cx);
-                                        })),
+                                        },
+                                    )),
                                 ),
                         );
+                    panel = panel.child(form);
                 }
             }
             None => {
-                panel = panel.child("No connection selected");
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .text_color(self.theme.text_muted)
+                        .child("No connection selected"),
+                );
             }
         }
 
         panel
+    }
+
+    fn detail_panel_shell(&self) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .px_4()
+            .pb_4()
+            .pt(px(52.0))
+            .bg(self.theme.panel_bg)
+            .border_l_1()
+            .border_color(self.theme.border_strong)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(-1.0), px(0.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let appearance_control = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .p(px(2.0))
+            .gap(px(2.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.control_bg)
+            .child(self.render_theme_mode_option("theme_system", "System", ThemeMode::System, cx))
+            .child(self.render_theme_mode_option("theme_light", "Light", ThemeMode::Light, cx))
+            .child(self.render_theme_mode_option("theme_dark", "Dark", ThemeMode::Dark, cx));
+
+        let content = div()
+            .id("settings_content")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_x_hidden()
+            .overflow_y_scroll()
+            .pr_1()
+            .child(
+                div()
+                    .mt_6()
+                    .mb_3()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(self.theme.text_muted)
+                    .child("Appearance"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().flex_none().w(px(112.0)).truncate().child("Theme"))
+                    .child(appearance_control),
+            )
+            .when_some(self.settings_error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .mt_3()
+                        .text_color(self.theme.error_text)
+                        .child(error.clone()),
+                )
+            });
+
+        self.detail_panel_shell()
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Settings"),
+            )
+            .child(content)
+    }
+
+    fn render_theme_mode_option(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        mode: ThemeMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.theme_mode == mode;
+        let background = if is_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let border = if is_selected {
+            self.theme.border_strong
+        } else {
+            self.theme.transparent
+        };
+        let hover_background = if is_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.control_hover_bg
+        };
+
+        div()
+            .id(id)
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py(px(6.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover_background))
+            .when(is_selected, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(3.0),
+                    spread_radius: px(-1.0),
+                }])
+            })
+            .child(div().truncate().child(label))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_theme_mode(mode, window, cx);
+            }))
     }
 
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1573,56 +1854,56 @@ impl RemCmdApp {
             _ => "Connect",
         };
 
-        let button_color = if can_disconnect {
-            rgb(0xdc2626)
+        let button_variant = if can_disconnect {
+            ButtonVariant::Danger
         } else {
-            rgb(0x2563eb)
+            ButtonVariant::Primary
         };
 
         let status_color = match self.connection_state {
-            SessionState::Connected => rgb(0x86efac),
-            SessionState::Failed => rgb(0xfca5a5),
+            SessionState::Connected => self.theme.status_ok,
+            SessionState::Failed => self.theme.error_text,
             SessionState::Connecting
             | SessionState::Authenticating
-            | SessionState::Disconnecting => rgb(0xfde68a),
-            SessionState::Disconnected => rgb(0xa1a1aa),
+            | SessionState::Disconnecting => self.theme.status_warn,
+            SessionState::Disconnected => self.theme.text_muted,
         };
 
-        let mut button = div()
-            .id("connection_action")
-            .px_3()
-            .py_1()
-            .rounded_lg()
-            .bg(button_color)
-            .child(label);
+        let mut action = button(
+            "connection_action",
+            label,
+            button_variant,
+            can_connect || can_disconnect,
+            &self.theme,
+        );
 
         if can_connect {
-            button = button
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.connect_selected_profile(window, cx);
-                }));
+            action = action.on_click(cx.listener(|this, _, window, cx| {
+                this.connect_selected_profile(window, cx);
+            }));
         } else if can_disconnect {
-            button = button
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.disconnect_active_connection(cx);
-                }));
-        } else {
-            button = button.opacity(0.55);
+            action = action.on_click(cx.listener(|this, _, _, cx| {
+                this.disconnect_active_connection(cx);
+            }));
         }
 
         div()
             .flex()
+            .flex_none()
+            .flex_wrap()
             .items_center()
+            .justify_end()
             .gap_2()
             .child(
                 div()
+                    .min_w(px(0.0))
+                    .max_w(px(220.0))
+                    .truncate()
                     .text_sm()
                     .text_color(status_color)
                     .child(self.connection_status_text()),
             )
-            .child(button)
+            .child(action)
     }
 
     fn connection_status_text(&self) -> String {
@@ -1658,18 +1939,24 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .mt_3()
-            .child(div().w(px(112.0)).child("Authentication"))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(112.0))
+                    .truncate()
+                    .child("Authentication"),
+            )
             .child(
                 div()
                     .flex()
                     .flex_1()
-                    .h(px(38.0))
+                    .min_w(px(0.0))
                     .p(px(2.0))
                     .gap(px(2.0))
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgba(0xffffff26))
-                    .bg(rgba(0xffffff0d))
+                    .border_color(self.theme.border)
+                    .bg(self.theme.control_bg)
                     .child(self.render_auth_method_option(
                         "auth_password",
                         "Password",
@@ -1704,45 +1991,46 @@ impl RemCmdApp {
     ) -> impl IntoElement {
         let is_selected = auth_kind == selected;
         let background = if is_selected {
-            rgb(0x4f4d50)
+            self.theme.list_selected_bg
         } else {
-            rgba(0xffffff00)
+            self.theme.transparent
         };
         let border = if is_selected {
-            rgba(0xffffff40)
+            self.theme.border_strong
         } else {
-            rgba(0xffffff00)
+            self.theme.transparent
+        };
+        let hover_background = if is_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.control_hover_bg
         };
 
         div()
             .id(id)
             .flex()
             .flex_1()
-            .h_full()
+            .min_w(px(0.0))
             .items_center()
             .justify_center()
+            .px_2()
+            .py(px(6.0))
             .rounded_md()
             .border_1()
             .border_color(border)
             .bg(background)
             .text_sm()
             .cursor_pointer()
-            .hover(move |this| {
-                if is_selected {
-                    this.bg(rgb(0x59575b))
-                } else {
-                    this.bg(rgba(0xffffff18))
-                }
-            })
+            .hover(move |this| this.bg(hover_background))
             .when(is_selected, |this| {
                 this.shadow(vec![BoxShadow {
-                    color: rgba(0x0000002e).into(),
+                    color: self.theme.shadow,
                     offset: point(px(0.0), px(1.0)),
                     blur_radius: px(3.0),
                     spread_radius: px(-1.0),
                 }])
             })
-            .child(label)
+            .child(div().truncate().child(label))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_auth_method(auth_kind, window, cx);
             }))
@@ -1757,40 +2045,35 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .mt_3()
-            .child(div().w(px(112.0)).child("Key file"))
+            .child(div().flex_none().w(px(112.0)).truncate().child("Key file"))
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_w(px(0.0))
                     .items_center()
                     .gap_2()
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
                             .rounded_lg()
                             .border_1()
-                            .border_color(rgba(0xffffff26))
-                            .bg(rgba(0xffffff12))
+                            .border_color(self.theme.border)
+                            .bg(self.theme.surface_bg)
                             .child(field),
                     )
                     .child(
-                        div()
-                            .id("browse_private_key")
-                            .flex()
-                            .flex_none()
-                            .h(px(34.0))
-                            .items_center()
-                            .px_3()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(rgba(0xffffff26))
-                            .bg(rgba(0xffffff12))
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgba(0xffffff1f)))
-                            .child("Browse")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.browse_private_key(cx);
-                            })),
+                        button(
+                            "browse_private_key",
+                            "Browse",
+                            ButtonVariant::Secondary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.browse_private_key(cx);
+                        })),
                     ),
             )
     }
@@ -1800,14 +2083,15 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .mt_3()
-            .child(div().w(px(112.0)).child(label))
+            .child(div().flex_none().w(px(112.0)).truncate().child(label))
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgba(0xffffff26))
-                    .bg(rgba(0xffffff12))
+                    .border_color(self.theme.border)
+                    .bg(self.theme.surface_bg)
                     .child(field),
             )
     }
@@ -2047,6 +2331,7 @@ fn main_window_options(cx: &App) -> WindowOptions {
 
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(720.0), px(480.0))),
         window_background: WindowBackgroundAppearance::Blurred,
         titlebar: Some(TitlebarOptions {
             appears_transparent: true,
