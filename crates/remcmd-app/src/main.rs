@@ -4,20 +4,24 @@ use text_field::{TextField, bind_text_field_keys};
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
+mod terminal_input;
+use terminal_input::{encode_alternate_scroll, encode_focus, encode_key, encode_paste};
+
 mod terminal_view;
 use terminal_view::{DEFAULT_BACKGROUND, TerminalRunStyle, TerminalViewModel, palette_color};
 
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 
 use gpui::{
-    App, Application, Bounds, BoxShadow, ClipboardItem, Context, Entity, Focusable, FontStyle,
-    FontWeight, HighlightStyle, IntoElement, KeyBinding, Render, SharedString, StrikethroughStyle,
-    StyledText, TitlebarOptions, UnderlineStyle as GpuiUnderlineStyle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba,
-    size,
+    App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, Pixels, Render,
+    ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TitlebarOptions,
+    UTF16Selection, UnderlineStyle as GpuiUnderlineStyle, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -30,8 +34,8 @@ use remcmd_ssh::{
 };
 use remcmd_storage::{default_profiles_path, ensure_profiles_file, load_profiles, save_profiles};
 use remcmd_terminal::{
-    Clipboard as TerminalClipboard, CursorShape, TerminalEngine, TerminalEvent, TerminalSnapshot,
-    TextAreaSize,
+    Clipboard as TerminalClipboard, CursorShape, Scroll as TerminalScroll, TerminalEngine,
+    TerminalEvent, TerminalModes, TerminalSnapshot, TextAreaSize,
 };
 
 const TERMINAL_COLUMNS: u32 = 80;
@@ -62,12 +66,18 @@ struct RemCmdApp {
     connection_message: Option<String>,
     credential_prompt: Option<CredentialPrompt>,
     terminal: Option<ActiveTerminal>,
+    terminal_focus_handle: FocusHandle,
+    terminal_marked_text: String,
+    terminal_scroll_accumulator: f32,
 }
 
 struct ActiveTerminal {
     profile_id: String,
     engine: TerminalEngine,
     title: Option<String>,
+    pty_size: PtySize,
+    cell_width: u16,
+    cell_height: u16,
 }
 
 impl ActiveTerminal {
@@ -80,6 +90,9 @@ impl ActiveTerminal {
             profile_id,
             engine,
             title: None,
+            pty_size: size,
+            cell_width: TERMINAL_CELL_WIDTH,
+            cell_height: TERMINAL_CELL_HEIGHT,
         }
     }
 
@@ -98,10 +111,21 @@ impl ActiveTerminal {
         TextAreaSize {
             rows: u16::try_from(size.rows()).unwrap_or(u16::MAX),
             columns: u16::try_from(size.columns()).unwrap_or(u16::MAX),
-            cell_width: TERMINAL_CELL_WIDTH,
-            cell_height: TERMINAL_CELL_HEIGHT,
+            cell_width: self.cell_width,
+            cell_height: self.cell_height,
         }
     }
+
+    fn modes(&self) -> TerminalModes {
+        self.engine.modes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalLayout {
+    pty_size: PtySize,
+    cell_width: u16,
+    cell_height: u16,
 }
 
 #[derive(Clone)]
@@ -164,7 +188,7 @@ enum CredentialPromptKind {
 
 // Application construction and shared data helpers.
 impl RemCmdApp {
-    fn load(cx: &mut Context<Self>) -> Self {
+    fn load(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let profiles_path = default_profiles_path().expect("failed to resolve profiles path");
 
         let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
@@ -185,6 +209,7 @@ impl RemCmdApp {
             .unwrap_or(0)
             + 1;
 
+        let terminal_focus_handle = cx.focus_handle();
         let mut app = Self {
             profiles,
             profiles_path,
@@ -199,7 +224,19 @@ impl RemCmdApp {
             connection_message: None,
             credential_prompt: None,
             terminal: None,
+            terminal_focus_handle: terminal_focus_handle.clone(),
+            terminal_marked_text: String::new(),
+            terminal_scroll_accumulator: 0.0,
         };
+
+        cx.on_focus(&terminal_focus_handle, window, |this, _, cx| {
+            this.report_terminal_focus(true, cx);
+        })
+        .detach();
+        cx.on_blur(&terminal_focus_handle, window, |this, _, cx| {
+            this.report_terminal_focus(false, cx);
+        })
+        .detach();
 
         app.load_editor_for_selected_profile(cx);
         app
@@ -557,6 +594,8 @@ impl RemCmdApp {
         self.connection_error = None;
         self.connection_message = None;
         self.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
+        self.terminal_marked_text.clear();
+        self.terminal_scroll_accumulator = 0.0;
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -690,6 +729,167 @@ impl RemCmdApp {
         }
 
         cx.notify();
+    }
+
+    fn terminal_modes(&self) -> TerminalModes {
+        self.terminal
+            .as_ref()
+            .map(ActiveTerminal::modes)
+            .unwrap_or(TerminalModes::NONE)
+    }
+
+    fn on_terminal_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if is_terminal_paste_shortcut(&event.keystroke) {
+            self.paste_into_terminal(cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if let Some(bytes) = encode_key(&event.keystroke, self.terminal_modes()) {
+            self.send_terminal_user_input(bytes, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    fn paste_into_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+
+        let bytes = encode_paste(&text, self.terminal_modes());
+        self.send_terminal_user_input(bytes, cx);
+    }
+
+    fn report_terminal_focus(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if let Some(bytes) = encode_focus(focused, self.terminal_modes()) {
+            self.send_terminal_input(bytes, cx);
+        }
+    }
+
+    fn send_terminal_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
+        if data.is_empty() || self.connection_state != SessionState::Connected {
+            return;
+        }
+
+        let Some(handle) = self.connection_handle.as_ref() else {
+            return;
+        };
+
+        if let Err(error) = handle.send_input(data) {
+            self.connection_error = Some(error.to_string());
+            cx.notify();
+        }
+    }
+
+    fn send_terminal_user_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
+        if data.is_empty() {
+            return;
+        }
+
+        if let Some(terminal) = self.terminal.as_mut()
+            && terminal.engine.display_offset() != 0
+        {
+            terminal.engine.scroll(TerminalScroll::Bottom);
+            cx.notify();
+        }
+
+        self.send_terminal_input(data, cx);
+    }
+
+    fn apply_terminal_layout(
+        &mut self,
+        profile_id: &str,
+        layout: TerminalLayout,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self
+            .terminal
+            .as_mut()
+            .filter(|terminal| terminal.profile_id == profile_id)
+        else {
+            return;
+        };
+
+        let cell_size_changed =
+            terminal.cell_width != layout.cell_width || terminal.cell_height != layout.cell_height;
+        terminal.cell_width = layout.cell_width;
+        terminal.cell_height = layout.cell_height;
+
+        let previous_size = terminal.pty_size;
+        if previous_size.columns != layout.pty_size.columns
+            || previous_size.rows != layout.pty_size.rows
+        {
+            terminal
+                .engine
+                .resize(
+                    usize::try_from(layout.pty_size.columns).expect("PTY columns fit usize"),
+                    usize::try_from(layout.pty_size.rows).expect("PTY rows fit usize"),
+                )
+                .expect("measured terminal size is valid");
+        }
+        terminal.pty_size = layout.pty_size;
+
+        if previous_size == layout.pty_size {
+            if cell_size_changed {
+                cx.notify();
+            }
+            return;
+        }
+
+        if let Some(handle) = self.connection_handle.as_ref()
+            && let Err(error) = handle.resize(layout.pty_size)
+        {
+            self.connection_error = Some(error.to_string());
+        }
+        cx.notify();
+    }
+
+    fn on_terminal_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_height = self
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.cell_height)
+            .unwrap_or(TERMINAL_CELL_HEIGHT);
+        let delta = f32::from(event.delta.pixel_delta(px(f32::from(line_height))).y);
+        if delta == 0.0 {
+            return;
+        }
+        cx.stop_propagation();
+
+        if self.terminal_scroll_accumulator.signum() != delta.signum() {
+            self.terminal_scroll_accumulator = 0.0;
+        }
+        self.terminal_scroll_accumulator += delta;
+
+        let lines = (self.terminal_scroll_accumulator / f32::from(line_height)).trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.terminal_scroll_accumulator -= lines as f32 * f32::from(line_height);
+
+        let modes = self.terminal_modes();
+        let alternate_scroll = modes.contains(TerminalModes::ALTERNATE_SCROLL)
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.engine.display_offset() == 0);
+
+        if alternate_scroll {
+            self.send_terminal_input(encode_alternate_scroll(lines, modes), cx);
+        } else if let Some(terminal) = self.terminal.as_mut() {
+            terminal.engine.scroll(TerminalScroll::Lines(lines));
+            cx.notify();
+        }
     }
 
     fn process_terminal_output(&mut self, data: &[u8], cx: &mut Context<Self>) {
@@ -878,6 +1078,9 @@ impl RemCmdApp {
 impl Render for RemCmdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_profile = self.selected_profile().cloned();
+        let should_focus_terminal = selected_profile
+            .as_ref()
+            .is_some_and(|profile| self.is_terminal_visible(&profile.id));
 
         let mut root = div()
             .relative()
@@ -894,6 +1097,8 @@ impl Render for RemCmdApp {
             }
 
             root = root.child(self.render_credential_prompt(cx));
+        } else if should_focus_terminal && !self.terminal_focus_handle.is_focused(window) {
+            window.focus(&self.terminal_focus_handle);
         }
 
         root
@@ -910,8 +1115,13 @@ impl RemCmdApp {
                 .is_some_and(|terminal| terminal.profile_id == profile_id)
     }
 
-    fn render_terminal(&self) -> impl IntoElement {
+    fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut screen = div().flex().flex_col().flex_none();
+        let cell_height = self
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.cell_height)
+            .unwrap_or(TERMINAL_CELL_HEIGHT);
 
         if let Some(terminal) = self.terminal.as_ref() {
             let model = TerminalViewModel::from_snapshot(&terminal.snapshot());
@@ -924,7 +1134,7 @@ impl RemCmdApp {
 
                 screen = screen.child(
                     div()
-                        .h(px(f32::from(TERMINAL_CELL_HEIGHT)))
+                        .h(px(f32::from(cell_height)))
                         .flex_none()
                         .whitespace_nowrap()
                         .child(StyledText::new(row.text).with_highlights(highlights)),
@@ -932,8 +1142,40 @@ impl RemCmdApp {
             }
         }
 
+        let profile_id = self
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.profile_id.clone())
+            .unwrap_or_default();
+        let input_entity = cx.entity();
+        let layout_entity = input_entity.clone();
+        let input_focus_handle = self.terminal_focus_handle.clone();
+        let click_focus_handle = self.terminal_focus_handle.clone();
+        let input_layer = canvas(
+            measure_terminal_layout,
+            move |bounds, layout, window, cx| {
+                window.handle_input(
+                    &input_focus_handle,
+                    ElementInputHandler::new(bounds, input_entity),
+                    cx,
+                );
+
+                cx.defer(move |cx| {
+                    layout_entity.update(cx, |this, cx| {
+                        this.apply_terminal_layout(&profile_id, layout, cx);
+                    });
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
         div()
             .id("terminal_view")
+            .key_context("Terminal")
+            .track_focus(&self.terminal_focus_handle)
             .flex_1()
             .w_full()
             .mt_4()
@@ -945,8 +1187,25 @@ impl RemCmdApp {
             .bg(rgb(DEFAULT_BACKGROUND.hex()))
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(14.0))
-            .line_height(px(f32::from(TERMINAL_CELL_HEIGHT)))
-            .child(screen)
+            .line_height(px(f32::from(cell_height)))
+            .cursor(CursorStyle::IBeam)
+            .focus(|style| style.border_color(rgba(0xffffff40)))
+            .on_key_down(cx.listener(Self::on_terminal_key_down))
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                click_focus_handle.focus(window);
+                cx.stop_propagation();
+            })
+            .on_scroll_wheel(cx.listener(Self::on_terminal_scroll))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(screen)
+                    .child(input_layer),
+            )
     }
 
     fn render_credential_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1230,7 +1489,7 @@ impl RemCmdApp {
                 );
 
                 if self.is_terminal_visible(&profile.id) {
-                    panel = panel.child(self.render_terminal());
+                    panel = panel.child(self.render_terminal(cx));
                 } else {
                     panel = panel
                         .child(self.render_form_row("Name", editor.name.clone()))
@@ -1550,6 +1809,205 @@ impl RemCmdApp {
     }
 }
 
+impl EntityInputHandler for RemCmdApp {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let utf16_len = self.terminal_marked_text.encode_utf16().count();
+        let start_utf16 = range_utf16.start.min(utf16_len);
+        let end_utf16 = range_utf16.end.clamp(start_utf16, utf16_len);
+        let start = utf16_offset_to_utf8(&self.terminal_marked_text, start_utf16);
+        let end = utf16_offset_to_utf8(&self.terminal_marked_text, end_utf16);
+        let adjusted_start = self.terminal_marked_text[..start].encode_utf16().count();
+        let adjusted_end = self.terminal_marked_text[..end].encode_utf16().count();
+
+        adjusted_range.replace(adjusted_start..adjusted_end);
+        Some(self.terminal_marked_text[start..end].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let cursor = self.terminal_marked_text.encode_utf16().count();
+        Some(UTF16Selection {
+            range: cursor..cursor,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        let len = self.terminal_marked_text.encode_utf16().count();
+        (len != 0).then_some(0..len)
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let text = std::mem::take(&mut self.terminal_marked_text);
+        self.send_terminal_user_input(text.into_bytes(), cx);
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_marked_text.clear();
+        self.send_terminal_user_input(new_text.as_bytes().to_vec(), cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        new_text.clone_into(&mut self.terminal_marked_text);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let terminal = self.terminal.as_ref()?;
+        let cursor = terminal.snapshot().cursor;
+        let (row, column) = cursor
+            .map(|cursor| (cursor.row, cursor.column))
+            .unwrap_or_default();
+
+        Some(Bounds::new(
+            point(
+                element_bounds.left() + px(column as f32 * f32::from(terminal.cell_width)),
+                element_bounds.top() + px(row as f32 * f32::from(terminal.cell_height)),
+            ),
+            size(
+                px(f32::from(terminal.cell_width)),
+                px(f32::from(terminal.cell_height)),
+            ),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.terminal_marked_text.encode_utf16().count())
+    }
+}
+
+fn measure_terminal_layout(
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    _: &mut App,
+) -> TerminalLayout {
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let line = window
+        .text_system()
+        .shape_line("M".into(), font_size, &[style.to_run(1)], None);
+
+    terminal_layout_for_pixels(
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height),
+        f32::from(line.width),
+        f32::from(window.line_height()),
+    )
+}
+
+fn terminal_layout_for_pixels(
+    viewport_width: f32,
+    viewport_height: f32,
+    measured_cell_width: f32,
+    measured_cell_height: f32,
+) -> TerminalLayout {
+    let cell_width = valid_dimension(measured_cell_width, f32::from(TERMINAL_CELL_WIDTH));
+    let cell_height = valid_dimension(measured_cell_height, f32::from(TERMINAL_CELL_HEIGHT));
+    let columns = cell_count(viewport_width, cell_width);
+    let rows = cell_count(viewport_height, cell_height);
+
+    TerminalLayout {
+        pty_size: PtySize::new(columns, rows).with_pixels(
+            pixel_dimension(viewport_width),
+            pixel_dimension(viewport_height),
+        ),
+        cell_width: pixel_cell_dimension(cell_width),
+        cell_height: pixel_cell_dimension(cell_height),
+    }
+}
+
+fn valid_dimension(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn cell_count(viewport: f32, cell: f32) -> u32 {
+    (valid_dimension(viewport, cell) / cell)
+        .floor()
+        .clamp(1.0, u32::MAX as f32) as u32
+}
+
+fn pixel_dimension(value: f32) -> u32 {
+    valid_dimension(value, 1.0)
+        .floor()
+        .clamp(1.0, u32::MAX as f32) as u32
+}
+
+fn pixel_cell_dimension(value: f32) -> u16 {
+    value.round().clamp(1.0, f32::from(u16::MAX)) as u16
+}
+
+fn utf16_offset_to_utf8(text: &str, offset: usize) -> usize {
+    let mut utf16_offset = 0;
+
+    for (utf8_offset, character) in text.char_indices() {
+        if utf16_offset >= offset || utf16_offset + character.len_utf16() > offset {
+            return utf8_offset;
+        }
+        utf16_offset += character.len_utf16();
+    }
+
+    text.len()
+}
+
+fn is_terminal_paste_shortcut(keystroke: &Keystroke) -> bool {
+    if keystroke.key == "insert" && keystroke.modifiers.shift {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        keystroke.key == "v" && keystroke.modifiers.platform
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        keystroke.key == "v" && keystroke.modifiers.control
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        keystroke.key == "v" && keystroke.modifiers.control && keystroke.modifiers.shift
+    }
+}
+
 fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
     let cursor_line = matches!(
         style.cursor,
@@ -1597,8 +2055,10 @@ fn main_window_options(cx: &App) -> WindowOptions {
 fn open_main_window(cx: &mut App) {
     let options = main_window_options(cx);
 
-    cx.open_window(options, |_, cx| cx.new(RemCmdApp::load))
-        .expect("failed to open main window");
+    cx.open_window(options, |window, cx| {
+        cx.new(|cx| RemCmdApp::load(window, cx))
+    })
+    .expect("failed to open main window");
 }
 
 fn bind_credential_prompt_keys(cx: &mut App) {
@@ -1671,5 +2131,37 @@ mod tests {
             ProfileAuthKind::Agent.into_config("ignored"),
             Ok(AuthConfig::Agent)
         );
+    }
+
+    #[test]
+    fn terminal_layout_uses_measured_cells_and_viewport_pixels() {
+        let layout = terminal_layout_for_pixels(803.0, 479.0, 8.0, 19.0);
+
+        assert_eq!(layout.pty_size, PtySize::new(100, 25).with_pixels(803, 479));
+        assert_eq!(layout.cell_width, 8);
+        assert_eq!(layout.cell_height, 19);
+    }
+
+    #[test]
+    fn terminal_layout_never_reports_an_empty_pty() {
+        let layout = terminal_layout_for_pixels(0.0, 0.0, 0.0, f32::NAN);
+
+        assert_eq!(layout.pty_size.columns, 1);
+        assert_eq!(layout.pty_size.rows, 1);
+        assert_eq!(layout.pty_size.pixel_width, 1);
+        assert_eq!(layout.pty_size.pixel_height, 1);
+        assert_eq!(layout.cell_width, TERMINAL_CELL_WIDTH);
+        assert_eq!(layout.cell_height, TERMINAL_CELL_HEIGHT);
+    }
+
+    #[test]
+    fn utf16_offsets_snap_to_valid_utf8_boundaries() {
+        let text = "a\u{1f642}b";
+
+        assert_eq!(utf16_offset_to_utf8(text, 0), 0);
+        assert_eq!(utf16_offset_to_utf8(text, 1), 1);
+        assert_eq!(utf16_offset_to_utf8(text, 2), 1);
+        assert_eq!(utf16_offset_to_utf8(text, 3), 5);
+        assert_eq!(utf16_offset_to_utf8(text, 4), 6);
     }
 }
