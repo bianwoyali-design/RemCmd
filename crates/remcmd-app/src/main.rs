@@ -19,15 +19,16 @@ use terminal_view::{DEFAULT_BACKGROUND, TerminalRunStyle, TerminalViewModel, pal
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
-use std::{ops::Range, path::PathBuf};
+use std::{ops::Range, path::PathBuf, time::Duration};
 
 use gpui::{
     App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, Pixels, Render,
-    ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, Subscription, TitlebarOptions,
-    UTF16Selection, UnderlineStyle as GpuiUnderlineStyle, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
+    ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, Subscription, Task, Timer,
+    TitlebarOptions, UTF16Selection, UnderlineStyle as GpuiUnderlineStyle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
+    rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -51,6 +52,7 @@ const TERMINAL_COLUMNS: u32 = 80;
 const TERMINAL_ROWS: u32 = 24;
 const TERMINAL_CELL_WIDTH: u16 = 8;
 const TERMINAL_CELL_HEIGHT: u16 = 19;
+const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[cfg(target_os = "macos")]
 const TERMINAL_FONT_FAMILY: &str = "Menlo";
@@ -78,6 +80,7 @@ struct RemCmdApp {
     terminal_focus_handle: FocusHandle,
     terminal_marked_text: String,
     terminal_scroll_accumulator: f32,
+    terminal_resize_task: Option<Task<()>>,
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
     theme: Theme,
@@ -265,6 +268,7 @@ impl RemCmdApp {
             terminal_focus_handle: terminal_focus_handle.clone(),
             terminal_marked_text: String::new(),
             terminal_scroll_accumulator: 0.0,
+            terminal_resize_task: None,
             active_panel: ActivePanel::Connection,
             theme_mode,
             theme,
@@ -670,6 +674,7 @@ impl RemCmdApp {
         self.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
         self.terminal_marked_text.clear();
         self.terminal_scroll_accumulator = 0.0;
+        self.terminal_resize_task = None;
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -783,6 +788,8 @@ impl RemCmdApp {
         if !self.connection_state.can_disconnect() {
             return;
         }
+
+        self.terminal_resize_task = None;
 
         let Some(handle) = self.connection_handle.as_ref() else {
             self.connection_state = SessionState::Failed;
@@ -915,12 +922,38 @@ impl RemCmdApp {
             return;
         }
 
-        if let Some(handle) = self.connection_handle.as_ref()
-            && let Err(error) = handle.resize(layout.pty_size)
-        {
-            self.connection_error = Some(error.to_string());
-        }
+        self.schedule_terminal_resize(profile_id.to_owned(), layout.pty_size, cx);
         cx.notify();
+    }
+
+    fn schedule_terminal_resize(
+        &mut self,
+        profile_id: String,
+        size: PtySize,
+        cx: &mut Context<Self>,
+    ) {
+        // Live window resizing crosses many cell boundaries; only notify the PTY after it settles.
+        self.terminal_resize_task = Some(cx.spawn(async move |this, cx| {
+            Timer::after(TERMINAL_RESIZE_DEBOUNCE).await;
+
+            let _ = this.update(cx, |this, cx| {
+                let is_current_size = this.terminal.as_ref().is_some_and(|terminal| {
+                    terminal.profile_id == profile_id && terminal.pty_size == size
+                });
+                if !is_current_size
+                    || this.connection_profile_id.as_deref() != Some(profile_id.as_str())
+                {
+                    return;
+                }
+
+                if let Some(handle) = this.connection_handle.as_ref()
+                    && let Err(error) = handle.resize(size)
+                {
+                    this.connection_error = Some(error.to_string());
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn on_terminal_scroll(
@@ -1081,6 +1114,7 @@ impl RemCmdApp {
                 self.connection_state = state;
 
                 if state == SessionState::Disconnected {
+                    self.terminal_resize_task = None;
                     self.connection_handle = None;
                     self.connection_profile_id = None;
                 }
@@ -1090,6 +1124,7 @@ impl RemCmdApp {
             ConnectionEvent::Failed(error) => {
                 let failed_profile_id = self.connection_profile_id.take();
                 self.connection_state = SessionState::Failed;
+                self.terminal_resize_task = None;
                 self.connection_handle = None;
 
                 let prompted_for_passphrase = if error.kind() == SshErrorKind::PrivateKeyPassphrase

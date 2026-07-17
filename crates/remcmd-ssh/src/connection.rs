@@ -164,6 +164,22 @@ where
     }
 }
 
+fn coalesce_queued_resizes(
+    initial_size: PtySize,
+    commands: &mut mpsc::UnboundedReceiver<ConnectionCommand>,
+) -> (PtySize, Option<ConnectionCommand>) {
+    let mut latest_size = initial_size;
+
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            ConnectionCommand::Resize(size) => latest_size = size,
+            command => return (latest_size, Some(command)),
+        }
+    }
+
+    (latest_size, None)
+}
+
 async fn run_connection(
     profile: ConnectionProfile,
     auth: AuthMethod,
@@ -271,25 +287,27 @@ async fn run_connection(
         return;
     }
 
+    let mut pending_command = None;
+
     loop {
-        tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(ConnectionCommand::Input(data)) => {
-                        if let Err(error) = writer.send_input(data).await {
-                            report_failure(&mut session, error, &events).await;
-                            close_resources(&transport, Some(&writer)).await;
-                            return;
-                        }
+        let command = if let Some(command) = pending_command.take() {
+            Some(command)
+        } else {
+            tokio::select! {
+                command = commands.recv() => command,
+                shell_event = reader.next_event() => {
+                    let is_closed = matches!(&shell_event, ShellEvent::Closed);
+
+                    if events
+                        .send(ConnectionEvent::Shell(shell_event))
+                        .await
+                        .is_err()
+                    {
+                        close_resources(&transport, Some(&writer)).await;
+                        return;
                     }
-                    Some(ConnectionCommand::Resize(size)) => {
-                        if let Err(error) = writer.resize(size).await {
-                            report_failure(&mut session, error, &events).await;
-                            close_resources(&transport, Some(&writer)).await;
-                            return;
-                        }
-                    }
-                    Some(ConnectionCommand::Disconnect) | None => {
+
+                    if is_closed {
                         finish_disconnection(
                             &mut session,
                             Some(&transport),
@@ -299,31 +317,33 @@ async fn run_connection(
                         .await;
                         return;
                     }
+
+                    continue;
                 }
             }
+        };
 
-            shell_event = reader.next_event() => {
-                let is_closed = matches!(&shell_event, ShellEvent::Closed);
-
-                if events
-                    .send(ConnectionEvent::Shell(shell_event))
-                    .await
-                    .is_err()
-                {
+        match command {
+            Some(ConnectionCommand::Input(data)) => {
+                if let Err(error) = writer.send_input(data).await {
+                    report_failure(&mut session, error, &events).await;
                     close_resources(&transport, Some(&writer)).await;
                     return;
                 }
+            }
+            Some(ConnectionCommand::Resize(size)) => {
+                let (latest_size, next_command) = coalesce_queued_resizes(size, &mut commands);
+                pending_command = next_command;
 
-                if is_closed {
-                    finish_disconnection(
-                        &mut session,
-                        Some(&transport),
-                        Some(&writer),
-                        &events,
-                    )
-                    .await;
+                if let Err(error) = writer.resize(latest_size).await {
+                    report_failure(&mut session, error, &events).await;
+                    close_resources(&transport, Some(&writer)).await;
                     return;
                 }
+            }
+            Some(ConnectionCommand::Disconnect) | None => {
+                finish_disconnection(&mut session, Some(&transport), Some(&writer), &events).await;
+                return;
             }
         }
     }
