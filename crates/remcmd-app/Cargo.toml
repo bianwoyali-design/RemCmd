@@ -9,6 +9,7 @@ gpui.workspace = true
 remcmd-core.workspace = true
 remcmd-ssh.workspace = true
 remcmd-storage.workspace = true
+remcmd-terminal.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 unicode-segmentation = "1"
