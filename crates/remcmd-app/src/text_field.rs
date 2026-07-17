@@ -5,10 +5,12 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, hsla, point, prelude::*, px, relative, rgba, size,
+    fill, point, prelude::*, px, relative, size,
 };
 use secrecy::zeroize::Zeroize;
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::theme::Theme;
 
 actions!(
     text_field,
@@ -558,9 +560,10 @@ impl Element for TextElement {
             .as_ref()
             .map(|range| input.display_range_for_content_range(range));
         let style = window.text_style();
+        let theme = *cx.global::<Theme>();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0.0, 0.0, 1.0, 0.45))
+            (input.placeholder.clone(), theme.input_placeholder)
         } else {
             (content, style.color)
         };
@@ -615,7 +618,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(1.5), bounds.bottom() - bounds.top()),
                     ),
-                    hsla(0.0, 0.0, 1.0, 0.9),
+                    theme.input_cursor,
                 )),
             )
         } else {
@@ -631,7 +634,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x60a5fa55),
+                    theme.selection_bg,
                 )),
                 None,
             )

@@ -29,6 +29,42 @@ fn connection_handle_forwards_commands() {
 }
 
 #[test]
+fn queued_resizes_are_coalesced_without_reordering_other_commands() {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let first_size = PtySize::new(90, 30);
+    let latest_size = PtySize::new(120, 40);
+    let later_size = PtySize::new(140, 50);
+
+    command_tx
+        .send(ConnectionCommand::Resize(first_size))
+        .unwrap();
+    command_tx
+        .send(ConnectionCommand::Resize(latest_size))
+        .unwrap();
+    command_tx
+        .send(ConnectionCommand::Input(b"pwd\n".to_vec()))
+        .unwrap();
+    command_tx
+        .send(ConnectionCommand::Resize(later_size))
+        .unwrap();
+
+    let ConnectionCommand::Resize(initial_size) = command_rx.try_recv().unwrap() else {
+        panic!("first command should be a resize");
+    };
+    let (coalesced_size, pending_command) = coalesce_queued_resizes(initial_size, &mut command_rx);
+
+    assert_eq!(coalesced_size, latest_size);
+    assert_eq!(
+        pending_command,
+        Some(ConnectionCommand::Input(b"pwd\n".to_vec()))
+    );
+    assert_eq!(
+        command_rx.try_recv().unwrap(),
+        ConnectionCommand::Resize(later_size)
+    );
+}
+
+#[test]
 fn closed_command_channel_returns_invalid_state_error() {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = ConnectionHandle { command_tx };
