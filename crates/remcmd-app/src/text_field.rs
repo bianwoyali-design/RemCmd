@@ -737,19 +737,19 @@ impl Drop for TextField {
 
 pub fn bind_text_field_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, None),
-        KeyBinding::new("delete", Delete, None),
-        KeyBinding::new("left", Left, None),
-        KeyBinding::new("right", Right, None),
-        KeyBinding::new("shift-left", SelectLeft, None),
-        KeyBinding::new("shift-right", SelectRight, None),
-        KeyBinding::new("cmd-a", SelectAll, None),
-        KeyBinding::new("cmd-v", Paste, None),
-        KeyBinding::new("cmd-c", Copy, None),
-        KeyBinding::new("cmd-x", Cut, None),
-        KeyBinding::new("home", Home, None),
-        KeyBinding::new("end", End, None),
-        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
+        KeyBinding::new("backspace", Backspace, Some("TextField")),
+        KeyBinding::new("delete", Delete, Some("TextField")),
+        KeyBinding::new("left", Left, Some("TextField")),
+        KeyBinding::new("right", Right, Some("TextField")),
+        KeyBinding::new("shift-left", SelectLeft, Some("TextField")),
+        KeyBinding::new("shift-right", SelectRight, Some("TextField")),
+        KeyBinding::new("cmd-a", SelectAll, Some("TextField")),
+        KeyBinding::new("cmd-v", Paste, Some("TextField")),
+        KeyBinding::new("cmd-c", Copy, Some("TextField")),
+        KeyBinding::new("cmd-x", Cut, Some("TextField")),
+        KeyBinding::new("home", Home, Some("TextField")),
+        KeyBinding::new("end", End, Some("TextField")),
+        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextField")),
     ]);
 }
 

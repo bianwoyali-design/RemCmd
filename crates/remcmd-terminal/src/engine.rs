@@ -84,6 +84,10 @@ impl TerminalEngine {
         self.terminal.grid().display_offset()
     }
 
+    pub fn modes(&self) -> TerminalModes {
+        map_modes(*self.terminal.mode())
+    }
+
     pub fn snapshot(&self) -> TerminalSnapshot {
         let content = self.terminal.renderable_content();
         let display_offset = content.display_offset;
@@ -462,6 +466,15 @@ mod tests {
         let primary = terminal.snapshot();
         assert_eq!(row_text(&primary, 0), "main");
         assert!(!primary.modes.contains(TerminalModes::ALTERNATE_SCREEN));
+    }
+
+    #[test]
+    fn exposes_current_terminal_modes_without_building_a_snapshot() {
+        let mut terminal = terminal(8, 2);
+        terminal.process(b"\x1b[?1h\x1b[?2004h");
+
+        assert!(terminal.modes().contains(TerminalModes::APPLICATION_CURSOR));
+        assert!(terminal.modes().contains(TerminalModes::BRACKETED_PASTE));
     }
 
     #[test]
