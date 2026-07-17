@@ -5,7 +5,10 @@ mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
 mod terminal_input;
-use terminal_input::{encode_alternate_scroll, encode_focus, encode_key, encode_paste};
+use terminal_input::{
+    encode_alternate_scroll, encode_focus, encode_key, encode_paste,
+    should_translate_alternate_scroll,
+};
 
 mod terminal_view;
 use terminal_view::{DEFAULT_BACKGROUND, TerminalRunStyle, TerminalViewModel, palette_color};
@@ -878,11 +881,12 @@ impl RemCmdApp {
         self.terminal_scroll_accumulator -= lines as f32 * f32::from(line_height);
 
         let modes = self.terminal_modes();
-        let alternate_scroll = modes.contains(TerminalModes::ALTERNATE_SCROLL)
-            && self
-                .terminal
-                .as_ref()
-                .is_some_and(|terminal| terminal.engine.display_offset() == 0);
+        let display_offset = self
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.engine.display_offset())
+            .unwrap_or_default();
+        let alternate_scroll = should_translate_alternate_scroll(modes, display_offset);
 
         if alternate_scroll {
             self.send_terminal_input(encode_alternate_scroll(lines, modes), cx);

@@ -97,6 +97,15 @@ pub(crate) fn encode_alternate_scroll(lines: i32, modes: TerminalModes) -> Vec<u
     sequence.repeat(repetitions)
 }
 
+pub(crate) fn should_translate_alternate_scroll(
+    modes: TerminalModes,
+    display_offset: usize,
+) -> bool {
+    display_offset == 0
+        && modes.contains(TerminalModes::ALTERNATE_SCREEN)
+        && modes.contains(TerminalModes::ALTERNATE_SCROLL)
+}
+
 fn cursor_key(final_byte: u8, modes: TerminalModes, modifiers: Modifiers) -> Vec<u8> {
     let modifier = modifier_parameter(modifiers);
     if modifier != 1 {
@@ -177,6 +186,7 @@ fn with_alt_prefix(mut bytes: Vec<u8>, alt: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use gpui::Keystroke;
+    use remcmd_terminal::TerminalEngine;
 
     use super::*;
 
@@ -254,5 +264,17 @@ mod tests {
             b"\x1bOA\x1bOA"
         );
         assert_eq!(encode_alternate_scroll(-1, TerminalModes::NONE), b"\x1b[B");
+    }
+
+    #[test]
+    fn alternate_scroll_translation_requires_the_alternate_screen() {
+        let mut terminal = TerminalEngine::new(8, 2).unwrap();
+
+        let primary_modes = terminal.modes();
+        assert!(!should_translate_alternate_scroll(primary_modes, 0));
+        terminal.process(b"\x1b[?1049h");
+        let alternate_modes = terminal.modes();
+        assert!(should_translate_alternate_scroll(alternate_modes, 0));
+        assert!(!should_translate_alternate_scroll(alternate_modes, 1));
     }
 }
