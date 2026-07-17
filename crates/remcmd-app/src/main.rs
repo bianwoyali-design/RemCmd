@@ -4,15 +4,20 @@ use text_field::{TextField, bind_text_field_keys};
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
+mod terminal_view;
+use terminal_view::{DEFAULT_BACKGROUND, TerminalRunStyle, TerminalViewModel, palette_color};
+
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
 use std::path::PathBuf;
 
 use gpui::{
-    App, Application, Bounds, BoxShadow, Context, Entity, Focusable, FontWeight, IntoElement,
-    KeyBinding, Render, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
+    App, Application, Bounds, BoxShadow, ClipboardItem, Context, Entity, Focusable, FontStyle,
+    FontWeight, HighlightStyle, IntoElement, KeyBinding, Render, SharedString, StrikethroughStyle,
+    StyledText, TitlebarOptions, UnderlineStyle as GpuiUnderlineStyle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba,
+    size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -24,6 +29,22 @@ use remcmd_ssh::{
     SshConnection, SshErrorKind,
 };
 use remcmd_storage::{default_profiles_path, ensure_profiles_file, load_profiles, save_profiles};
+use remcmd_terminal::{
+    Clipboard as TerminalClipboard, CursorShape, TerminalEngine, TerminalEvent, TerminalSnapshot,
+    TextAreaSize,
+};
+
+const TERMINAL_COLUMNS: u32 = 80;
+const TERMINAL_ROWS: u32 = 24;
+const TERMINAL_CELL_WIDTH: u16 = 8;
+const TERMINAL_CELL_HEIGHT: u16 = 19;
+
+#[cfg(target_os = "macos")]
+const TERMINAL_FONT_FAMILY: &str = "Menlo";
+#[cfg(target_os = "windows")]
+const TERMINAL_FONT_FAMILY: &str = "Consolas";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const TERMINAL_FONT_FAMILY: &str = "DejaVu Sans Mono";
 
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 
@@ -40,6 +61,47 @@ struct RemCmdApp {
     connection_error: Option<String>,
     connection_message: Option<String>,
     credential_prompt: Option<CredentialPrompt>,
+    terminal: Option<ActiveTerminal>,
+}
+
+struct ActiveTerminal {
+    profile_id: String,
+    engine: TerminalEngine,
+    title: Option<String>,
+}
+
+impl ActiveTerminal {
+    fn new(profile_id: String, size: PtySize) -> Self {
+        let columns = usize::try_from(size.columns).expect("PTY columns fit usize");
+        let rows = usize::try_from(size.rows).expect("PTY rows fit usize");
+        let engine = TerminalEngine::new(columns, rows).expect("valid initial terminal size");
+
+        Self {
+            profile_id,
+            engine,
+            title: None,
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) -> Vec<TerminalEvent> {
+        self.engine.process(bytes);
+        self.engine.drain_events()
+    }
+
+    fn snapshot(&self) -> TerminalSnapshot {
+        self.engine.snapshot()
+    }
+
+    fn text_area_size(&self) -> TextAreaSize {
+        let size = self.engine.size();
+
+        TextAreaSize {
+            rows: u16::try_from(size.rows()).unwrap_or(u16::MAX),
+            columns: u16::try_from(size.columns()).unwrap_or(u16::MAX),
+            cell_width: TERMINAL_CELL_WIDTH,
+            cell_height: TERMINAL_CELL_HEIGHT,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -136,6 +198,7 @@ impl RemCmdApp {
             connection_error: None,
             connection_message: None,
             credential_prompt: None,
+            terminal: None,
         };
 
         app.load_editor_for_selected_profile(cx);
@@ -484,14 +547,16 @@ impl RemCmdApp {
         self.dismiss_credential_prompt(cx);
 
         let runtime = cx.global::<SshRuntime>().handle();
-        let connection = SshConnection::spawn(&runtime, profile.clone(), auth, PtySize::default());
+        let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
+        let connection = SshConnection::spawn(&runtime, profile.clone(), auth, pty_size);
         let (handle, mut events) = connection.split();
 
         self.connection_state = SessionState::Connecting;
         self.connection_handle = Some(handle);
-        self.connection_profile_id = Some(profile.id);
+        self.connection_profile_id = Some(profile.id.clone());
         self.connection_error = None;
         self.connection_message = None;
+        self.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -627,6 +692,114 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn process_terminal_output(&mut self, data: &[u8], cx: &mut Context<Self>) {
+        let events = self
+            .terminal
+            .as_mut()
+            .map(|terminal| terminal.process(data))
+            .unwrap_or_default();
+
+        for event in events {
+            self.handle_terminal_event(event, cx);
+        }
+    }
+
+    fn handle_terminal_event(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
+        match event {
+            TerminalEvent::TitleChanged(title) => {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.title = title;
+                }
+            }
+            TerminalEvent::ClipboardStore {
+                clipboard,
+                contents,
+            } => self.write_terminal_clipboard(clipboard, contents, cx),
+            TerminalEvent::ClipboardLoad(request) => {
+                let contents = self
+                    .read_terminal_clipboard(request.clipboard, cx)
+                    .and_then(|item| item.text())
+                    .unwrap_or_default();
+                self.send_terminal_response(request.response(&contents));
+            }
+            TerminalEvent::ColorRequest(request) => {
+                if let Some(terminal) = self.terminal.as_ref() {
+                    let snapshot = terminal.snapshot();
+                    let color = palette_color(&snapshot, request.index).into();
+                    self.send_terminal_response(request.response(color));
+                }
+            }
+            TerminalEvent::WriteToPty(data) => self.send_terminal_response(data),
+            TerminalEvent::TextAreaSizeRequest(request) => {
+                if let Some(terminal) = self.terminal.as_ref() {
+                    self.send_terminal_response(request.response(terminal.text_area_size()));
+                }
+            }
+            TerminalEvent::Bell => {
+                self.connection_message = Some("Remote terminal bell".into());
+            }
+            TerminalEvent::ExitRequested => {
+                self.connection_message = Some("Remote terminal requested exit".into());
+            }
+            TerminalEvent::ChildExited(status) => {
+                self.connection_message =
+                    status.map(|status| format!("Remote terminal exited with status {status}"));
+            }
+            TerminalEvent::MouseCursorDirty
+            | TerminalEvent::CursorBlinkingChanged
+            | TerminalEvent::Wakeup => {}
+        }
+    }
+
+    fn send_terminal_response(&mut self, data: Vec<u8>) {
+        let Some(handle) = self.connection_handle.as_ref() else {
+            return;
+        };
+
+        if let Err(error) = handle.send_input(data) {
+            self.connection_error = Some(error.to_string());
+        }
+    }
+
+    fn write_terminal_clipboard(
+        &self,
+        clipboard: TerminalClipboard,
+        contents: String,
+        cx: &mut Context<Self>,
+    ) {
+        let item = ClipboardItem::new_string(contents);
+
+        match clipboard {
+            TerminalClipboard::Clipboard => cx.write_to_clipboard(item),
+            TerminalClipboard::Selection => {
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                cx.write_to_primary(item);
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                cx.write_to_clipboard(item);
+            }
+        }
+    }
+
+    fn read_terminal_clipboard(
+        &self,
+        clipboard: TerminalClipboard,
+        cx: &mut Context<Self>,
+    ) -> Option<ClipboardItem> {
+        match clipboard {
+            TerminalClipboard::Clipboard => cx.read_from_clipboard(),
+            TerminalClipboard::Selection => {
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                {
+                    cx.read_from_primary()
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                {
+                    cx.read_from_clipboard()
+                }
+            }
+        }
+    }
+
     fn handle_connection_event(&mut self, event: ConnectionEvent, cx: &mut Context<Self>) {
         let should_notify = match event {
             ConnectionEvent::StateChanged(state) => {
@@ -664,9 +837,11 @@ impl RemCmdApp {
                 }
                 true
             }
-            ConnectionEvent::Shell(ShellEvent::Output(_) | ShellEvent::ExtendedOutput { .. }) => {
-                // Terminal output will be consumed by remcmd-terminal later.
-                false
+            ConnectionEvent::Shell(
+                ShellEvent::Output(data) | ShellEvent::ExtendedOutput { data, .. },
+            ) => {
+                self.process_terminal_output(&data, cx);
+                true
             }
             ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
                 self.connection_message = Some(format!("Remote shell exited with status {status}"));
@@ -726,6 +901,54 @@ impl Render for RemCmdApp {
 }
 
 impl RemCmdApp {
+    fn is_terminal_visible(&self, profile_id: &str) -> bool {
+        self.connection_profile_id.as_deref() == Some(profile_id)
+            && !self.connection_state.can_connect()
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.profile_id == profile_id)
+    }
+
+    fn render_terminal(&self) -> impl IntoElement {
+        let mut screen = div().flex().flex_col().flex_none();
+
+        if let Some(terminal) = self.terminal.as_ref() {
+            let model = TerminalViewModel::from_snapshot(&terminal.snapshot());
+
+            for row in model.rows {
+                let highlights = row
+                    .runs
+                    .into_iter()
+                    .map(|run| (run.range, terminal_highlight(run.style)));
+
+                screen = screen.child(
+                    div()
+                        .h(px(f32::from(TERMINAL_CELL_HEIGHT)))
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .child(StyledText::new(row.text).with_highlights(highlights)),
+                );
+            }
+        }
+
+        div()
+            .id("terminal_view")
+            .flex_1()
+            .w_full()
+            .mt_4()
+            .p_3()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(rgba(0xffffff24))
+            .bg(rgb(DEFAULT_BACKGROUND.hex()))
+            .font_family(TERMINAL_FONT_FAMILY)
+            .text_size(px(14.0))
+            .line_height(px(f32::from(TERMINAL_CELL_HEIGHT)))
+            .child(screen)
+    }
+
     fn render_credential_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = self
             .credential_prompt
@@ -954,6 +1177,8 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut panel = div()
+            .flex()
+            .flex_col()
             .flex_1()
             .h_full()
             .px_4()
@@ -975,88 +1200,96 @@ impl RemCmdApp {
                     return panel.child("No editor loaded");
                 };
 
-                panel = panel
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(profile.name.clone())
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(self.render_connection_controls(cx))
-                                    .child(
-                                        div()
-                                            .id("delete_connection")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_lg()
-                                            .bg(rgb(0xdc2626))
-                                            .cursor_pointer()
-                                            .child("Delete")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.delete_selected_profile(cx);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(self.render_form_row("Name", editor.name.clone()))
-                    .child(self.render_form_row("Host", editor.host.clone()))
-                    .child(self.render_form_row("Port", editor.port.clone()))
-                    .child(self.render_form_row("Username", editor.username.clone()))
-                    .child(self.render_auth_method_row(editor.auth_kind, cx))
-                    .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
-                        this.child(self.render_private_key_row(editor.private_key_path.clone(), cx))
-                    })
-                    .when_some(self.form_error.as_ref(), |this, error| {
-                        this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
-                    })
-                    .when_some(self.connection_error.as_ref(), |this, error| {
-                        this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
-                    })
-                    .when_some(self.connection_message.as_ref(), |this, message| {
-                        this.child(
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .child(profile.name.clone())
+                        .child(
                             div()
-                                .mt_3()
-                                .text_color(rgb(0xa1a1aa))
-                                .child(message.clone()),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .mt_6()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("save_profile")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(rgb(0x2563eb))
-                                    .cursor_pointer()
-                                    .child("Save")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_editor(cx);
-                                    })),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(self.render_connection_controls(cx))
+                                .child(
+                                    div()
+                                        .id("delete_connection")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_lg()
+                                        .bg(rgb(0xdc2626))
+                                        .cursor_pointer()
+                                        .child("Delete")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.delete_selected_profile(cx);
+                                        })),
+                                ),
+                        ),
+                );
+
+                if self.is_terminal_visible(&profile.id) {
+                    panel = panel.child(self.render_terminal());
+                } else {
+                    panel = panel
+                        .child(self.render_form_row("Name", editor.name.clone()))
+                        .child(self.render_form_row("Host", editor.host.clone()))
+                        .child(self.render_form_row("Port", editor.port.clone()))
+                        .child(self.render_form_row("Username", editor.username.clone()))
+                        .child(self.render_auth_method_row(editor.auth_kind, cx))
+                        .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
+                            this.child(
+                                self.render_private_key_row(editor.private_key_path.clone(), cx),
                             )
-                            .child(
+                        })
+                        .when_some(self.form_error.as_ref(), |this, error| {
+                            this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                        })
+                        .when_some(self.connection_error.as_ref(), |this, error| {
+                            this.child(div().mt_3().text_color(rgb(0xfca5a5)).child(error.clone()))
+                        })
+                        .when_some(self.connection_message.as_ref(), |this, message| {
+                            this.child(
                                 div()
-                                    .id("cancel_profile")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(rgba(0xffffff18))
-                                    .cursor_pointer()
-                                    .child("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_editor(cx);
-                                    })),
-                            ),
-                    );
+                                    .mt_3()
+                                    .text_color(rgb(0xa1a1aa))
+                                    .child(message.clone()),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .mt_6()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("save_profile")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_lg()
+                                        .bg(rgb(0x2563eb))
+                                        .cursor_pointer()
+                                        .child("Save")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.save_editor(cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("cancel_profile")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_lg()
+                                        .bg(rgba(0xffffff18))
+                                        .cursor_pointer()
+                                        .child("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_editor(cx);
+                                        })),
+                                ),
+                        );
+                }
             }
             None => {
                 panel = panel.child("No connection selected");
@@ -1314,6 +1547,35 @@ impl RemCmdApp {
                     .bg(rgba(0xffffff12))
                     .child(field),
             )
+    }
+}
+
+fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
+    let cursor_line = matches!(
+        style.cursor,
+        Some(CursorShape::Underline | CursorShape::Beam)
+    );
+    let underline_color = if cursor_line {
+        rgb(0xe5e5e5)
+    } else {
+        rgb(style.underline_color.hex())
+    };
+
+    HighlightStyle {
+        color: Some(rgb(style.foreground.hex()).into()),
+        font_weight: style.bold.then_some(FontWeight::BOLD),
+        font_style: style.italic.then_some(FontStyle::Italic),
+        background_color: Some(rgb(style.background.hex()).into()),
+        underline: (style.underline || cursor_line).then_some(GpuiUnderlineStyle {
+            thickness: px(1.0),
+            color: Some(underline_color.into()),
+            wavy: false,
+        }),
+        strikethrough: style.strikeout.then_some(StrikethroughStyle {
+            thickness: px(1.0),
+            color: Some(rgb(style.foreground.hex()).into()),
+        }),
+        fade_out: None,
     }
 }
 
