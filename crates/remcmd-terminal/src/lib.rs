@@ -8,5 +8,5 @@ pub use screen::{
     CellAttributes, Clipboard, CursorShape, DamageRange, Hyperlink, InvalidTerminalSize,
     MIN_COLUMNS, MIN_ROWS, NamedColor, Osc52Mode, PALETTE_SIZE, PaletteOverrides, Rgb, Scroll,
     TerminalCell, TerminalColor, TerminalConfig, TerminalCursor, TerminalDamage, TerminalModes,
-    TerminalSize, TerminalSnapshot, TextAreaSize, UnderlineStyle,
+    TerminalPoint, TerminalSelection, TerminalSize, TerminalSnapshot, TextAreaSize, UnderlineStyle,
 };

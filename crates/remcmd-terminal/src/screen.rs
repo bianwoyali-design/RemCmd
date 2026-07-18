@@ -320,6 +320,150 @@ impl TerminalSnapshot {
 
         Some(text)
     }
+
+    pub fn selected_text(&self, selection: TerminalSelection) -> String {
+        if selection.is_empty() || self.size.rows() == 0 {
+            return String::new();
+        }
+
+        let (start, end) = selection.ordered();
+        let last_row = self.size.rows() - 1;
+        let start = TerminalPoint::new(
+            start.row.min(last_row),
+            start.column.min(self.size.columns()),
+        );
+        let end = TerminalPoint::new(end.row.min(last_row), end.column.min(self.size.columns()));
+
+        if start >= end {
+            return String::new();
+        }
+
+        let mut text = String::new();
+
+        for row in start.row..=end.row {
+            let start_column = if row == start.row { start.column } else { 0 };
+            let end_column = if row == end.row {
+                end.column
+            } else {
+                self.size.columns()
+            };
+
+            let mut row_text = self.selected_row_text(row, start_column, end_column);
+            if end_column == self.size.columns() {
+                row_text.truncate(row_text.trim_end_matches(' ').len());
+            }
+            text.push_str(&row_text);
+
+            if row < end.row && !self.row_is_wrapped(row) {
+                text.push('\n');
+            }
+        }
+
+        text
+    }
+
+    fn selected_row_text(&self, row: usize, start_column: usize, end_column: usize) -> String {
+        let mut text = String::new();
+        let start_column = start_column.min(self.size.columns());
+        let end_column = end_column.min(self.size.columns());
+
+        for column in start_column..end_column {
+            let Some(cell) = self.cell(row, column) else {
+                continue;
+            };
+
+            if cell.attributes.contains(CellAttributes::WIDE_SPACER) {
+                if column == start_column
+                    && column > 0
+                    && let Some(wide) = self.cell(row, column - 1)
+                {
+                    text.push(wide.character);
+                    text.extend(wide.combining_characters.iter());
+                }
+                continue;
+            }
+
+            if cell
+                .attributes
+                .contains(CellAttributes::LEADING_WIDE_SPACER)
+            {
+                if column + 1 == end_column
+                    && let Some(wide) = self.cell(row, column + 1)
+                {
+                    text.push(wide.character);
+                    text.extend(wide.combining_characters.iter());
+                }
+                continue;
+            }
+
+            text.push(cell.character);
+            text.extend(cell.combining_characters.iter());
+        }
+
+        text
+    }
+
+    fn row_is_wrapped(&self, row: usize) -> bool {
+        (0..self.size.columns()).any(|column| {
+            self.cell(row, column)
+                .is_some_and(|cell| cell.attributes.contains(CellAttributes::WRAPPED))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TerminalPoint {
+    pub row: usize,
+    pub column: usize,
+}
+
+impl TerminalPoint {
+    pub const fn new(row: usize, column: usize) -> Self {
+        Self { row, column }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalSelection {
+    pub anchor: TerminalPoint,
+    pub head: TerminalPoint,
+}
+
+impl TerminalSelection {
+    pub const fn new(anchor: TerminalPoint, head: TerminalPoint) -> Self {
+        Self { anchor, head }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.anchor.row == self.head.row && self.anchor.column == self.head.column
+    }
+
+    pub fn contains(self, row: usize, column: usize) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+
+        let (start, end) = self.ordered();
+        let point = TerminalPoint::new(row, column);
+
+        if start.row == end.row {
+            row == start.row && column >= start.column && column < end.column
+        } else if row == start.row {
+            column >= start.column
+        } else if row == end.row {
+            column < end.column
+        } else {
+            point > start && point < end
+        }
+    }
+
+    fn ordered(self) -> (TerminalPoint, TerminalPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

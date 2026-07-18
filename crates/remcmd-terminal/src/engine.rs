@@ -374,7 +374,7 @@ fn map_modes(mode: TermMode) -> TerminalModes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen::Clipboard;
+    use crate::screen::{Clipboard, TerminalPoint, TerminalSelection};
 
     fn terminal(columns: usize, rows: usize) -> TerminalEngine {
         TerminalEngine::new(columns, rows).expect("valid terminal size")
@@ -496,6 +496,39 @@ mod tests {
 
         terminal.scroll(Scroll::Bottom);
         assert_eq!(terminal.display_offset(), 0);
+    }
+
+    #[test]
+    fn extracts_forward_and_reverse_multiline_selections() {
+        let mut terminal = terminal(8, 3);
+        terminal.process(b"alpha\r\nbeta\r\ngamma");
+        let snapshot = terminal.snapshot();
+
+        let forward = TerminalSelection::new(TerminalPoint::new(0, 2), TerminalPoint::new(2, 3));
+        let reverse = TerminalSelection::new(TerminalPoint::new(2, 3), TerminalPoint::new(0, 2));
+
+        assert_eq!(snapshot.selected_text(forward), "pha\nbeta\ngam");
+        assert_eq!(snapshot.selected_text(reverse), "pha\nbeta\ngam");
+    }
+
+    #[test]
+    fn joins_soft_wrapped_rows_and_trims_terminal_padding() {
+        let mut terminal = terminal(5, 2);
+        terminal.process(b"abcdef");
+        let snapshot = terminal.snapshot();
+        let selection = TerminalSelection::new(TerminalPoint::new(0, 0), TerminalPoint::new(1, 5));
+
+        assert_eq!(snapshot.selected_text(selection), "abcdef");
+    }
+
+    #[test]
+    fn selecting_a_wide_character_spacer_copies_the_character() {
+        let mut terminal = terminal(4, 1);
+        terminal.process("你x".as_bytes());
+        let snapshot = terminal.snapshot();
+        let selection = TerminalSelection::new(TerminalPoint::new(0, 1), TerminalPoint::new(0, 2));
+
+        assert_eq!(snapshot.selected_text(selection), "你");
     }
 
     #[test]

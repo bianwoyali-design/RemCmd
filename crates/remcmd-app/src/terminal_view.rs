@@ -2,11 +2,12 @@ use std::ops::Range;
 
 use remcmd_terminal::{
     CellAttributes, CursorShape, NamedColor, PaletteOverrides, Rgb, TerminalColor,
-    TerminalSnapshot, UnderlineStyle,
+    TerminalSelection, TerminalSnapshot, UnderlineStyle,
 };
 
 pub(crate) const DEFAULT_BACKGROUND: ViewColor = ViewColor::new(0x18, 0x18, 0x18);
 pub(crate) const DEFAULT_FOREGROUND: ViewColor = ViewColor::new(0xd4, 0xd4, 0xd4);
+pub(crate) const SELECTION_BACKGROUND: ViewColor = ViewColor::new(0x26, 0x4f, 0x78);
 
 const CURSOR_COLOR: ViewColor = ViewColor::new(0xe5, 0xe5, 0xe5);
 const ANSI_COLORS: [ViewColor; 16] = [
@@ -75,6 +76,7 @@ pub(crate) struct TerminalRunStyle {
     pub(crate) underline: bool,
     pub(crate) strikeout: bool,
     pub(crate) cursor: Option<CursorShape>,
+    pub(crate) selected: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,9 +97,17 @@ pub(crate) struct TerminalViewModel {
 }
 
 impl TerminalViewModel {
+    #[cfg(test)]
     pub(crate) fn from_snapshot(snapshot: &TerminalSnapshot) -> Self {
+        Self::from_snapshot_with_selection(snapshot, None)
+    }
+
+    pub(crate) fn from_snapshot_with_selection(
+        snapshot: &TerminalSnapshot,
+        selection: Option<TerminalSelection>,
+    ) -> Self {
         let rows = (0..snapshot.size.rows())
-            .map(|row| build_row(snapshot, row))
+            .map(|row| build_row(snapshot, row, selection))
             .collect();
 
         Self { rows }
@@ -108,7 +118,11 @@ pub(crate) fn palette_color(snapshot: &TerminalSnapshot, index: usize) -> ViewCo
     resolve_palette_color(&snapshot.palette_overrides, index)
 }
 
-fn build_row(snapshot: &TerminalSnapshot, row: usize) -> TerminalRow {
+fn build_row(
+    snapshot: &TerminalSnapshot,
+    row: usize,
+    selection: Option<TerminalSelection>,
+) -> TerminalRow {
     let mut text = String::with_capacity(snapshot.size.columns());
     let mut runs: Vec<TerminalRun> = Vec::new();
 
@@ -134,7 +148,15 @@ fn build_row(snapshot: &TerminalSnapshot, row: usize) -> TerminalRow {
             .cursor
             .filter(|cursor| cursor.row == row && cursor.column == column)
             .map(|cursor| cursor.shape);
-        let style = resolve_cell_style(snapshot, cell.foreground, cell.background, cell, cursor);
+        let selected = cell_is_selected(snapshot, selection, row, column, cell);
+        let style = resolve_cell_style(
+            snapshot,
+            cell.foreground,
+            cell.background,
+            cell,
+            cursor,
+            selected,
+        );
 
         if let Some(previous) = runs.last_mut()
             && previous.range.end == start
@@ -152,12 +174,44 @@ fn build_row(snapshot: &TerminalSnapshot, row: usize) -> TerminalRow {
     TerminalRow { text, runs }
 }
 
+fn cell_is_selected(
+    snapshot: &TerminalSnapshot,
+    selection: Option<TerminalSelection>,
+    row: usize,
+    column: usize,
+    cell: &remcmd_terminal::TerminalCell,
+) -> bool {
+    let Some(selection) = selection else {
+        return false;
+    };
+
+    if selection.contains(row, column) {
+        return true;
+    }
+
+    if cell.attributes.contains(CellAttributes::WIDE)
+        && column + 1 < snapshot.size.columns()
+        && selection.contains(row, column + 1)
+    {
+        return true;
+    }
+
+    column > 0
+        && snapshot.cell(row, column - 1).is_some_and(|previous| {
+            previous
+                .attributes
+                .contains(CellAttributes::LEADING_WIDE_SPACER)
+                && selection.contains(row, column - 1)
+        })
+}
+
 fn resolve_cell_style(
     snapshot: &TerminalSnapshot,
     foreground: TerminalColor,
     background: TerminalColor,
     cell: &remcmd_terminal::TerminalCell,
     cursor: Option<CursorShape>,
+    selected: bool,
 ) -> TerminalRunStyle {
     let mut foreground = resolve_color(snapshot, foreground);
     let mut background = resolve_color(snapshot, background);
@@ -191,6 +245,7 @@ fn resolve_cell_style(
         underline: cell.underline != UnderlineStyle::None,
         strikeout: cell.attributes.contains(CellAttributes::STRIKEOUT),
         cursor,
+        selected,
     }
 }
 
@@ -338,5 +393,36 @@ mod tests {
 
         assert_eq!(cursor_style.cursor, Some(CursorShape::Block));
         assert_eq!(cursor_style.background, CURSOR_COLOR);
+    }
+
+    #[test]
+    fn splits_runs_at_selection_boundaries() {
+        let mut terminal = TerminalEngine::new(4, 1).unwrap();
+        terminal.process(b"abcd");
+        let snapshot = terminal.snapshot();
+        let selection = TerminalSelection::new(
+            remcmd_terminal::TerminalPoint::new(0, 1),
+            remcmd_terminal::TerminalPoint::new(0, 3),
+        );
+        let model = TerminalViewModel::from_snapshot_with_selection(&snapshot, Some(selection));
+
+        assert!(!style_at(&model.rows[0], 0).selected);
+        assert!(style_at(&model.rows[0], 1).selected);
+        assert!(style_at(&model.rows[0], 2).selected);
+        assert!(!style_at(&model.rows[0], 3).selected);
+    }
+
+    #[test]
+    fn selecting_a_wide_spacer_highlights_the_wide_glyph() {
+        let mut terminal = TerminalEngine::new(4, 1).unwrap();
+        terminal.process("你x".as_bytes());
+        let snapshot = terminal.snapshot();
+        let selection = TerminalSelection::new(
+            remcmd_terminal::TerminalPoint::new(0, 1),
+            remcmd_terminal::TerminalPoint::new(0, 2),
+        );
+        let model = TerminalViewModel::from_snapshot_with_selection(&snapshot, Some(selection));
+
+        assert!(style_at(&model.rows[0], 0).selected);
     }
 }

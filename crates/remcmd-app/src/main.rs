@@ -14,7 +14,9 @@ use terminal_input::{
 };
 
 mod terminal_view;
-use terminal_view::{DEFAULT_BACKGROUND, TerminalRunStyle, TerminalViewModel, palette_color};
+use terminal_view::{
+    DEFAULT_BACKGROUND, SELECTION_BACKGROUND, TerminalRunStyle, TerminalViewModel, palette_color,
+};
 
 #[cfg(target_os = "macos")]
 mod private_key_picker;
@@ -24,11 +26,11 @@ use std::{ops::Range, path::PathBuf, time::Duration};
 use gpui::{
     App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
-    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, Pixels, Render,
-    ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, Subscription, Task, Timer,
-    TitlebarOptions, UTF16Selection, UnderlineStyle as GpuiUnderlineStyle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
-    rgb, size,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
+    Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
+    UnderlineStyle as GpuiUnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -45,7 +47,7 @@ use remcmd_storage::{
 };
 use remcmd_terminal::{
     Clipboard as TerminalClipboard, CursorShape, Scroll as TerminalScroll, TerminalEngine,
-    TerminalEvent, TerminalModes, TerminalSnapshot, TextAreaSize,
+    TerminalEvent, TerminalModes, TerminalPoint, TerminalSelection, TerminalSnapshot, TextAreaSize,
 };
 
 const TERMINAL_COLUMNS: u32 = 80;
@@ -75,10 +77,13 @@ struct RemCmdApp {
     connection_profile_id: Option<String>,
     connection_error: Option<String>,
     connection_message: Option<String>,
+    terminal_end_reason: Option<String>,
     credential_prompt: Option<CredentialPrompt>,
     terminal: Option<ActiveTerminal>,
     terminal_focus_handle: FocusHandle,
     terminal_marked_text: String,
+    terminal_selection: Option<TerminalSelection>,
+    terminal_selecting: bool,
     terminal_scroll_accumulator: f32,
     terminal_resize_task: Option<Task<()>>,
     active_panel: ActivePanel,
@@ -96,6 +101,8 @@ struct ActiveTerminal {
     pty_size: PtySize,
     cell_width: u16,
     cell_height: u16,
+    viewport_bounds: Option<Bounds<Pixels>>,
+    was_connected: bool,
 }
 
 impl ActiveTerminal {
@@ -111,6 +118,8 @@ impl ActiveTerminal {
             pty_size: size,
             cell_width: TERMINAL_CELL_WIDTH,
             cell_height: TERMINAL_CELL_HEIGHT,
+            viewport_bounds: None,
+            was_connected: false,
         }
     }
 
@@ -263,10 +272,13 @@ impl RemCmdApp {
             connection_profile_id: None,
             connection_error: None,
             connection_message: None,
+            terminal_end_reason: None,
             credential_prompt: None,
             terminal: None,
             terminal_focus_handle: terminal_focus_handle.clone(),
             terminal_marked_text: String::new(),
+            terminal_selection: None,
+            terminal_selecting: false,
             terminal_scroll_accumulator: 0.0,
             terminal_resize_task: None,
             active_panel: ActivePanel::Connection,
@@ -452,6 +464,20 @@ impl RemCmdApp {
             cx.notify();
             return;
         };
+
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.profile_id == selected_id)
+        {
+            self.terminal = None;
+            self.terminal_selection = None;
+            self.terminal_selecting = false;
+            self.terminal_resize_task = None;
+            self.connection_error = None;
+            self.connection_message = None;
+            self.terminal_end_reason = None;
+        }
 
         self.profiles.remove(selected_index);
 
@@ -671,8 +697,11 @@ impl RemCmdApp {
         self.connection_profile_id = Some(profile.id.clone());
         self.connection_error = None;
         self.connection_message = None;
+        self.terminal_end_reason = None;
         self.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
         self.terminal_marked_text.clear();
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
         self.terminal_scroll_accumulator = 0.0;
         self.terminal_resize_task = None;
 
@@ -807,6 +836,7 @@ impl RemCmdApp {
         } else {
             // Disable repeated clicks before the worker publishes its event.
             self.connection_state = SessionState::Disconnecting;
+            self.terminal_end_reason = Some("Session disconnected".into());
         }
 
         cx.notify();
@@ -819,12 +849,118 @@ impl RemCmdApp {
             .unwrap_or(TerminalModes::NONE)
     }
 
+    fn terminal_point_for_position(&self, position: gpui::Point<Pixels>) -> Option<TerminalPoint> {
+        let terminal = self.terminal.as_ref()?;
+        let bounds = terminal.viewport_bounds?;
+        let local = bounds.localize(&position)?;
+        let size = terminal.engine.size();
+        let cell_width = f32::from(terminal.cell_width).max(1.0);
+        let cell_height = f32::from(terminal.cell_height).max(1.0);
+
+        Some(terminal_point_for_pixels(
+            f32::from(local.x),
+            f32::from(local.y),
+            size.columns(),
+            size.rows(),
+            cell_width,
+            cell_height,
+        ))
+    }
+
+    fn on_terminal_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_focus_handle.focus(window);
+
+        let Some(point) = self.terminal_point_for_position(event.position) else {
+            return;
+        };
+
+        if event.modifiers.shift
+            && let Some(selection) = self.terminal_selection.as_mut()
+        {
+            selection.head = point;
+        } else {
+            self.terminal_selection = Some(TerminalSelection::new(point, point));
+        }
+
+        self.terminal_selecting = true;
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn on_terminal_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.terminal_selecting || !event.dragging() {
+            return;
+        }
+
+        let Some(point) = self.terminal_point_for_position(event.position) else {
+            return;
+        };
+        let Some(selection) = self.terminal_selection.as_mut() else {
+            return;
+        };
+
+        if selection.head != point {
+            selection.head = point;
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_terminal_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_selecting = false;
+        if self
+            .terminal_selection
+            .is_some_and(TerminalSelection::is_empty)
+        {
+            self.terminal_selection = None;
+            cx.notify();
+        }
+    }
+
+    fn copy_terminal_selection(&self, cx: &mut Context<Self>) -> bool {
+        let Some(selection) = self
+            .terminal_selection
+            .filter(|selection| !selection.is_empty())
+        else {
+            return false;
+        };
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            terminal.snapshot().selected_text(selection),
+        ));
+        true
+    }
+
+    fn clear_terminal_selection(&mut self) -> bool {
+        let had_selection = self.terminal_selection.take().is_some();
+        let was_selecting = std::mem::take(&mut self.terminal_selecting);
+        had_selection || was_selecting
+    }
+
     fn on_terminal_key_down(
         &mut self,
         event: &KeyDownEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if is_terminal_copy_shortcut(&event.keystroke) && self.copy_terminal_selection(cx) {
+            cx.stop_propagation();
+            return;
+        }
+
         if is_terminal_paste_shortcut(&event.keystroke) {
             self.paste_into_terminal(cx);
             cx.stop_propagation();
@@ -872,10 +1008,16 @@ impl RemCmdApp {
             return;
         }
 
+        let selection_cleared = self.clear_terminal_selection();
+
         if let Some(terminal) = self.terminal.as_mut()
             && terminal.engine.display_offset() != 0
         {
             terminal.engine.scroll(TerminalScroll::Bottom);
+            cx.notify();
+        }
+
+        if selection_cleared {
             cx.notify();
         }
 
@@ -885,6 +1027,7 @@ impl RemCmdApp {
     fn apply_terminal_layout(
         &mut self,
         profile_id: &str,
+        bounds: Bounds<Pixels>,
         layout: TerminalLayout,
         cx: &mut Context<Self>,
     ) {
@@ -896,6 +1039,7 @@ impl RemCmdApp {
             return;
         };
 
+        terminal.viewport_bounds = Some(bounds);
         let cell_size_changed =
             terminal.cell_width != layout.cell_width || terminal.cell_height != layout.cell_height;
         terminal.cell_width = layout.cell_width;
@@ -905,6 +1049,8 @@ impl RemCmdApp {
         if previous_size.columns != layout.pty_size.columns
             || previous_size.rows != layout.pty_size.rows
         {
+            self.terminal_selection = None;
+            self.terminal_selecting = false;
             terminal
                 .engine
                 .resize(
@@ -993,14 +1139,27 @@ impl RemCmdApp {
         let alternate_scroll = should_translate_alternate_scroll(modes, display_offset);
 
         if alternate_scroll {
+            self.clear_terminal_selection();
             self.send_terminal_input(encode_alternate_scroll(lines, modes), cx);
         } else if let Some(terminal) = self.terminal.as_mut() {
+            self.terminal_selection = None;
+            self.terminal_selecting = false;
             terminal.engine.scroll(TerminalScroll::Lines(lines));
             cx.notify();
         }
     }
 
     fn process_terminal_output(&mut self, data: &[u8], cx: &mut Context<Self>) {
+        if !data.is_empty()
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.engine.display_offset() == 0)
+        {
+            self.terminal_selection = None;
+            self.terminal_selecting = false;
+        }
+
         let events = self
             .terminal
             .as_mut()
@@ -1048,10 +1207,14 @@ impl RemCmdApp {
             }
             TerminalEvent::ExitRequested => {
                 self.connection_message = Some("Remote terminal requested exit".into());
+                self.terminal_end_reason = Some("Remote terminal requested exit".into());
             }
             TerminalEvent::ChildExited(status) => {
-                self.connection_message =
-                    status.map(|status| format!("Remote terminal exited with status {status}"));
+                self.terminal_end_reason = status
+                    .map(|status| format!("Remote terminal exited with status {status}"))
+                    .or_else(|| Some("Remote terminal exited".into()));
+                self.connection_message
+                    .clone_from(&self.terminal_end_reason);
             }
             TerminalEvent::MouseCursorDirty
             | TerminalEvent::CursorBlinkingChanged
@@ -1111,12 +1274,24 @@ impl RemCmdApp {
     fn handle_connection_event(&mut self, event: ConnectionEvent, cx: &mut Context<Self>) {
         let should_notify = match event {
             ConnectionEvent::StateChanged(state) => {
+                let previous_state = self.connection_state;
                 self.connection_state = state;
+
+                if state == SessionState::Connected
+                    && let Some(terminal) = self.terminal.as_mut()
+                {
+                    terminal.was_connected = true;
+                }
 
                 if state == SessionState::Disconnected {
                     self.terminal_resize_task = None;
                     self.connection_handle = None;
                     self.connection_profile_id = None;
+                    if previous_state == SessionState::Disconnecting
+                        && self.terminal_end_reason.is_none()
+                    {
+                        self.terminal_end_reason = Some("Session disconnected".into());
+                    }
                 }
 
                 true
@@ -1154,7 +1329,9 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
-                self.connection_message = Some(format!("Remote shell exited with status {status}"));
+                let message = format!("Remote shell exited with status {status}");
+                self.connection_message = Some(message.clone());
+                self.terminal_end_reason = Some(message);
                 true
             }
             ConnectionEvent::Shell(ShellEvent::ExitSignal {
@@ -1163,17 +1340,24 @@ impl RemCmdApp {
                 message,
             }) => {
                 let core_dump = if core_dumped { " (core dumped)" } else { "" };
-                self.connection_message = Some(format!(
-                    "Remote shell exited on signal {signal}{core_dump}: {message}"
-                ));
+                let message =
+                    format!("Remote shell exited on signal {signal}{core_dump}: {message}");
+                self.connection_message = Some(message.clone());
+                self.terminal_end_reason = Some(message);
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Eof) => {
                 self.connection_message = Some("Remote shell reached EOF".into());
+                if self.terminal_end_reason.is_none() {
+                    self.terminal_end_reason = Some("Remote shell reached EOF".into());
+                }
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Closed) => {
                 self.connection_message = Some("Remote shell closed".into());
+                if self.terminal_end_reason.is_none() {
+                    self.terminal_end_reason = Some("Remote shell closed".into());
+                }
                 true
             }
         };
@@ -1218,12 +1402,35 @@ impl Render for RemCmdApp {
 
 impl RemCmdApp {
     fn is_terminal_visible(&self, profile_id: &str) -> bool {
-        self.connection_profile_id.as_deref() == Some(profile_id)
-            && !self.connection_state.can_connect()
+        let active_connection = self.connection_profile_id.as_deref() == Some(profile_id)
+            && !self.connection_state.can_connect();
+
+        self.terminal.as_ref().is_some_and(|terminal| {
+            terminal.profile_id == profile_id && (active_connection || terminal.was_connected)
+        })
+    }
+
+    fn terminal_has_ended(&self, profile_id: &str) -> bool {
+        self.connection_state.can_connect()
+            && self.connection_profile_id.as_deref() != Some(profile_id)
             && self
                 .terminal
                 .as_ref()
-                .is_some_and(|terminal| terminal.profile_id == profile_id)
+                .is_some_and(|terminal| terminal.profile_id == profile_id && terminal.was_connected)
+    }
+
+    fn close_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.connection_state.can_disconnect() {
+            return;
+        }
+
+        self.terminal = None;
+        self.terminal_marked_text.clear();
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
+        self.terminal_scroll_accumulator = 0.0;
+        self.terminal_resize_task = None;
+        cx.notify();
     }
 
     fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1235,7 +1442,10 @@ impl RemCmdApp {
             .unwrap_or(TERMINAL_CELL_HEIGHT);
 
         if let Some(terminal) = self.terminal.as_ref() {
-            let model = TerminalViewModel::from_snapshot(&terminal.snapshot());
+            let model = TerminalViewModel::from_snapshot_with_selection(
+                &terminal.snapshot(),
+                self.terminal_selection,
+            );
 
             for row in model.rows {
                 let highlights = row
@@ -1261,7 +1471,6 @@ impl RemCmdApp {
         let input_entity = cx.entity();
         let layout_entity = input_entity.clone();
         let input_focus_handle = self.terminal_focus_handle.clone();
-        let click_focus_handle = self.terminal_focus_handle.clone();
         let input_layer = canvas(
             measure_terminal_layout,
             move |bounds, layout, window, cx| {
@@ -1273,7 +1482,7 @@ impl RemCmdApp {
 
                 cx.defer(move |cx| {
                     layout_entity.update(cx, |this, cx| {
-                        this.apply_terminal_layout(&profile_id, layout, cx);
+                        this.apply_terminal_layout(&profile_id, bounds, layout, cx);
                     });
                 });
             },
@@ -1302,10 +1511,10 @@ impl RemCmdApp {
             .cursor(CursorStyle::IBeam)
             .focus(|style| style.border_color(self.theme.border_strong))
             .on_key_down(cx.listener(Self::on_terminal_key_down))
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                click_focus_handle.focus(window);
-                cx.stop_propagation();
-            })
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_terminal_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_terminal_scroll))
             .child(
                 div()
@@ -1316,6 +1525,71 @@ impl RemCmdApp {
                     .overflow_hidden()
                     .child(screen)
                     .child(input_layer),
+            )
+    }
+
+    fn render_terminal_lifecycle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (message, color) = if let Some(error) = self.connection_error.as_ref() {
+            (error.clone(), self.theme.error_text)
+        } else if let Some(message) = self.terminal_end_reason.as_ref() {
+            (message.clone(), self.theme.text_muted)
+        } else {
+            ("Session ended".into(), self.theme.text_muted)
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .mt_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.control_bg)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(120.0))
+                    .truncate()
+                    .text_sm()
+                    .text_color(color)
+                    .child(message),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button(
+                            "terminal_reconnect",
+                            "Reconnect",
+                            ButtonVariant::Primary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.connect_selected_profile(window, cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            "terminal_close",
+                            "Close terminal",
+                            ButtonVariant::Secondary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_terminal(cx);
+                        })),
+                    ),
             )
     }
 
@@ -1643,6 +1917,9 @@ impl RemCmdApp {
 
                 if self.is_terminal_visible(&profile.id) {
                     panel = panel.child(self.render_terminal(cx));
+                    if self.terminal_has_ended(&profile.id) {
+                        panel = panel.child(self.render_terminal_lifecycle(cx));
+                    }
                 } else {
                     let form = div()
                         .id("connection_form")
@@ -1886,6 +2163,13 @@ impl RemCmdApp {
             SessionState::Failed => "Retry",
             SessionState::Disconnecting => "Disconnecting",
             _ if can_disconnect => "Disconnect",
+            _ if self
+                .selected_profile_id
+                .as_deref()
+                .is_some_and(|profile_id| self.terminal_has_ended(profile_id)) =>
+            {
+                "Reconnect"
+            }
             _ => "Connect",
         };
 
@@ -2273,6 +2557,22 @@ fn terminal_layout_for_pixels(
     }
 }
 
+fn terminal_point_for_pixels(
+    x: f32,
+    y: f32,
+    columns: usize,
+    rows: usize,
+    cell_width: f32,
+    cell_height: f32,
+) -> TerminalPoint {
+    let cell_width = valid_dimension(cell_width, f32::from(TERMINAL_CELL_WIDTH));
+    let cell_height = valid_dimension(cell_height, f32::from(TERMINAL_CELL_HEIGHT));
+    let column = (x.max(0.0) / cell_width).round() as usize;
+    let row = (y.max(0.0) / cell_height).floor() as usize;
+
+    TerminalPoint::new(row.min(rows.saturating_sub(1)), column.min(columns))
+}
+
 fn valid_dimension(value: f32, fallback: f32) -> f32 {
     if value.is_finite() && value > 0.0 {
         value
@@ -2331,6 +2631,27 @@ fn is_terminal_paste_shortcut(keystroke: &Keystroke) -> bool {
     }
 }
 
+fn is_terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
+    if keystroke.key != "c" {
+        return false;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        keystroke.modifiers.platform
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        keystroke.modifiers.control
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        keystroke.modifiers.control && keystroke.modifiers.shift
+    }
+}
+
 fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
     let cursor_line = matches!(
         style.cursor,
@@ -2346,7 +2667,14 @@ fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
         color: Some(rgb(style.foreground.hex()).into()),
         font_weight: style.bold.then_some(FontWeight::BOLD),
         font_style: style.italic.then_some(FontStyle::Italic),
-        background_color: Some(rgb(style.background.hex()).into()),
+        background_color: Some(
+            rgb(if style.selected {
+                SELECTION_BACKGROUND.hex()
+            } else {
+                style.background.hex()
+            })
+            .into(),
+        ),
         underline: (style.underline || cursor_line).then_some(GpuiUnderlineStyle {
             thickness: px(1.0),
             color: Some(underline_color.into()),
@@ -2476,6 +2804,33 @@ mod tests {
         assert_eq!(layout.pty_size.pixel_height, 1);
         assert_eq!(layout.cell_width, TERMINAL_CELL_WIDTH);
         assert_eq!(layout.cell_height, TERMINAL_CELL_HEIGHT);
+    }
+
+    #[test]
+    fn terminal_mouse_positions_snap_to_character_boundaries() {
+        assert_eq!(
+            terminal_point_for_pixels(3.9, 18.9, 80, 24, 8.0, 19.0),
+            TerminalPoint::new(0, 0)
+        );
+        assert_eq!(
+            terminal_point_for_pixels(4.1, 19.0, 80, 24, 8.0, 19.0),
+            TerminalPoint::new(1, 1)
+        );
+        assert_eq!(
+            terminal_point_for_pixels(10_000.0, 10_000.0, 80, 24, 8.0, 19.0),
+            TerminalPoint::new(23, 80)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_c_is_the_terminal_copy_shortcut_on_macos() {
+        assert!(is_terminal_copy_shortcut(
+            &Keystroke::parse("cmd-c").unwrap()
+        ));
+        assert!(!is_terminal_copy_shortcut(
+            &Keystroke::parse("ctrl-c").unwrap()
+        ));
     }
 
     #[test]
