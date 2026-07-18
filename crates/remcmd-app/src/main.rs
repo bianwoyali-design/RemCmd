@@ -13,8 +13,11 @@ use terminal_input::{
     should_translate_alternate_scroll,
 };
 
+mod terminal_canvas;
+use terminal_canvas::{TerminalCanvasFrame, TerminalCellMetrics};
+
 mod terminal_view;
-use terminal_view::{TerminalPalette, TerminalRunStyle, TerminalViewModel, palette_color};
+use terminal_view::{TerminalPalette, TerminalViewModel, palette_color};
 
 #[cfg(target_os = "macos")]
 mod private_key_picker;
@@ -23,12 +26,11 @@ use std::{ops::Range, path::PathBuf, time::Duration};
 
 use gpui::{
     App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
-    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText,
-    Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
-    UnderlineStyle as GpuiUnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
+    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions,
+    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div,
+    point, prelude::*, px, rgb, size,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -44,8 +46,8 @@ use remcmd_storage::{
     load_settings, save_profiles, save_settings,
 };
 use remcmd_terminal::{
-    Clipboard as TerminalClipboard, CursorShape, Scroll as TerminalScroll, TerminalEngine,
-    TerminalEvent, TerminalModes, TerminalPoint, TerminalSelection, TerminalSnapshot, TextAreaSize,
+    Clipboard as TerminalClipboard, Scroll as TerminalScroll, TerminalEngine, TerminalEvent,
+    TerminalModes, TerminalPoint, TerminalSelection, TerminalSnapshot, TextAreaSize,
 };
 
 const TERMINAL_COLUMNS: u32 = 80;
@@ -97,8 +99,8 @@ struct ActiveTerminal {
     engine: TerminalEngine,
     title: Option<String>,
     pty_size: PtySize,
-    cell_width: u16,
-    cell_height: u16,
+    cell_width: f32,
+    cell_height: f32,
     viewport_bounds: Option<Bounds<Pixels>>,
     was_connected: bool,
 }
@@ -114,8 +116,8 @@ impl ActiveTerminal {
             engine,
             title: None,
             pty_size: size,
-            cell_width: TERMINAL_CELL_WIDTH,
-            cell_height: TERMINAL_CELL_HEIGHT,
+            cell_width: f32::from(TERMINAL_CELL_WIDTH),
+            cell_height: f32::from(TERMINAL_CELL_HEIGHT),
             viewport_bounds: None,
             was_connected: false,
         }
@@ -136,8 +138,8 @@ impl ActiveTerminal {
         TextAreaSize {
             rows: u16::try_from(size.rows()).unwrap_or(u16::MAX),
             columns: u16::try_from(size.columns()).unwrap_or(u16::MAX),
-            cell_width: self.cell_width,
-            cell_height: self.cell_height,
+            cell_width: pixel_cell_dimension(self.cell_width),
+            cell_height: pixel_cell_dimension(self.cell_height),
         }
     }
 
@@ -146,11 +148,11 @@ impl ActiveTerminal {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalLayout {
     pty_size: PtySize,
-    cell_width: u16,
-    cell_height: u16,
+    cell_width: f32,
+    cell_height: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -860,8 +862,8 @@ impl RemCmdApp {
         let bounds = terminal.viewport_bounds?;
         let local = bounds.localize(&position)?;
         let size = terminal.engine.size();
-        let cell_width = f32::from(terminal.cell_width).max(1.0);
-        let cell_height = f32::from(terminal.cell_height).max(1.0);
+        let cell_width = terminal.cell_width.max(1.0);
+        let cell_height = terminal.cell_height.max(1.0);
 
         Some(terminal_point_for_pixels(
             f32::from(local.x),
@@ -1118,8 +1120,8 @@ impl RemCmdApp {
             .terminal
             .as_ref()
             .map(|terminal| terminal.cell_height)
-            .unwrap_or(TERMINAL_CELL_HEIGHT);
-        let delta = f32::from(event.delta.pixel_delta(px(f32::from(line_height))).y);
+            .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
+        let delta = f32::from(event.delta.pixel_delta(px(line_height)).y);
         if delta == 0.0 {
             return;
         }
@@ -1130,11 +1132,11 @@ impl RemCmdApp {
         }
         self.terminal_scroll_accumulator += delta;
 
-        let lines = (self.terminal_scroll_accumulator / f32::from(line_height)).trunc() as i32;
+        let lines = (self.terminal_scroll_accumulator / line_height).trunc() as i32;
         if lines == 0 {
             return;
         }
-        self.terminal_scroll_accumulator -= lines as f32 * f32::from(line_height);
+        self.terminal_scroll_accumulator -= lines as f32 * line_height;
 
         let modes = self.terminal_modes();
         let display_offset = self
@@ -1441,36 +1443,19 @@ impl RemCmdApp {
     }
 
     fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut screen = div().flex().flex_col().flex_none();
         let palette = self.terminal_palette();
         let cell_height = self
             .terminal
             .as_ref()
             .map(|terminal| terminal.cell_height)
-            .unwrap_or(TERMINAL_CELL_HEIGHT);
-
-        if let Some(terminal) = self.terminal.as_ref() {
-            let model = TerminalViewModel::from_snapshot_with_selection(
+            .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
+        let model = self.terminal.as_ref().map(|terminal| {
+            TerminalViewModel::from_snapshot_with_selection(
                 &terminal.snapshot(),
                 self.terminal_selection,
                 palette,
-            );
-
-            for row in model.rows {
-                let highlights = row
-                    .runs
-                    .into_iter()
-                    .map(|run| (run.range, terminal_highlight(run.style)));
-
-                screen = screen.child(
-                    div()
-                        .h(px(f32::from(cell_height)))
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .child(StyledText::new(row.text).with_highlights(highlights)),
-                );
-            }
-        }
+            )
+        });
 
         let profile_id = self
             .terminal
@@ -1481,13 +1466,28 @@ impl RemCmdApp {
         let layout_entity = input_entity.clone();
         let input_focus_handle = self.terminal_focus_handle.clone();
         let input_layer = canvas(
-            measure_terminal_layout,
-            move |bounds, layout, window, cx| {
+            move |bounds, window, _| {
+                let metrics = TerminalCellMetrics::measure(window);
+                let layout = terminal_layout_for_pixels(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    metrics.width,
+                    metrics.height,
+                );
+                let frame = model.map(|model| TerminalCanvasFrame::prepare(model, metrics, window));
+
+                (layout, frame)
+            },
+            move |bounds, (layout, frame), window, cx| {
                 window.handle_input(
                     &input_focus_handle,
                     ElementInputHandler::new(bounds, input_entity),
                     cx,
                 );
+
+                if let Some(frame) = frame {
+                    frame.paint(bounds, window, cx);
+                }
 
                 cx.defer(move |cx| {
                     layout_entity.update(cx, |this, cx| {
@@ -1516,7 +1516,7 @@ impl RemCmdApp {
             .bg(rgb(palette.background.hex()))
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(14.0))
-            .line_height(px(f32::from(cell_height)))
+            .line_height(px(cell_height))
             .cursor(CursorStyle::IBeam)
             .focus(|style| style.border_color(self.theme.border_strong))
             .on_key_down(cx.listener(Self::on_terminal_key_down))
@@ -1532,7 +1532,6 @@ impl RemCmdApp {
                     .flex_1()
                     .size_full()
                     .overflow_hidden()
-                    .child(screen)
                     .child(input_layer),
             )
     }
@@ -2506,13 +2505,10 @@ impl EntityInputHandler for RemCmdApp {
 
         Some(Bounds::new(
             point(
-                element_bounds.left() + px(column as f32 * f32::from(terminal.cell_width)),
-                element_bounds.top() + px(row as f32 * f32::from(terminal.cell_height)),
+                element_bounds.left() + px(column as f32 * terminal.cell_width),
+                element_bounds.top() + px(row as f32 * terminal.cell_height),
             ),
-            size(
-                px(f32::from(terminal.cell_width)),
-                px(f32::from(terminal.cell_height)),
-            ),
+            size(px(terminal.cell_width), px(terminal.cell_height)),
         ))
     }
 
@@ -2524,25 +2520,6 @@ impl EntityInputHandler for RemCmdApp {
     ) -> Option<usize> {
         Some(self.terminal_marked_text.encode_utf16().count())
     }
-}
-
-fn measure_terminal_layout(
-    bounds: Bounds<Pixels>,
-    window: &mut Window,
-    _: &mut App,
-) -> TerminalLayout {
-    let style = window.text_style();
-    let font_size = style.font_size.to_pixels(window.rem_size());
-    let line = window
-        .text_system()
-        .shape_line("M".into(), font_size, &[style.to_run(1)], None);
-
-    terminal_layout_for_pixels(
-        f32::from(bounds.size.width),
-        f32::from(bounds.size.height),
-        f32::from(line.width),
-        f32::from(window.line_height()),
-    )
 }
 
 fn terminal_layout_for_pixels(
@@ -2561,8 +2538,8 @@ fn terminal_layout_for_pixels(
             pixel_dimension(viewport_width),
             pixel_dimension(viewport_height),
         ),
-        cell_width: pixel_cell_dimension(cell_width),
-        cell_height: pixel_cell_dimension(cell_height),
+        cell_width,
+        cell_height,
     }
 }
 
@@ -2658,42 +2635,6 @@ fn is_terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         keystroke.modifiers.control && keystroke.modifiers.shift
-    }
-}
-
-fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
-    let cursor_line = matches!(
-        style.cursor,
-        Some(CursorShape::Underline | CursorShape::Beam)
-    );
-    let underline_color = if cursor_line {
-        rgb(style.cursor_color.hex())
-    } else {
-        rgb(style.underline_color.hex())
-    };
-
-    HighlightStyle {
-        color: Some(rgb(style.foreground.hex()).into()),
-        font_weight: style.bold.then_some(FontWeight::BOLD),
-        font_style: style.italic.then_some(FontStyle::Italic),
-        background_color: Some(
-            rgb(if style.selected {
-                style.selection_background.hex()
-            } else {
-                style.background.hex()
-            })
-            .into(),
-        ),
-        underline: (style.underline || cursor_line).then_some(GpuiUnderlineStyle {
-            thickness: px(1.0),
-            color: Some(underline_color.into()),
-            wavy: false,
-        }),
-        strikethrough: style.strikeout.then_some(StrikethroughStyle {
-            thickness: px(1.0),
-            color: Some(rgb(style.foreground.hex()).into()),
-        }),
-        fade_out: None,
     }
 }
 
@@ -2799,8 +2740,8 @@ mod tests {
         let layout = terminal_layout_for_pixels(803.0, 479.0, 8.0, 19.0);
 
         assert_eq!(layout.pty_size, PtySize::new(100, 25).with_pixels(803, 479));
-        assert_eq!(layout.cell_width, 8);
-        assert_eq!(layout.cell_height, 19);
+        assert_eq!(layout.cell_width, 8.0);
+        assert_eq!(layout.cell_height, 19.0);
     }
 
     #[test]
@@ -2811,8 +2752,8 @@ mod tests {
         assert_eq!(layout.pty_size.rows, 1);
         assert_eq!(layout.pty_size.pixel_width, 1);
         assert_eq!(layout.pty_size.pixel_height, 1);
-        assert_eq!(layout.cell_width, TERMINAL_CELL_WIDTH);
-        assert_eq!(layout.cell_height, TERMINAL_CELL_HEIGHT);
+        assert_eq!(layout.cell_width, f32::from(TERMINAL_CELL_WIDTH));
+        assert_eq!(layout.cell_height, f32::from(TERMINAL_CELL_HEIGHT));
     }
 
     #[test]
