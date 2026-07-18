@@ -5,12 +5,7 @@ use remcmd_terminal::{
     TerminalSelection, TerminalSnapshot, UnderlineStyle,
 };
 
-pub(crate) const DEFAULT_BACKGROUND: ViewColor = ViewColor::new(0x18, 0x18, 0x18);
-pub(crate) const DEFAULT_FOREGROUND: ViewColor = ViewColor::new(0xd4, 0xd4, 0xd4);
-pub(crate) const SELECTION_BACKGROUND: ViewColor = ViewColor::new(0x26, 0x4f, 0x78);
-
-const CURSOR_COLOR: ViewColor = ViewColor::new(0xe5, 0xe5, 0xe5);
-const ANSI_COLORS: [ViewColor; 16] = [
+const DARK_ANSI_COLORS: [ViewColor; 16] = [
     ViewColor::new(0x1e, 0x1e, 0x1e),
     ViewColor::new(0xcd, 0x31, 0x31),
     ViewColor::new(0x0d, 0xbc, 0x79),
@@ -28,6 +23,56 @@ const ANSI_COLORS: [ViewColor; 16] = [
     ViewColor::new(0x29, 0xb8, 0xdb),
     ViewColor::new(0xff, 0xff, 0xff),
 ];
+
+const LIGHT_ANSI_COLORS: [ViewColor; 16] = [
+    ViewColor::new(0x00, 0x00, 0x00),
+    ViewColor::new(0xcd, 0x31, 0x31),
+    ViewColor::new(0x00, 0x80, 0x00),
+    ViewColor::new(0x94, 0x98, 0x00),
+    ViewColor::new(0x04, 0x51, 0xa5),
+    ViewColor::new(0xbc, 0x05, 0xbc),
+    ViewColor::new(0x05, 0x98, 0xbc),
+    ViewColor::new(0x55, 0x55, 0x55),
+    ViewColor::new(0x66, 0x66, 0x66),
+    ViewColor::new(0xcd, 0x31, 0x31),
+    ViewColor::new(0x14, 0xce, 0x14),
+    ViewColor::new(0xb5, 0xba, 0x00),
+    ViewColor::new(0x04, 0x51, 0xa5),
+    ViewColor::new(0xbc, 0x05, 0xbc),
+    ViewColor::new(0x05, 0x98, 0xbc),
+    ViewColor::new(0xa5, 0xa5, 0xa5),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalPalette {
+    pub(crate) foreground: ViewColor,
+    pub(crate) background: ViewColor,
+    pub(crate) cursor: ViewColor,
+    pub(crate) selection: ViewColor,
+    ansi: [ViewColor; 16],
+}
+
+impl TerminalPalette {
+    pub(crate) const fn dark() -> Self {
+        Self {
+            foreground: ViewColor::new(0xd4, 0xd4, 0xd4),
+            background: ViewColor::new(0x18, 0x18, 0x18),
+            cursor: ViewColor::new(0xe5, 0xe5, 0xe5),
+            selection: ViewColor::new(0x26, 0x4f, 0x78),
+            ansi: DARK_ANSI_COLORS,
+        }
+    }
+
+    pub(crate) const fn light() -> Self {
+        Self {
+            foreground: ViewColor::new(0x24, 0x29, 0x2f),
+            background: ViewColor::new(0xff, 0xff, 0xff),
+            cursor: ViewColor::new(0x24, 0x29, 0x2f),
+            selection: ViewColor::new(0xad, 0xd6, 0xff),
+            ansi: LIGHT_ANSI_COLORS,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ViewColor {
@@ -76,7 +121,9 @@ pub(crate) struct TerminalRunStyle {
     pub(crate) underline: bool,
     pub(crate) strikeout: bool,
     pub(crate) cursor: Option<CursorShape>,
+    pub(crate) cursor_color: ViewColor,
     pub(crate) selected: bool,
+    pub(crate) selection_background: ViewColor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,29 +146,35 @@ pub(crate) struct TerminalViewModel {
 impl TerminalViewModel {
     #[cfg(test)]
     pub(crate) fn from_snapshot(snapshot: &TerminalSnapshot) -> Self {
-        Self::from_snapshot_with_selection(snapshot, None)
+        Self::from_snapshot_with_selection(snapshot, None, TerminalPalette::dark())
     }
 
     pub(crate) fn from_snapshot_with_selection(
         snapshot: &TerminalSnapshot,
         selection: Option<TerminalSelection>,
+        palette: TerminalPalette,
     ) -> Self {
         let rows = (0..snapshot.size.rows())
-            .map(|row| build_row(snapshot, row, selection))
+            .map(|row| build_row(snapshot, row, selection, palette))
             .collect();
 
         Self { rows }
     }
 }
 
-pub(crate) fn palette_color(snapshot: &TerminalSnapshot, index: usize) -> ViewColor {
-    resolve_palette_color(&snapshot.palette_overrides, index)
+pub(crate) fn palette_color(
+    snapshot: &TerminalSnapshot,
+    index: usize,
+    palette: TerminalPalette,
+) -> ViewColor {
+    resolve_palette_color(&snapshot.palette_overrides, index, palette)
 }
 
 fn build_row(
     snapshot: &TerminalSnapshot,
     row: usize,
     selection: Option<TerminalSelection>,
+    palette: TerminalPalette,
 ) -> TerminalRow {
     let mut text = String::with_capacity(snapshot.size.columns());
     let mut runs: Vec<TerminalRun> = Vec::new();
@@ -156,6 +209,7 @@ fn build_row(
             cell,
             cursor,
             selected,
+            palette,
         );
 
         if let Some(previous) = runs.last_mut()
@@ -212,9 +266,10 @@ fn resolve_cell_style(
     cell: &remcmd_terminal::TerminalCell,
     cursor: Option<CursorShape>,
     selected: bool,
+    palette: TerminalPalette,
 ) -> TerminalRunStyle {
-    let mut foreground = resolve_color(snapshot, foreground);
-    let mut background = resolve_color(snapshot, background);
+    let mut foreground = resolve_color(snapshot, foreground, palette);
+    let mut background = resolve_color(snapshot, background, palette);
 
     if cell.attributes.contains(CellAttributes::INVERSE) {
         std::mem::swap(&mut foreground, &mut background);
@@ -230,7 +285,7 @@ fn resolve_cell_style(
 
     if matches!(cursor, Some(CursorShape::Block | CursorShape::HollowBlock)) {
         foreground = background;
-        background = palette_color(snapshot, NamedColor::Cursor.palette_index());
+        background = palette_color(snapshot, NamedColor::Cursor.palette_index(), palette);
     }
 
     TerminalRunStyle {
@@ -238,32 +293,42 @@ fn resolve_cell_style(
         background,
         underline_color: cell
             .underline_color
-            .map(|color| resolve_color(snapshot, color))
+            .map(|color| resolve_color(snapshot, color, palette))
             .unwrap_or(foreground),
         bold: cell.attributes.contains(CellAttributes::BOLD),
         italic: cell.attributes.contains(CellAttributes::ITALIC),
         underline: cell.underline != UnderlineStyle::None,
         strikeout: cell.attributes.contains(CellAttributes::STRIKEOUT),
         cursor,
+        cursor_color: palette.cursor,
         selected,
+        selection_background: palette.selection,
     }
 }
 
-fn resolve_color(snapshot: &TerminalSnapshot, color: TerminalColor) -> ViewColor {
+fn resolve_color(
+    snapshot: &TerminalSnapshot,
+    color: TerminalColor,
+    palette: TerminalPalette,
+) -> ViewColor {
     match color {
-        TerminalColor::Named(color) => palette_color(snapshot, color.palette_index()),
-        TerminalColor::Indexed(index) => palette_color(snapshot, usize::from(index)),
+        TerminalColor::Named(color) => palette_color(snapshot, color.palette_index(), palette),
+        TerminalColor::Indexed(index) => palette_color(snapshot, usize::from(index), palette),
         TerminalColor::Rgb(color) => color.into(),
     }
 }
 
-fn resolve_palette_color(overrides: &PaletteOverrides, index: usize) -> ViewColor {
+fn resolve_palette_color(
+    overrides: &PaletteOverrides,
+    index: usize,
+    palette: TerminalPalette,
+) -> ViewColor {
     if let Some(color) = overrides.get(index) {
         return color.into();
     }
 
     match index {
-        0..=15 => ANSI_COLORS[index],
+        0..=15 => palette.ansi[index],
         16..=231 => {
             let index = index - 16;
             let red = color_cube_channel(index / 36);
@@ -275,38 +340,38 @@ fn resolve_palette_color(overrides: &PaletteOverrides, index: usize) -> ViewColo
             let level = 8 + ((index - 232) as u8 * 10);
             ViewColor::new(level, level, level)
         }
-        index if index == NamedColor::Foreground.palette_index() => DEFAULT_FOREGROUND,
-        index if index == NamedColor::Background.palette_index() => DEFAULT_BACKGROUND,
-        index if index == NamedColor::Cursor.palette_index() => CURSOR_COLOR,
+        index if index == NamedColor::Foreground.palette_index() => palette.foreground,
+        index if index == NamedColor::Background.palette_index() => palette.background,
+        index if index == NamedColor::Cursor.palette_index() => palette.cursor,
         index if index == NamedColor::DimBlack.palette_index() => {
-            ANSI_COLORS[0].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[0].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimRed.palette_index() => {
-            ANSI_COLORS[1].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[1].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimGreen.palette_index() => {
-            ANSI_COLORS[2].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[2].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimYellow.palette_index() => {
-            ANSI_COLORS[3].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[3].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimBlue.palette_index() => {
-            ANSI_COLORS[4].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[4].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimMagenta.palette_index() => {
-            ANSI_COLORS[5].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[5].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimCyan.palette_index() => {
-            ANSI_COLORS[6].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[6].dimmed_against(palette.background)
         }
         index if index == NamedColor::DimWhite.palette_index() => {
-            ANSI_COLORS[7].dimmed_against(DEFAULT_BACKGROUND)
+            palette.ansi[7].dimmed_against(palette.background)
         }
-        index if index == NamedColor::BrightForeground.palette_index() => ANSI_COLORS[15],
+        index if index == NamedColor::BrightForeground.palette_index() => palette.ansi[15],
         index if index == NamedColor::DimForeground.palette_index() => {
-            DEFAULT_FOREGROUND.dimmed_against(DEFAULT_BACKGROUND)
+            palette.foreground.dimmed_against(palette.background)
         }
-        _ => DEFAULT_FOREGROUND,
+        _ => palette.foreground,
     }
 }
 
@@ -349,8 +414,8 @@ mod tests {
         let styled = style_at(row, 1);
 
         assert_eq!(row.text.len(), 6);
-        assert_eq!(styled.foreground, ANSI_COLORS[1]);
-        assert_eq!(styled.background, ANSI_COLORS[4]);
+        assert_eq!(styled.foreground, TerminalPalette::dark().ansi[1]);
+        assert_eq!(styled.background, TerminalPalette::dark().ansi[4]);
         assert!(styled.bold);
         assert!(styled.italic);
     }
@@ -376,7 +441,7 @@ mod tests {
         let snapshot = terminal.snapshot();
 
         assert_eq!(
-            palette_color(&snapshot, 1),
+            palette_color(&snapshot, 1, TerminalPalette::dark()),
             ViewColor::new(0x12, 0x34, 0x56)
         );
         assert_eq!(
@@ -392,7 +457,21 @@ mod tests {
         let cursor_style = style_at(&model.rows[0], 0);
 
         assert_eq!(cursor_style.cursor, Some(CursorShape::Block));
-        assert_eq!(cursor_style.background, CURSOR_COLOR);
+        assert_eq!(cursor_style.background, TerminalPalette::dark().cursor);
+    }
+
+    #[test]
+    fn light_palette_uses_white_defaults_and_dark_text() {
+        let mut terminal = TerminalEngine::new(4, 1).unwrap();
+        terminal.process(b"A");
+        let palette = TerminalPalette::light();
+        let model =
+            TerminalViewModel::from_snapshot_with_selection(&terminal.snapshot(), None, palette);
+        let style = style_at(&model.rows[0], 0);
+
+        assert_eq!(style.foreground, palette.foreground);
+        assert_eq!(style.background, palette.background);
+        assert_eq!(palette.background, ViewColor::new(0xff, 0xff, 0xff));
     }
 
     #[test]
@@ -404,7 +483,11 @@ mod tests {
             remcmd_terminal::TerminalPoint::new(0, 1),
             remcmd_terminal::TerminalPoint::new(0, 3),
         );
-        let model = TerminalViewModel::from_snapshot_with_selection(&snapshot, Some(selection));
+        let model = TerminalViewModel::from_snapshot_with_selection(
+            &snapshot,
+            Some(selection),
+            TerminalPalette::dark(),
+        );
 
         assert!(!style_at(&model.rows[0], 0).selected);
         assert!(style_at(&model.rows[0], 1).selected);
@@ -421,7 +504,11 @@ mod tests {
             remcmd_terminal::TerminalPoint::new(0, 1),
             remcmd_terminal::TerminalPoint::new(0, 2),
         );
-        let model = TerminalViewModel::from_snapshot_with_selection(&snapshot, Some(selection));
+        let model = TerminalViewModel::from_snapshot_with_selection(
+            &snapshot,
+            Some(selection),
+            TerminalPalette::dark(),
+        );
 
         assert!(style_at(&model.rows[0], 0).selected);
     }

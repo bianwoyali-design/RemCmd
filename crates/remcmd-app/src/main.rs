@@ -14,9 +14,7 @@ use terminal_input::{
 };
 
 mod terminal_view;
-use terminal_view::{
-    DEFAULT_BACKGROUND, SELECTION_BACKGROUND, TerminalRunStyle, TerminalViewModel, palette_color,
-};
+use terminal_view::{TerminalPalette, TerminalRunStyle, TerminalViewModel, palette_color};
 
 #[cfg(target_os = "macos")]
 mod private_key_picker;
@@ -849,6 +847,14 @@ impl RemCmdApp {
             .unwrap_or(TerminalModes::NONE)
     }
 
+    fn terminal_palette(&self) -> TerminalPalette {
+        if self.theme.is_light() {
+            TerminalPalette::light()
+        } else {
+            TerminalPalette::dark()
+        }
+    }
+
     fn terminal_point_for_position(&self, position: gpui::Point<Pixels>) -> Option<TerminalPoint> {
         let terminal = self.terminal.as_ref()?;
         let bounds = terminal.viewport_bounds?;
@@ -1190,9 +1196,10 @@ impl RemCmdApp {
                 self.send_terminal_response(request.response(&contents));
             }
             TerminalEvent::ColorRequest(request) => {
+                let palette = self.terminal_palette();
                 if let Some(terminal) = self.terminal.as_ref() {
                     let snapshot = terminal.snapshot();
-                    let color = palette_color(&snapshot, request.index).into();
+                    let color = palette_color(&snapshot, request.index, palette).into();
                     self.send_terminal_response(request.response(color));
                 }
             }
@@ -1435,6 +1442,7 @@ impl RemCmdApp {
 
     fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut screen = div().flex().flex_col().flex_none();
+        let palette = self.terminal_palette();
         let cell_height = self
             .terminal
             .as_ref()
@@ -1445,6 +1453,7 @@ impl RemCmdApp {
             let model = TerminalViewModel::from_snapshot_with_selection(
                 &terminal.snapshot(),
                 self.terminal_selection,
+                palette,
             );
 
             for row in model.rows {
@@ -1504,7 +1513,7 @@ impl RemCmdApp {
             .rounded_md()
             .border_1()
             .border_color(self.theme.border)
-            .bg(rgb(DEFAULT_BACKGROUND.hex()))
+            .bg(rgb(palette.background.hex()))
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(14.0))
             .line_height(px(f32::from(cell_height)))
@@ -2658,7 +2667,7 @@ fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
         Some(CursorShape::Underline | CursorShape::Beam)
     );
     let underline_color = if cursor_line {
-        rgb(0xe5e5e5)
+        rgb(style.cursor_color.hex())
     } else {
         rgb(style.underline_color.hex())
     };
@@ -2669,7 +2678,7 @@ fn terminal_highlight(style: TerminalRunStyle) -> HighlightStyle {
         font_style: style.italic.then_some(FontStyle::Italic),
         background_color: Some(
             rgb(if style.selected {
-                SELECTION_BACKGROUND.hex()
+                style.selection_background.hex()
             } else {
                 style.background.hex()
             })

@@ -2,6 +2,12 @@ use gpui::{App, Global, Hsla, Window, WindowAppearance, div, hsla, prelude::*, p
 
 use remcmd_core::ThemeMode;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThemeAppearance {
+    Light,
+    Dark,
+}
+
 /// Semantic color tokens for the whole application. Every render helper reads
 /// colors from a `Theme` so light and dark appearances stay consistent.
 ///
@@ -10,6 +16,7 @@ use remcmd_core::ThemeMode;
 /// palette from any `&App`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
+    pub appearance: ThemeAppearance,
     pub text_primary: Hsla,
     pub text_muted: Hsla,
     pub text_faint: Hsla,
@@ -50,6 +57,7 @@ impl Global for Theme {}
 impl Theme {
     pub fn dark() -> Self {
         Self {
+            appearance: ThemeAppearance::Dark,
             text_primary: opaque(0xf4f4f5),
             text_muted: opaque(0xa1a1aa),
             text_faint: opaque(0x71717a),
@@ -88,6 +96,7 @@ impl Theme {
 
     pub fn light() -> Self {
         Self {
+            appearance: ThemeAppearance::Light,
             text_primary: opaque(0x1a1a1a),
             text_muted: opaque(0x5f5f66),
             text_faint: opaque(0x8b8b92),
@@ -138,6 +147,10 @@ impl Theme {
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self::light(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),
         }
+    }
+
+    pub const fn is_light(self) -> bool {
+        matches!(self.appearance, ThemeAppearance::Light)
     }
 }
 
