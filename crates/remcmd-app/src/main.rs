@@ -55,7 +55,7 @@ const TERMINAL_CELL_HEIGHT: u16 = 19;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[cfg(target_os = "macos")]
-const TERMINAL_FONT_FAMILY: &str = "Menlo";
+const TERMINAL_FONT_FAMILY: &str = "SF Mono";
 #[cfg(target_os = "windows")]
 const TERMINAL_FONT_FAMILY: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
