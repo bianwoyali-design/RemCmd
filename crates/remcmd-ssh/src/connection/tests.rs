@@ -80,8 +80,9 @@ fn closed_command_channel_returns_invalid_state_error() {
 
 #[tokio::test]
 async fn event_receiver_preserves_event_order() {
-    let (event_tx, event_rx) = mpsc::channel(2);
+    let (event_tx, event_rx) = mpsc::channel(4);
     let mut receiver = ConnectionEventReceiver { event_rx };
+    let resized = PtySize::new(120, 40);
 
     event_tx
         .send(ConnectionEvent::StateChanged(SessionState::Connecting))
@@ -91,6 +92,16 @@ async fn event_receiver_preserves_event_order() {
         .send(ConnectionEvent::StateChanged(SessionState::Authenticating))
         .await
         .expect("authenticating event should be sent");
+    event_tx
+        .send(ConnectionEvent::Resized(resized))
+        .await
+        .expect("resize confirmation should be sent");
+    event_tx
+        .send(ConnectionEvent::Shell(ShellEvent::Output(
+            b"prompt".to_vec(),
+        )))
+        .await
+        .expect("shell output should be sent");
 
     assert_eq!(
         receiver.next_event().await,
@@ -99,6 +110,16 @@ async fn event_receiver_preserves_event_order() {
     assert_eq!(
         receiver.next_event().await,
         Some(ConnectionEvent::StateChanged(SessionState::Authenticating))
+    );
+    assert_eq!(
+        receiver.next_event().await,
+        Some(ConnectionEvent::Resized(resized))
+    );
+    assert_eq!(
+        receiver.next_event().await,
+        Some(ConnectionEvent::Shell(ShellEvent::Output(
+            b"prompt".to_vec()
+        )))
     );
 }
 

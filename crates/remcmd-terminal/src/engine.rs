@@ -1,4 +1,5 @@
-use alacritty_terminal::grid::{Dimensions, Scroll as AlacrittyScroll};
+use alacritty_terminal::grid::{Dimensions, GridCell, Row, Scroll as AlacrittyScroll};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell as AlacrittyCell, Flags};
 use alacritty_terminal::term::{
     Config as AlacrittyConfig, Osc52, Term, TermDamage as AlacrittyDamage, TermMode,
@@ -16,6 +17,10 @@ use crate::screen::{
     TerminalConfig, TerminalCursor, TerminalDamage, TerminalModes, TerminalSize, TerminalSnapshot,
     UnderlineStyle,
 };
+
+const MIN_RIGHT_ALIGNED_GAP: usize = 8;
+const MAX_RIGHT_ALIGNED_SUFFIX: usize = 32;
+const MAX_RIGHT_MARGIN: usize = 2;
 
 pub struct TerminalEngine {
     parser: Processor,
@@ -52,6 +57,7 @@ impl TerminalEngine {
 
     pub fn resize(&mut self, columns: usize, rows: usize) -> Result<(), InvalidTerminalSize> {
         let size = TerminalSize::new(columns, rows)?;
+        reanchor_right_aligned_rows(&mut self.terminal, columns);
         self.terminal.resize(size);
         self.size = size;
         Ok(())
@@ -144,6 +150,84 @@ impl TerminalEngine {
 
     pub fn drain_events(&self) -> Vec<TerminalEvent> {
         self.events.drain()
+    }
+}
+
+fn reanchor_right_aligned_rows(terminal: &mut Term<EventQueue>, target_columns: usize) {
+    if terminal.mode().contains(TermMode::ALT_SCREEN) {
+        return;
+    }
+
+    // Zsh-style right prompts are cursor-positioned suffixes, not soft-wrapped text.
+    let grid = terminal.grid_mut();
+    let history_size = grid.history_size();
+    let screen_lines = grid.screen_lines();
+    let current_columns = grid.columns();
+
+    for line in -(history_size as i32)..screen_lines as i32 {
+        reanchor_right_aligned_row(&mut grid[Line(line)], current_columns, target_columns);
+    }
+}
+
+fn reanchor_right_aligned_row(
+    row: &mut Row<AlacrittyCell>,
+    current_columns: usize,
+    target_columns: usize,
+) {
+    if current_columns == target_columns || current_columns == 0 || target_columns == 0 {
+        return;
+    }
+
+    if row[Column(current_columns - 1)]
+        .flags
+        .contains(Flags::WRAPLINE)
+    {
+        return;
+    }
+
+    let Some(last_content) = (0..current_columns)
+        .rfind(|column| !row[Column(*column)].is_empty())
+        .map(|column| column + 1)
+    else {
+        return;
+    };
+    let right_margin = current_columns - last_content;
+    if right_margin > MAX_RIGHT_MARGIN {
+        return;
+    }
+
+    let mut suffix_start = last_content;
+    while suffix_start > 0 && !row[Column(suffix_start - 1)].is_empty() {
+        suffix_start -= 1;
+    }
+    let suffix_width = last_content - suffix_start;
+    if suffix_width == 0 || suffix_width > MAX_RIGHT_ALIGNED_SUFFIX {
+        return;
+    }
+
+    let mut prefix_end = suffix_start;
+    while prefix_end > 0 && row[Column(prefix_end - 1)].is_empty() {
+        prefix_end -= 1;
+    }
+    let gap_width = suffix_start - prefix_end;
+    if prefix_end == 0 || gap_width < MIN_RIGHT_ALIGNED_GAP {
+        return;
+    }
+
+    let target_end = target_columns.saturating_sub(right_margin);
+    let Some(target_start) = target_end.checked_sub(suffix_width) else {
+        return;
+    };
+    if target_start < prefix_end + MIN_RIGHT_ALIGNED_GAP || target_start == suffix_start {
+        return;
+    }
+
+    let suffix: Vec<_> = (suffix_start..last_content)
+        .map(|column| std::mem::take(&mut row[Column(column)]))
+        .collect();
+    row.grow(target_columns);
+    for (offset, cell) in suffix.into_iter().enumerate() {
+        row[Column(target_start + offset)] = cell;
     }
 }
 
@@ -543,6 +627,49 @@ mod tests {
             .map(|row| row_text(&snapshot, row))
             .collect();
         assert_eq!(text, "abcdefgh");
+    }
+
+    #[test]
+    fn resize_keeps_cursor_positioned_prompt_content_on_its_row() {
+        let mut terminal = terminal(97, 8);
+        terminal.process(
+            "user\r\n❯ \x1b[K\x1b[83C\x1b[44m \u{e606} v3.14.6 \x1b[0m\x1b[94Decho first\r\nFIRST\r\n"
+                .as_bytes(),
+        );
+        terminal.process(
+            "user\r\n❯ \x1b[K\x1b[83C\x1b[44m \u{e606} v3.14.6 \x1b[0m\x1b[94Decho second\r\nSECOND\r\n"
+                .as_bytes(),
+        );
+
+        terminal.resize(67, 8).expect("valid narrow size");
+        let narrow_snapshot = terminal.snapshot();
+        let narrow_rows: Vec<_> = (0..narrow_snapshot.size.rows())
+            .map(|row| narrow_snapshot.row_text(row).unwrap())
+            .collect();
+        assert!(
+            narrow_rows.iter().any(|row| {
+                row.starts_with("❯ echo first") && row.trim_end().ends_with("v3.14.6")
+            }),
+            "first prompt wrapped at the narrow size: {narrow_rows:?}"
+        );
+
+        terminal.resize(91, 8).expect("valid restored size");
+        let restored_snapshot = terminal.snapshot();
+        let restored_rows: Vec<_> = (0..restored_snapshot.size.rows())
+            .map(|row| restored_snapshot.row_text(row).unwrap())
+            .collect();
+        assert!(
+            restored_rows.iter().any(|row| {
+                row.starts_with("❯ echo first") && row.trim_end().ends_with("v3.14.6")
+            }),
+            "first prompt was split across rows: {restored_rows:?}"
+        );
+        assert!(
+            restored_rows.iter().any(|row| {
+                row.starts_with("❯ echo second") && row.trim_end().ends_with("v3.14.6")
+            }),
+            "second prompt was split across rows: {restored_rows:?}"
+        );
     }
 
     #[test]

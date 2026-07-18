@@ -99,6 +99,7 @@ struct ActiveTerminal {
     engine: TerminalEngine,
     title: Option<String>,
     pty_size: PtySize,
+    pending_pty_size: Option<PtySize>,
     cell_width: f32,
     cell_height: f32,
     viewport_bounds: Option<Bounds<Pixels>>,
@@ -116,6 +117,7 @@ impl ActiveTerminal {
             engine,
             title: None,
             pty_size: size,
+            pending_pty_size: None,
             cell_width: f32::from(TERMINAL_CELL_WIDTH),
             cell_height: f32::from(TERMINAL_CELL_HEIGHT),
             viewport_bounds: None,
@@ -145,6 +147,35 @@ impl ActiveTerminal {
 
     fn modes(&self) -> TerminalModes {
         self.engine.modes()
+    }
+
+    fn stage_resize(&mut self, size: PtySize) -> bool {
+        let current_target = self.pending_pty_size.unwrap_or(self.pty_size);
+        if current_target == size {
+            return false;
+        }
+
+        self.pending_pty_size = Some(size);
+        true
+    }
+
+    fn acknowledge_resize(&mut self, size: PtySize) -> bool {
+        let dimensions_changed =
+            self.pty_size.columns != size.columns || self.pty_size.rows != size.rows;
+        if dimensions_changed {
+            self.engine
+                .resize(
+                    usize::try_from(size.columns).expect("PTY columns fit usize"),
+                    usize::try_from(size.rows).expect("PTY rows fit usize"),
+                )
+                .expect("measured terminal size is valid");
+        }
+
+        self.pty_size = size;
+        if self.pending_pty_size == Some(size) {
+            self.pending_pty_size = None;
+        }
+        dimensions_changed
     }
 }
 
@@ -1053,23 +1084,7 @@ impl RemCmdApp {
         terminal.cell_width = layout.cell_width;
         terminal.cell_height = layout.cell_height;
 
-        let previous_size = terminal.pty_size;
-        if previous_size.columns != layout.pty_size.columns
-            || previous_size.rows != layout.pty_size.rows
-        {
-            self.terminal_selection = None;
-            self.terminal_selecting = false;
-            terminal
-                .engine
-                .resize(
-                    usize::try_from(layout.pty_size.columns).expect("PTY columns fit usize"),
-                    usize::try_from(layout.pty_size.rows).expect("PTY rows fit usize"),
-                )
-                .expect("measured terminal size is valid");
-        }
-        terminal.pty_size = layout.pty_size;
-
-        if previous_size == layout.pty_size {
+        if !terminal.stage_resize(layout.pty_size) {
             if cell_size_changed {
                 cx.notify();
             }
@@ -1086,13 +1101,13 @@ impl RemCmdApp {
         size: PtySize,
         cx: &mut Context<Self>,
     ) {
-        // Live window resizing crosses many cell boundaries; only notify the PTY after it settles.
+        // Keep local reflow and the remote PTY on the same final size after live resizing settles.
         self.terminal_resize_task = Some(cx.spawn(async move |this, cx| {
             Timer::after(TERMINAL_RESIZE_DEBOUNCE).await;
 
             let _ = this.update(cx, |this, cx| {
                 let is_current_size = this.terminal.as_ref().is_some_and(|terminal| {
-                    terminal.profile_id == profile_id && terminal.pty_size == size
+                    terminal.profile_id == profile_id && terminal.pending_pty_size == Some(size)
                 });
                 if !is_current_size
                     || this.connection_profile_id.as_deref() != Some(profile_id.as_str())
@@ -1100,9 +1115,11 @@ impl RemCmdApp {
                     return;
                 }
 
-                if let Some(handle) = this.connection_handle.as_ref()
-                    && let Err(error) = handle.resize(size)
-                {
+                let Some(handle) = this.connection_handle.as_ref() else {
+                    return;
+                };
+
+                if let Err(error) = handle.resize(size) {
                     this.connection_error = Some(error.to_string());
                     cx.notify();
                 }
@@ -1328,6 +1345,20 @@ impl RemCmdApp {
 
                 if !prompted_for_passphrase {
                     self.connection_error = Some(error.to_string());
+                }
+                true
+            }
+            ConnectionEvent::Resized(size) => {
+                let dimensions_changed = self
+                    .terminal
+                    .as_mut()
+                    .filter(|terminal| {
+                        self.connection_profile_id.as_deref() == Some(terminal.profile_id.as_str())
+                    })
+                    .is_some_and(|terminal| terminal.acknowledge_resize(size));
+                if dimensions_changed {
+                    self.terminal_selection = None;
+                    self.terminal_selecting = false;
                 }
                 true
             }
@@ -2754,6 +2785,54 @@ mod tests {
         assert_eq!(layout.pty_size.pixel_height, 1);
         assert_eq!(layout.cell_width, f32::from(TERMINAL_CELL_WIDTH));
         assert_eq!(layout.cell_height, f32::from(TERMINAL_CELL_HEIGHT));
+    }
+
+    #[test]
+    fn terminal_resize_ignores_intermediate_live_sizes() {
+        let initial_size = PtySize::new(80, 24);
+        let final_size = initial_size.with_pixels(640, 456);
+        let mut terminal = ActiveTerminal::new("profile-1".into(), initial_size);
+        terminal.process(b"first prompt\r\nsecond prompt");
+        let initial_snapshot = terminal.snapshot();
+
+        assert!(terminal.stage_resize(PtySize::new(48, 18).with_pixels(384, 342)));
+        assert!(terminal.stage_resize(final_size));
+        assert_eq!(terminal.pty_size, initial_size);
+        assert_eq!(terminal.snapshot(), initial_snapshot);
+
+        assert!(!terminal.acknowledge_resize(final_size));
+        assert_eq!(terminal.pty_size, final_size);
+        assert_eq!(terminal.snapshot(), initial_snapshot);
+    }
+
+    #[test]
+    fn terminal_resize_tracks_stale_acknowledgements_without_losing_final_target() {
+        let initial_size = PtySize::new(80, 24);
+        let narrow_size = PtySize::new(48, 18).with_pixels(384, 342);
+        let final_size = PtySize::new(100, 30).with_pixels(800, 570);
+        let mut terminal = ActiveTerminal::new("profile-1".into(), initial_size);
+
+        assert!(terminal.stage_resize(narrow_size));
+        assert!(terminal.stage_resize(final_size));
+        assert!(terminal.acknowledge_resize(narrow_size));
+        assert_eq!(terminal.pty_size, narrow_size);
+        assert_eq!(terminal.pending_pty_size, Some(final_size));
+
+        assert!(terminal.acknowledge_resize(final_size));
+        assert_eq!(terminal.pty_size, final_size);
+        assert_eq!(terminal.pending_pty_size, None);
+    }
+
+    #[test]
+    fn terminal_resize_reflows_only_when_the_final_grid_changes() {
+        let mut terminal = ActiveTerminal::new("profile-1".into(), PtySize::new(80, 24));
+        let final_size = PtySize::new(48, 18).with_pixels(384, 342);
+
+        assert!(terminal.stage_resize(final_size));
+        assert!(terminal.acknowledge_resize(final_size));
+        assert_eq!(terminal.engine.size().columns(), 48);
+        assert_eq!(terminal.engine.size().rows(), 18);
+        assert_eq!(terminal.pending_pty_size, None);
     }
 
     #[test]
