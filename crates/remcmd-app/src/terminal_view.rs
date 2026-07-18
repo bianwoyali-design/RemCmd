@@ -1,5 +1,3 @@
-use std::ops::Range;
-
 use remcmd_terminal::{
     CellAttributes, CursorShape, NamedColor, PaletteOverrides, Rgb, TerminalColor,
     TerminalSelection, TerminalSnapshot, UnderlineStyle,
@@ -127,20 +125,22 @@ pub(crate) struct TerminalRunStyle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TerminalRun {
-    pub(crate) range: Range<usize>,
+pub(crate) struct TerminalViewCell {
+    pub(crate) column: usize,
+    pub(crate) width: usize,
+    pub(crate) text: String,
     pub(crate) style: TerminalRunStyle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalRow {
-    pub(crate) text: String,
-    pub(crate) runs: Vec<TerminalRun>,
+    pub(crate) cells: Vec<TerminalViewCell>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalViewModel {
     pub(crate) rows: Vec<TerminalRow>,
+    pub(crate) background: ViewColor,
 }
 
 impl TerminalViewModel {
@@ -158,7 +158,10 @@ impl TerminalViewModel {
             .map(|row| build_row(snapshot, row, selection, palette))
             .collect();
 
-        Self { rows }
+        Self {
+            rows,
+            background: palette.background,
+        }
     }
 }
 
@@ -176,26 +179,27 @@ fn build_row(
     selection: Option<TerminalSelection>,
     palette: TerminalPalette,
 ) -> TerminalRow {
-    let mut text = String::with_capacity(snapshot.size.columns());
-    let mut runs: Vec<TerminalRun> = Vec::new();
+    let mut cells = Vec::with_capacity(snapshot.size.columns());
 
     for column in 0..snapshot.size.columns() {
         let Some(cell) = snapshot.cell(row, column) else {
             continue;
         };
 
-        if cell.attributes.contains(CellAttributes::WIDE_SPACER)
-            || cell
-                .attributes
-                .contains(CellAttributes::LEADING_WIDE_SPACER)
-        {
+        if cell.attributes.contains(CellAttributes::WIDE_SPACER) {
             continue;
         }
 
-        let start = text.len();
-        text.push(cell.character);
-        text.extend(cell.combining_characters.iter());
-        let end = text.len();
+        let mut text = String::new();
+        if cell
+            .attributes
+            .contains(CellAttributes::LEADING_WIDE_SPACER)
+        {
+            text.push(' ');
+        } else {
+            text.push(cell.character);
+            text.extend(cell.combining_characters.iter());
+        }
 
         let cursor = snapshot
             .cursor
@@ -212,20 +216,19 @@ fn build_row(
             palette,
         );
 
-        if let Some(previous) = runs.last_mut()
-            && previous.range.end == start
-            && previous.style == style
-        {
-            previous.range.end = end;
-        } else {
-            runs.push(TerminalRun {
-                range: start..end,
-                style,
-            });
-        }
+        cells.push(TerminalViewCell {
+            column,
+            width: if cell.attributes.contains(CellAttributes::WIDE) {
+                2
+            } else {
+                1
+            },
+            text,
+            style,
+        });
     }
 
-    TerminalRow { text, runs }
+    TerminalRow { cells }
 }
 
 fn cell_is_selected(
@@ -283,7 +286,7 @@ fn resolve_cell_style(
         foreground = background;
     }
 
-    if matches!(cursor, Some(CursorShape::Block | CursorShape::HollowBlock)) {
+    if matches!(cursor, Some(CursorShape::Block)) {
         foreground = background;
         background = palette_color(snapshot, NamedColor::Cursor.palette_index(), palette);
     }
@@ -396,16 +399,19 @@ mod tests {
 
     use super::*;
 
-    fn style_at(row: &TerminalRow, byte_index: usize) -> TerminalRunStyle {
-        row.runs
+    fn cell_at(row: &TerminalRow, column: usize) -> &TerminalViewCell {
+        row.cells
             .iter()
-            .find(|run| run.range.contains(&byte_index))
-            .expect("styled byte")
-            .style
+            .find(|cell| cell.column == column)
+            .expect("terminal cell")
+    }
+
+    fn style_at(row: &TerminalRow, column: usize) -> TerminalRunStyle {
+        cell_at(row, column).style
     }
 
     #[test]
-    fn converts_ansi_colors_and_attributes_to_styled_runs() {
+    fn converts_ansi_colors_and_attributes_to_styled_cells() {
         let mut terminal = TerminalEngine::new(6, 1).unwrap();
         terminal.process(b"A\x1b[1;3;31;44mB");
 
@@ -413,7 +419,7 @@ mod tests {
         let row = &model.rows[0];
         let styled = style_at(row, 1);
 
-        assert_eq!(row.text.len(), 6);
+        assert_eq!(row.cells.iter().map(|cell| cell.width).sum::<usize>(), 6);
         assert_eq!(styled.foreground, TerminalPalette::dark().ansi[1]);
         assert_eq!(styled.background, TerminalPalette::dark().ansi[4]);
         assert!(styled.bold);
@@ -421,17 +427,18 @@ mod tests {
     }
 
     #[test]
-    fn preserves_wide_and_combining_text_without_spacer_glyphs() {
+    fn preserves_terminal_columns_for_wide_and_combining_text() {
         let mut terminal = TerminalEngine::new(6, 1).unwrap();
         terminal.process("你e\u{301}".as_bytes());
 
         let model = TerminalViewModel::from_snapshot(&terminal.snapshot());
 
-        assert!(model.rows[0].text.starts_with("你e\u{301}"));
-        assert_eq!(
-            model.rows[0].text.chars().filter(|ch| *ch == ' ').count(),
-            3
-        );
+        let row = &model.rows[0];
+        assert_eq!(cell_at(row, 0).text, "你");
+        assert_eq!(cell_at(row, 0).width, 2);
+        assert_eq!(cell_at(row, 2).text, "e\u{301}");
+        assert_eq!(cell_at(row, 2).width, 1);
+        assert_eq!(row.cells.iter().map(|cell| cell.width).sum::<usize>(), 6);
     }
 
     #[test]
@@ -475,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn splits_runs_at_selection_boundaries() {
+    fn marks_selected_cells_without_changing_their_columns() {
         let mut terminal = TerminalEngine::new(4, 1).unwrap();
         terminal.process(b"abcd");
         let snapshot = terminal.snapshot();
@@ -511,5 +518,33 @@ mod tests {
         );
 
         assert!(style_at(&model.rows[0], 0).selected);
+    }
+
+    #[test]
+    fn box_drawing_cells_retain_their_terminal_columns() {
+        let mut terminal = TerminalEngine::new(8, 1).unwrap();
+        terminal.process("┌─cpu─┐".as_bytes());
+
+        let model = TerminalViewModel::from_snapshot(&terminal.snapshot());
+        let row = &model.rows[0];
+        let rendered = row
+            .cells
+            .iter()
+            .take(7)
+            .map(|cell| (cell.column, cell.text.as_str(), cell.width))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                (0, "┌", 1),
+                (1, "─", 1),
+                (2, "c", 1),
+                (3, "p", 1),
+                (4, "u", 1),
+                (5, "─", 1),
+                (6, "┐", 1),
+            ]
+        );
     }
 }

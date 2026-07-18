@@ -32,6 +32,9 @@ pub enum ConnectionEvent {
     /// Reports a successful lifecycle transition.
     StateChanged(SessionState),
 
+    /// Confirms that the remote PTY accepted a terminal resize.
+    Resized(PtySize),
+
     /// Carries output or lifecycle information from the remote shell.
     Shell(ShellEvent),
 
@@ -276,6 +279,15 @@ async fn run_connection(
         return;
     }
 
+    if events
+        .send(ConnectionEvent::Resized(latest_size))
+        .await
+        .is_err()
+    {
+        close_resources(&transport, Some(&writer)).await;
+        return;
+    }
+
     if let Err(error) = session.mark_connected() {
         report_failure(&mut session, error, &events).await;
         close_resources(&transport, Some(&writer)).await;
@@ -337,6 +349,15 @@ async fn run_connection(
 
                 if let Err(error) = writer.resize(latest_size).await {
                     report_failure(&mut session, error, &events).await;
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+
+                if events
+                    .send(ConnectionEvent::Resized(latest_size))
+                    .await
+                    .is_err()
+                {
                     close_resources(&transport, Some(&writer)).await;
                     return;
                 }
