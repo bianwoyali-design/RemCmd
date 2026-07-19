@@ -7,8 +7,18 @@ license.workspace = true
 [dependencies]
 directories.workspace = true
 remcmd-core.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+keyring = { workspace = true, features = ["sync-secret-service"] }
 
 [dev-dependencies]
 tempfile.workspace = true

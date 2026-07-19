@@ -6,6 +6,12 @@ use std::{
 use directories::ProjectDirs;
 use remcmd_core::{ConnectionProfile, ThemeMode};
 
+mod credentials;
+pub use credentials::{
+    CredentialKind, CredentialStoreError, delete_credential, delete_profile_credentials,
+    load_credential, save_credential,
+};
+
 pub fn default_profiles_path() -> io::Result<PathBuf> {
     let project_dirs = ProjectDirs::from("", "", "RemCmd")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "app data directory not found"))?;
