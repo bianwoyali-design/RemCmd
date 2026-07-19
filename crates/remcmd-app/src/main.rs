@@ -38,7 +38,7 @@ use gpui::PathPromptOptions;
 
 use remcmd_core::{AuthConfig, ConnectionProfile, ThemeMode};
 use remcmd_ssh::{
-    AuthMethod, ConnectionEvent, ConnectionHandle, PtySize, SessionState, ShellEvent,
+    AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, PtySize, SessionState, ShellEvent,
     SshConnection, SshErrorKind,
 };
 use remcmd_storage::{
@@ -64,6 +64,7 @@ const TERMINAL_FONT_FAMILY: &str = "Consolas";
 const TERMINAL_FONT_FAMILY: &str = "DejaVu Sans Mono";
 
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
+gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -79,6 +80,7 @@ struct RemCmdApp {
     connection_message: Option<String>,
     terminal_end_reason: Option<String>,
     credential_prompt: Option<CredentialPrompt>,
+    host_key_prompt: Option<HostKeyInfo>,
     terminal: Option<ActiveTerminal>,
     terminal_focus_handle: FocusHandle,
     terminal_marked_text: String,
@@ -305,6 +307,7 @@ impl RemCmdApp {
             connection_message: None,
             terminal_end_reason: None,
             credential_prompt: None,
+            host_key_prompt: None,
             terminal: None,
             terminal_focus_handle: terminal_focus_handle.clone(),
             terminal_marked_text: String::new(),
@@ -717,6 +720,7 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_credential_prompt(cx);
+        self.host_key_prompt = None;
 
         let runtime = cx.global::<SshRuntime>().handle();
         let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
@@ -815,6 +819,51 @@ impl RemCmdApp {
     ) {
         self.dismiss_credential_prompt(cx);
         cx.notify();
+    }
+
+    fn trust_pending_host_key(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.host_key_prompt.take() else {
+            return;
+        };
+
+        let Some(handle) = self.connection_handle.as_ref() else {
+            self.connection_error = Some("SSH connection handle is missing".into());
+            cx.notify();
+            return;
+        };
+
+        match handle.trust_host_key() {
+            Ok(()) => {
+                self.connection_message = Some(format!("Trusting {}", info.address()));
+            }
+            Err(error) => {
+                self.connection_error = Some(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn reject_pending_host_key(&mut self, cx: &mut Context<Self>) {
+        if self.host_key_prompt.take().is_none() {
+            return;
+        }
+
+        if let Some(handle) = self.connection_handle.as_ref()
+            && let Err(error) = handle.reject_host_key()
+        {
+            self.connection_error = Some(error.to_string());
+        }
+        self.connection_message = None;
+        cx.notify();
+    }
+
+    fn on_cancel_host_key_verification(
+        &mut self,
+        _: &CancelHostKeyVerification,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reject_pending_host_key(cx);
     }
 
     fn prompt_for_private_key_passphrase(
@@ -1303,6 +1352,14 @@ impl RemCmdApp {
                 let previous_state = self.connection_state;
                 self.connection_state = state;
 
+                if matches!(
+                    state,
+                    SessionState::Authenticating | SessionState::Connected
+                ) {
+                    self.host_key_prompt = None;
+                    self.connection_message = None;
+                }
+
                 if state == SessionState::Connected
                     && let Some(terminal) = self.terminal.as_mut()
                 {
@@ -1310,6 +1367,7 @@ impl RemCmdApp {
                 }
 
                 if state == SessionState::Disconnected {
+                    self.host_key_prompt = None;
                     self.terminal_resize_task = None;
                     self.connection_handle = None;
                     self.connection_profile_id = None;
@@ -1322,11 +1380,17 @@ impl RemCmdApp {
 
                 true
             }
+            ConnectionEvent::HostKeyVerificationRequired(info) => {
+                self.connection_message = Some(format!("Verify host key for {}", info.address()));
+                self.host_key_prompt = Some(info);
+                true
+            }
             ConnectionEvent::Failed(error) => {
                 let failed_profile_id = self.connection_profile_id.take();
                 self.connection_state = SessionState::Failed;
                 self.terminal_resize_task = None;
                 self.connection_handle = None;
+                self.host_key_prompt = None;
 
                 let prompted_for_passphrase = if error.kind() == SshErrorKind::PrivateKeyPassphrase
                 {
@@ -1425,7 +1489,9 @@ impl Render for RemCmdApp {
             .child(self.render_sidebar(cx))
             .child(self.render_detail_panel(selected_profile, cx));
 
-        if let Some(prompt) = self.credential_prompt.as_ref() {
+        if self.host_key_prompt.is_some() {
+            root = root.child(self.render_host_key_prompt(cx));
+        } else if let Some(prompt) = self.credential_prompt.as_ref() {
             let focus_handle = prompt.input.focus_handle(cx);
             if !focus_handle.is_focused(window) {
                 window.focus(&focus_handle);
@@ -1748,6 +1814,126 @@ impl RemCmdApp {
             .key_context("CredentialPrompt")
             .on_action(cx.listener(Self::on_submit_credential))
             .on_action(cx.listener(Self::on_cancel_credential))
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(self.theme.overlay_bg)
+            .occlude()
+            .child(modal)
+    }
+
+    fn render_host_key_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let info = self
+            .host_key_prompt
+            .as_ref()
+            .expect("host-key prompt should exist before rendering");
+
+        let modal = div()
+            .w_full()
+            .max_w(px(500.0))
+            .mx_4()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.modal_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(8.0)),
+                blur_radius: px(24.0),
+                spread_radius: px(-8.0),
+            }])
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Verify host key"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child(info.address()),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child("This server is not recorded in known_hosts. Verify its fingerprint before connecting."),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_sm()
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .flex_none()
+                            .text_color(self.theme.text_faint)
+                            .child("Algorithm"),
+                    )
+                    .child(div().child(info.algorithm().to_owned()))
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .text_sm()
+                    .text_color(self.theme.text_faint)
+                    .child("SHA-256 fingerprint"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .w_full()
+                    .font_family(TERMINAL_FONT_FAMILY)
+                    .text_xs()
+                    .child(info.fingerprint().to_owned()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .mt_4()
+                    .child(
+                        button(
+                            "host_key_cancel",
+                            "Cancel",
+                            ButtonVariant::Secondary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reject_pending_host_key(cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            "host_key_trust",
+                            "Trust and connect",
+                            ButtonVariant::Primary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.trust_pending_host_key(cx);
+                        })),
+                    ),
+            );
+
+        div()
+            .id("host_key_prompt")
+            .key_context("HostKeyPrompt")
+            .on_action(cx.listener(Self::on_cancel_host_key_verification))
             .absolute()
             .top_0()
             .right_0()
@@ -2701,11 +2887,20 @@ fn bind_credential_prompt_keys(cx: &mut App) {
     ]);
 }
 
+fn bind_host_key_prompt_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        CancelHostKeyVerification,
+        Some("HostKeyPrompt"),
+    )]);
+}
+
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
 
     bind_text_field_keys(cx);
     bind_credential_prompt_keys(cx);
+    bind_host_key_prompt_keys(cx);
     open_main_window(cx);
     cx.activate(true);
 }

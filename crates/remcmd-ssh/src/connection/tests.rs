@@ -5,13 +5,27 @@ use super::*;
 #[test]
 fn connection_handle_forwards_commands() {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-    let handle = ConnectionHandle { command_tx };
+    let (host_key_decision_tx, mut host_key_decision_rx) = mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        command_tx,
+        host_key_decision_tx,
+        host_key_verification_pending: Arc::new(AtomicBool::new(true)),
+    };
     let size = PtySize::new(120, 40);
 
     handle
         .send_input(b"pwd\n".to_vec())
         .expect("input should be sent");
     handle.resize(size).expect("resize should be sent");
+    handle
+        .trust_host_key()
+        .expect("host key trust should be sent");
+    handle
+        .host_key_verification_pending
+        .store(true, Ordering::Release);
+    handle
+        .reject_host_key()
+        .expect("host key rejection should be sent");
     handle.disconnect().expect("disconnect should be sent");
 
     assert_eq!(
@@ -21,6 +35,14 @@ fn connection_handle_forwards_commands() {
     assert_eq!(
         command_rx.try_recv().expect("resize command"),
         ConnectionCommand::Resize(size)
+    );
+    assert_eq!(
+        host_key_decision_rx.try_recv().expect("trust decision"),
+        HostKeyDecision::Trust
+    );
+    assert_eq!(
+        host_key_decision_rx.try_recv().expect("reject decision"),
+        HostKeyDecision::Reject
     );
     assert_eq!(
         command_rx.try_recv().expect("disconnect command"),
@@ -67,7 +89,12 @@ fn queued_resizes_are_coalesced_without_reordering_other_commands() {
 #[test]
 fn closed_command_channel_returns_invalid_state_error() {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let handle = ConnectionHandle { command_tx };
+    let (host_key_decision_tx, _host_key_decision_rx) = mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        command_tx,
+        host_key_decision_tx,
+        host_key_verification_pending: Arc::new(AtomicBool::new(false)),
+    };
 
     drop(command_rx);
 
@@ -76,6 +103,53 @@ fn closed_command_channel_returns_invalid_state_error() {
         .expect_err("closed worker should reject commands");
 
     assert_eq!(error.kind(), SshErrorKind::InvalidState);
+}
+
+#[test]
+fn host_key_cannot_be_trusted_before_verification_is_requested() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let (host_key_decision_tx, mut host_key_decision_rx) = mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        command_tx,
+        host_key_decision_tx,
+        host_key_verification_pending: Arc::new(AtomicBool::new(false)),
+    };
+
+    let error = handle
+        .trust_host_key()
+        .expect_err("preemptive trust must be rejected");
+
+    assert_eq!(error.kind(), SshErrorKind::InvalidState);
+    assert!(host_key_decision_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn resize_is_retained_while_waiting_for_host_key_decision() {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let (decision_tx, mut decision_rx) = mpsc::unbounded_channel();
+    let mut latest_size = PtySize::default();
+    let resized = PtySize::new(132, 43);
+
+    command_tx
+        .send(ConnectionCommand::Resize(resized))
+        .expect("resize should be queued");
+
+    let send_decision = async move {
+        tokio::task::yield_now().await;
+        decision_tx
+            .send(HostKeyDecision::Trust)
+            .expect("decision should be queued");
+    };
+    let (result, ()) = tokio::join!(
+        wait_for_host_key_decision(&mut decision_rx, &mut command_rx, &mut latest_size),
+        send_decision,
+    );
+
+    assert!(matches!(
+        result,
+        PendingResult::Completed(Ok(HostKeyDecision::Trust))
+    ));
+    assert_eq!(latest_size, resized);
 }
 
 #[tokio::test]

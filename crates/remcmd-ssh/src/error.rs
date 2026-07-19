@@ -5,7 +5,10 @@ pub enum SshErrorKind {
     InvalidState,
     Configuration,
     Network,
-    HostKey,
+    HostKeyUntrusted,
+    HostKeyChanged,
+    HostKeyPersistence,
+    HostKeyVerification,
     Authentication,
     PrivateKeyPassphrase,
     Timeout,
@@ -48,10 +51,12 @@ impl From<russh::Error> for SshError {
         use russh::Error as RusshError;
 
         let kind = match &error {
-            RusshError::UnknownKey
-            | RusshError::WrongServerSig
-            | RusshError::KeyChanged { .. }
-            | RusshError::Keys(russh::keys::Error::KeyChanged { .. }) => SshErrorKind::HostKey,
+            RusshError::UnknownKey => SshErrorKind::HostKeyUntrusted,
+            RusshError::KeyChanged { .. }
+            | RusshError::Keys(russh::keys::Error::KeyChanged { .. }) => {
+                SshErrorKind::HostKeyChanged
+            }
+            RusshError::WrongServerSig => SshErrorKind::HostKeyVerification,
 
             RusshError::NotAuthenticated
             | RusshError::UnsupportedAuthMethod
@@ -95,7 +100,7 @@ mod tests {
     fn unknown_server_key_maps_to_host_key_error() {
         let error = SshError::from(russh::Error::UnknownKey);
 
-        assert_eq!(error.kind(), SshErrorKind::HostKey);
+        assert_eq!(error.kind(), SshErrorKind::HostKeyUntrusted);
     }
 
     #[test]

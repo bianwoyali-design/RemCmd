@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -11,6 +11,7 @@ use russh::{
     keys::{
         Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, check_known_hosts,
         check_known_hosts_path,
+        known_hosts::{learn_known_hosts, learn_known_hosts_path},
     },
 };
 
@@ -19,7 +20,7 @@ use russh::keys::agent::{AgentIdentity, client::AgentClient};
 
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::{AuthMethod, PtySize, SshError, SshErrorKind, SshShell};
+use crate::{AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,14 +31,20 @@ struct ClientHandler {
     host: String,
     port: u16,
     known_hosts_path: Option<PathBuf>,
+    unknown_server_key: Arc<Mutex<Option<PublicKey>>>,
 }
 
 impl ClientHandler {
-    fn new(host: impl Into<String>, port: u16) -> Self {
+    fn new(
+        host: impl Into<String>,
+        port: u16,
+        unknown_server_key: Arc<Mutex<Option<PublicKey>>>,
+    ) -> Self {
         Self {
             host: host.into(),
             port,
             known_hosts_path: None,
+            unknown_server_key,
         }
     }
 
@@ -48,6 +55,7 @@ impl ClientHandler {
             host: host.into(),
             port,
             known_hosts_path: Some(path),
+            unknown_server_key: Arc::default(),
         }
     }
 
@@ -57,7 +65,27 @@ impl ClientHandler {
             None => check_known_hosts(&self.host, self.port, server_public_key),
         };
 
-        result.map_err(russh::Error::from).map_err(SshError::from)
+        result.map_err(|error| match error {
+            russh::keys::Error::KeyChanged { line } => SshError::new(
+                SshErrorKind::HostKeyChanged,
+                format!(
+                    "the host key for {}:{} changed at known_hosts line {line}",
+                    self.host, self.port
+                ),
+            ),
+            error => SshError::from(russh::Error::Keys(error)),
+        })
+    }
+
+    fn capture_unknown_server_key(&self, server_public_key: &PublicKey) -> Result<(), SshError> {
+        let mut unknown_server_key = self.unknown_server_key.lock().map_err(|_| {
+            SshError::new(
+                SshErrorKind::Protocol,
+                "host-key verification state is unavailable",
+            )
+        })?;
+        *unknown_server_key = Some(server_public_key.clone());
+        Ok(())
     }
 }
 
@@ -72,7 +100,75 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        self.verify_server_key(server_public_key)
+        let is_known = self.verify_server_key(server_public_key)?;
+        if !is_known {
+            self.capture_unknown_server_key(server_public_key)?;
+        }
+        Ok(is_known)
+    }
+}
+
+pub(crate) enum TransportOpen {
+    Connected(SshTransport),
+    UnknownHostKey(Box<PendingHostKey>),
+}
+
+pub(crate) struct PendingHostKey {
+    info: HostKeyInfo,
+    public_key: PublicKey,
+    known_hosts_path: Option<PathBuf>,
+}
+
+impl PendingHostKey {
+    fn new(
+        host: String,
+        port: u16,
+        public_key: PublicKey,
+        known_hosts_path: Option<PathBuf>,
+    ) -> Self {
+        let info = HostKeyInfo::from_public_key(host, port, &public_key);
+        Self {
+            info,
+            public_key,
+            known_hosts_path,
+        }
+    }
+
+    pub(crate) fn info(&self) -> &HostKeyInfo {
+        &self.info
+    }
+
+    pub(crate) fn rejected_error(&self) -> SshError {
+        SshError::new(
+            SshErrorKind::HostKeyUntrusted,
+            format!("host key for {} was not trusted", self.info.address()),
+        )
+    }
+
+    pub(crate) async fn trust(self) -> Result<(), SshError> {
+        let info = self.info;
+        let host = info.host().to_owned();
+        let port = info.port();
+        let public_key = self.public_key;
+        let known_hosts_path = self.known_hosts_path;
+
+        tokio::task::spawn_blocking(move || match known_hosts_path {
+            Some(path) => learn_known_hosts_path(&host, port, &public_key, path),
+            None => learn_known_hosts(&host, port, &public_key),
+        })
+        .await
+        .map_err(|error| {
+            SshError::new(
+                SshErrorKind::HostKeyPersistence,
+                format!("failed to record host key for {}: {error}", info.address()),
+            )
+        })?
+        .map_err(|error| {
+            SshError::new(
+                SshErrorKind::HostKeyPersistence,
+                format!("failed to record host key for {}: {error}", info.address()),
+            )
+        })
     }
 }
 
@@ -86,25 +182,52 @@ impl SshTransport {
     async fn open_connection_with_timeout(
         profile: &ConnectionProfile,
         timeout: Duration,
-    ) -> Result<client::Handle<ClientHandler>, SshError> {
+    ) -> Result<TransportOpen, SshError> {
         let config = Arc::new(client::Config {
             nodelay: true,
             ..Default::default()
         });
 
-        let handler = ClientHandler::new(profile.host.clone(), profile.port);
+        let unknown_server_key = Arc::new(Mutex::new(None));
+        let handler = ClientHandler::new(
+            profile.host.clone(),
+            profile.port,
+            unknown_server_key.clone(),
+        );
         let connection = client::connect(config, (profile.host.as_str(), profile.port), handler);
 
-        let handle = tokio::time::timeout(timeout, connection)
+        let result = tokio::time::timeout(timeout, connection)
             .await
             .map_err(|_| {
                 SshError::new(
                     SshErrorKind::Timeout,
                     format!("connection to {}:{} timed out", profile.host, profile.port),
                 )
-            })??;
+            })?;
 
-        Ok(handle)
+        match result {
+            Ok(handle) => Ok(TransportOpen::Connected(Self { handle })),
+            Err(error) => {
+                if error.kind() != SshErrorKind::HostKeyUntrusted {
+                    return Err(error);
+                }
+
+                let public_key = unknown_server_key
+                    .lock()
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Protocol,
+                            "host-key verification state is unavailable",
+                        )
+                    })?
+                    .take()
+                    .ok_or(error)?;
+
+                Ok(TransportOpen::UnknownHostKey(Box::new(
+                    PendingHostKey::new(profile.host.clone(), profile.port, public_key, None),
+                )))
+            }
+        }
     }
 
     async fn authenticate_with_timeout(
@@ -366,10 +489,8 @@ impl SshTransport {
     ///
     /// This remains crate-private so callers outside remcmd-ssh cannot retain
     /// an unauthenticated transport accidentally.
-    pub(crate) async fn open(profile: &ConnectionProfile) -> Result<Self, SshError> {
-        let handle = Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await?;
-
-        Ok(Self { handle })
+    pub(crate) async fn open(profile: &ConnectionProfile) -> Result<TransportOpen, SshError> {
+        Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await
     }
 
     /// Authenticates an already-open SSH transport.
@@ -389,7 +510,10 @@ impl SshTransport {
     /// This convenience API remains available to callers that do not need
     /// progress events for the individual connection stages.
     pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
-        let mut transport = Self::open(profile).await?;
+        let mut transport = match Self::open(profile).await? {
+            TransportOpen::Connected(transport) => transport,
+            TransportOpen::UnknownHostKey(pending) => return Err(pending.rejected_error()),
+        };
 
         transport
             .authenticate(profile.username.as_str(), auth)
@@ -478,6 +602,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unknown_host_key_is_captured_for_explicit_review() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("known_hosts");
+        let public_key =
+            russh::keys::parse_public_key_base64(PUBLIC_KEY).expect("public key should parse");
+        let mut handler = ClientHandler::with_known_hosts_path("localhost", 13265, path);
+
+        let accepted = client::Handler::check_server_key(&mut handler, &public_key)
+            .await
+            .expect("unknown key should not cause an IO error");
+
+        assert!(!accepted);
+        assert_eq!(
+            handler
+                .unknown_server_key
+                .lock()
+                .expect("captured key lock")
+                .as_ref(),
+            Some(&public_key)
+        );
+    }
+
     #[test]
     fn changed_host_key_returns_host_key_error() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -499,7 +646,62 @@ mod tests {
             .verify_server_key(&changed_key)
             .expect_err("changed key must be rejected");
 
-        assert_eq!(error.kind(), SshErrorKind::HostKey);
+        assert_eq!(error.kind(), SshErrorKind::HostKeyChanged);
+    }
+
+    #[tokio::test]
+    async fn trusting_unknown_host_key_records_exact_presented_key() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("nested").join("known_hosts");
+        let public_key =
+            russh::keys::parse_public_key_base64(PUBLIC_KEY).expect("public key should parse");
+        let pending = PendingHostKey::new(
+            "localhost".into(),
+            13265,
+            public_key.clone(),
+            Some(path.clone()),
+        );
+
+        pending.trust().await.expect("host key should be recorded");
+
+        assert!(
+            check_known_hosts_path("localhost", 13265, &public_key, path)
+                .expect("recorded key should be readable")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_key_write_failure_is_typed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let parent_file = directory.path().join("not-a-directory");
+        std::fs::write(&parent_file, b"occupied").expect("parent file should be written");
+        let public_key =
+            russh::keys::parse_public_key_base64(PUBLIC_KEY).expect("public key should parse");
+        let pending = PendingHostKey::new(
+            "localhost".into(),
+            13265,
+            public_key,
+            Some(parent_file.join("known_hosts")),
+        );
+
+        let error = pending
+            .trust()
+            .await
+            .expect_err("invalid parent path should fail");
+
+        assert_eq!(error.kind(), SshErrorKind::HostKeyPersistence);
+    }
+
+    #[test]
+    fn rejecting_unknown_host_key_is_typed() {
+        let public_key =
+            russh::keys::parse_public_key_base64(PUBLIC_KEY).expect("public key should parse");
+        let pending = PendingHostKey::new("localhost".into(), 22, public_key, None);
+
+        let error = pending.rejected_error();
+
+        assert_eq!(error.kind(), SshErrorKind::HostKeyUntrusted);
+        assert!(error.message().contains("localhost:22"));
     }
 
     #[tokio::test]

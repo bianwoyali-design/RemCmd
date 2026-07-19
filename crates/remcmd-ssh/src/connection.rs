@@ -1,11 +1,17 @@
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use remcmd_core::ConnectionProfile;
 use tokio::{runtime::Handle, sync::mpsc};
 
 use crate::{
-    AuthMethod, PtySize, SessionState, ShellEvent, SshError, SshErrorKind, SshSession,
-    SshShellWriter, SshTransport,
+    AuthMethod, HostKeyInfo, PtySize, SessionState, ShellEvent, SshError, SshErrorKind, SshSession,
+    SshShellWriter, SshTransport, host_key::HostKeyDecision, transport::TransportOpen,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -32,6 +38,9 @@ pub enum ConnectionEvent {
     /// Reports a successful lifecycle transition.
     StateChanged(SessionState),
 
+    /// Pauses the SSH handshake until the user verifies an unknown server key.
+    HostKeyVerificationRequired(HostKeyInfo),
+
     /// Confirms that the remote PTY accepted a terminal resize.
     Resized(PtySize),
 
@@ -49,6 +58,8 @@ pub enum ConnectionEvent {
 #[derive(Clone)]
 pub struct ConnectionHandle {
     command_tx: mpsc::UnboundedSender<ConnectionCommand>,
+    host_key_decision_tx: mpsc::UnboundedSender<HostKeyDecision>,
+    host_key_verification_pending: Arc<AtomicBool>,
 }
 
 impl ConnectionHandle {
@@ -67,11 +78,39 @@ impl ConnectionHandle {
         self.send(ConnectionCommand::Disconnect)
     }
 
+    /// Trusts and records the unknown host key presented by this connection.
+    pub fn trust_host_key(&self) -> Result<(), SshError> {
+        self.send_host_key_decision(HostKeyDecision::Trust)
+    }
+
+    /// Rejects the unknown host key presented by this connection.
+    pub fn reject_host_key(&self) -> Result<(), SshError> {
+        self.send_host_key_decision(HostKeyDecision::Reject)
+    }
+
     fn send(&self, command: ConnectionCommand) -> Result<(), SshError> {
         self.command_tx.send(command).map_err(|_| {
             SshError::new(
                 SshErrorKind::InvalidState,
                 "SSH connection task is not running",
+            )
+        })
+    }
+
+    fn send_host_key_decision(&self, decision: HostKeyDecision) -> Result<(), SshError> {
+        self.host_key_verification_pending
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                SshError::new(
+                    SshErrorKind::InvalidState,
+                    "SSH host-key verification is not pending",
+                )
+            })?;
+
+        self.host_key_decision_tx.send(decision).map_err(|_| {
+            SshError::new(
+                SshErrorKind::InvalidState,
+                "SSH host-key verification is not pending",
             )
         })
     }
@@ -107,6 +146,8 @@ impl SshConnection {
         initial_size: PtySize,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (host_key_decision_tx, host_key_decision_rx) = mpsc::unbounded_channel();
+        let host_key_verification_pending = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         runtime.spawn(run_connection(
@@ -114,11 +155,17 @@ impl SshConnection {
             auth,
             initial_size,
             command_rx,
+            host_key_decision_rx,
+            host_key_verification_pending.clone(),
             event_tx,
         ));
 
         Self {
-            handle: ConnectionHandle { command_tx },
+            handle: ConnectionHandle {
+                command_tx,
+                host_key_decision_tx,
+                host_key_verification_pending,
+            },
             events: ConnectionEventReceiver { event_rx },
         }
     }
@@ -167,6 +214,39 @@ where
     }
 }
 
+async fn wait_for_host_key_decision(
+    decisions: &mut mpsc::UnboundedReceiver<HostKeyDecision>,
+    commands: &mut mpsc::UnboundedReceiver<ConnectionCommand>,
+    latest_size: &mut PtySize,
+) -> PendingResult<HostKeyDecision> {
+    loop {
+        tokio::select! {
+            decision = decisions.recv() => {
+                return PendingResult::Completed(decision.ok_or_else(|| {
+                    SshError::new(
+                        SshErrorKind::InvalidState,
+                        "SSH host-key verification channel closed",
+                    )
+                }));
+            }
+
+            command = commands.recv() => {
+                match command {
+                    Some(ConnectionCommand::Resize(size)) => {
+                        *latest_size = size;
+                    }
+                    Some(ConnectionCommand::Input(_)) => {
+                        // Keyboard input is ignored until the shell is ready.
+                    }
+                    Some(ConnectionCommand::Disconnect) | None => {
+                        return PendingResult::Disconnect;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn coalesce_queued_resizes(
     initial_size: PtySize,
     commands: &mut mpsc::UnboundedReceiver<ConnectionCommand>,
@@ -188,6 +268,8 @@ async fn run_connection(
     auth: AuthMethod,
     mut latest_size: PtySize,
     mut commands: mpsc::UnboundedReceiver<ConnectionCommand>,
+    mut host_key_decisions: mpsc::UnboundedReceiver<HostKeyDecision>,
+    host_key_verification_pending: Arc<AtomicBool>,
     events: mpsc::Sender<ConnectionEvent>,
 ) {
     let mut session = SshSession::new(profile.clone());
@@ -201,21 +283,74 @@ async fn run_connection(
         return;
     }
 
-    let mut transport = match wait_for_operation(
-        SshTransport::open(&profile),
-        &mut commands,
-        &mut latest_size,
-    )
-    .await
-    {
-        PendingResult::Completed(Ok(transport)) => transport,
-        PendingResult::Completed(Err(error)) => {
-            report_failure(&mut session, error, &events).await;
-            return;
-        }
-        PendingResult::Disconnect => {
-            finish_disconnection(&mut session, None, None, &events).await;
-            return;
+    let mut transport = loop {
+        match wait_for_operation(
+            SshTransport::open(&profile),
+            &mut commands,
+            &mut latest_size,
+        )
+        .await
+        {
+            PendingResult::Completed(Ok(TransportOpen::Connected(transport))) => break transport,
+            PendingResult::Completed(Ok(TransportOpen::UnknownHostKey(pending))) => {
+                host_key_verification_pending.store(true, Ordering::Release);
+                if events
+                    .send(ConnectionEvent::HostKeyVerificationRequired(
+                        pending.info().clone(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    host_key_verification_pending.store(false, Ordering::Release);
+                    return;
+                }
+
+                let decision = wait_for_host_key_decision(
+                    &mut host_key_decisions,
+                    &mut commands,
+                    &mut latest_size,
+                )
+                .await;
+                host_key_verification_pending.store(false, Ordering::Release);
+
+                match decision {
+                    PendingResult::Completed(Ok(HostKeyDecision::Trust)) => {
+                        match wait_for_operation(pending.trust(), &mut commands, &mut latest_size)
+                            .await
+                        {
+                            PendingResult::Completed(Ok(())) => continue,
+                            PendingResult::Completed(Err(error)) => {
+                                report_failure(&mut session, error, &events).await;
+                                return;
+                            }
+                            PendingResult::Disconnect => {
+                                finish_disconnection(&mut session, None, None, &events).await;
+                                return;
+                            }
+                        }
+                    }
+                    PendingResult::Completed(Ok(HostKeyDecision::Reject)) => {
+                        report_failure(&mut session, pending.rejected_error(), &events).await;
+                        return;
+                    }
+                    PendingResult::Completed(Err(error)) => {
+                        report_failure(&mut session, error, &events).await;
+                        return;
+                    }
+                    PendingResult::Disconnect => {
+                        finish_disconnection(&mut session, None, None, &events).await;
+                        return;
+                    }
+                }
+            }
+            PendingResult::Completed(Err(error)) => {
+                report_failure(&mut session, error, &events).await;
+                return;
+            }
+            PendingResult::Disconnect => {
+                finish_disconnection(&mut session, None, None, &events).await;
+                return;
+            }
         }
     };
 
