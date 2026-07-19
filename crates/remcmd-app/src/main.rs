@@ -22,7 +22,7 @@ use terminal_view::{TerminalPalette, TerminalViewModel, palette_color};
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
-use std::{ops::Range, path::PathBuf, time::Duration};
+use std::{collections::HashMap, ops::Range, path::PathBuf, time::Duration};
 
 use gpui::{
     App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
@@ -32,6 +32,7 @@ use gpui::{
     UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div,
     point, prelude::*, px, rgb, size,
 };
+use secrecy::SecretString;
 
 #[cfg(not(target_os = "macos"))]
 use gpui::PathPromptOptions;
@@ -42,8 +43,9 @@ use remcmd_ssh::{
     SshConnection, SshErrorKind,
 };
 use remcmd_storage::{
-    AppSettings, default_profiles_path, default_settings_path, ensure_profiles_file, load_profiles,
-    load_settings, save_profiles, save_settings,
+    AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
+    delete_profile_credentials, ensure_profiles_file, load_credential, load_profiles,
+    load_settings, save_credential, save_profiles, save_settings,
 };
 use remcmd_terminal::{
     Clipboard as TerminalClipboard, Scroll as TerminalScroll, TerminalEngine, TerminalEvent,
@@ -88,6 +90,9 @@ struct RemCmdApp {
     terminal_selecting: bool,
     terminal_scroll_accumulator: f32,
     terminal_resize_task: Option<Task<()>>,
+    credential_lookup_task: Option<Task<()>>,
+    credential_mutations_in_progress: HashMap<String, usize>,
+    connection_credential: Option<ConnectionCredential>,
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
     theme: Theme,
@@ -244,6 +249,7 @@ struct CredentialPrompt {
     profile_id: String,
     kind: CredentialPromptKind,
     input: Entity<TextField>,
+    remember: bool,
     error: Option<String>,
 }
 
@@ -251,6 +257,52 @@ struct CredentialPrompt {
 enum CredentialPromptKind {
     Password,
     PrivateKeyPassphrase { path: PathBuf },
+}
+
+impl CredentialPromptKind {
+    fn credential_kind(&self) -> CredentialKind {
+        match self {
+            Self::Password => CredentialKind::Password,
+            Self::PrivateKeyPassphrase { .. } => CredentialKind::PrivateKeyPassphrase,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialSource {
+    SystemKeychain,
+    Prompt,
+}
+
+struct ConnectionCredential {
+    profile_id: String,
+    kind: CredentialKind,
+    source: CredentialSource,
+    save_on_success: Option<secrecy::SecretString>,
+}
+
+impl ConnectionCredential {
+    fn from_keychain(profile_id: String, kind: CredentialKind) -> Self {
+        Self {
+            profile_id,
+            kind,
+            source: CredentialSource::SystemKeychain,
+            save_on_success: None,
+        }
+    }
+
+    fn from_prompt(
+        profile_id: String,
+        kind: CredentialKind,
+        save_on_success: Option<secrecy::SecretString>,
+    ) -> Self {
+        Self {
+            profile_id,
+            kind,
+            source: CredentialSource::Prompt,
+            save_on_success,
+        }
+    }
 }
 
 // Application construction and shared data helpers.
@@ -315,6 +367,9 @@ impl RemCmdApp {
             terminal_selecting: false,
             terminal_scroll_accumulator: 0.0,
             terminal_resize_task: None,
+            credential_lookup_task: None,
+            credential_mutations_in_progress: HashMap::new(),
+            connection_credential: None,
             active_panel: ActivePanel::Connection,
             theme_mode,
             theme,
@@ -428,9 +483,11 @@ impl RemCmdApp {
             profile_id,
             kind,
             input: input.clone(),
+            remember: false,
             error,
         });
         self.connection_error = None;
+        self.connection_message = None;
         cx.notify();
 
         input
@@ -442,8 +499,94 @@ impl RemCmdApp {
         }
     }
 
+    fn delete_stored_credentials(
+        &mut self,
+        profile_id: String,
+        kind: Option<CredentialKind>,
+        success_message: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        let runtime = cx.global::<SshRuntime>().handle();
+        *self
+            .credential_mutations_in_progress
+            .entry(profile_id.clone())
+            .or_default() += 1;
+        if self.selected_profile_id.as_deref() == Some(profile_id.as_str()) {
+            self.connection_message = Some("Updating the system keychain".into());
+        }
+
+        cx.spawn(async move |this, cx| {
+            let deleted_profile_id = profile_id.clone();
+            let result = runtime
+                .spawn_blocking(move || match kind {
+                    Some(kind) => delete_credential(&profile_id, kind),
+                    None => delete_profile_credentials(&profile_id),
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let remove_counter = this
+                    .credential_mutations_in_progress
+                    .get_mut(&deleted_profile_id)
+                    .is_some_and(|count| {
+                        *count -= 1;
+                        *count == 0
+                    });
+                if remove_counter {
+                    this.credential_mutations_in_progress
+                        .remove(&deleted_profile_id);
+                    if this.selected_profile_id.as_deref() == Some(deleted_profile_id.as_str()) {
+                        this.connection_message = None;
+                    }
+                }
+
+                match result {
+                    Ok(Ok(())) => {
+                        if let Some(message) = success_message
+                            && remove_counter
+                            && this.selected_profile_id.as_deref()
+                                == Some(deleted_profile_id.as_str())
+                        {
+                            this.connection_message = Some(message.into());
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        this.form_error = Some(error.to_string());
+                    }
+                    Err(error) => {
+                        this.form_error = Some(format!(
+                            "Failed to access the system keychain task: {error}"
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn forget_selected_credential(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let kind = match editor.auth_kind {
+            ProfileAuthKind::Password => CredentialKind::Password,
+            ProfileAuthKind::PrivateKey => CredentialKind::PrivateKeyPassphrase,
+            ProfileAuthKind::Agent => return,
+        };
+
+        self.form_error = None;
+        self.delete_stored_credentials(
+            editor.profile_id.clone(),
+            Some(kind),
+            Some("Saved credential removed from the system keychain"),
+            cx,
+        );
+    }
+
     fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
+        self.credential_lookup_task = None;
         self.active_panel = ActivePanel::Connection;
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
@@ -451,6 +594,7 @@ impl RemCmdApp {
     }
 
     fn add_profile(&mut self, cx: &mut Context<Self>) {
+        self.credential_lookup_task = None;
         let number = self.next_profile_number;
 
         let profile = ConnectionProfile::new(
@@ -474,16 +618,17 @@ impl RemCmdApp {
 
     fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
+        self.credential_lookup_task = None;
         self.active_panel = ActivePanel::Settings;
         cx.notify();
     }
 
     fn delete_selected_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(selected_id) = self.selected_profile_id.as_deref() else {
+        let Some(selected_id) = self.selected_profile_id.clone() else {
             return;
         };
 
-        if self.connection_profile_id.as_deref() == Some(selected_id) {
+        if self.connection_profile_id.as_deref() == Some(selected_id.as_str()) {
             self.form_error = Some("Disconnect this profile before deleting it".into());
             cx.notify();
             return;
@@ -525,6 +670,7 @@ impl RemCmdApp {
 
         self.load_editor_for_selected_profile(cx);
         self.persist_profiles();
+        self.delete_stored_credentials(selected_id, None, None, cx);
 
         cx.notify();
     }
@@ -663,6 +809,14 @@ impl RemCmdApp {
             }
         };
 
+        let credentials_changed = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == editor.profile_id)
+            .is_some_and(|profile| {
+                credentials_invalidated_by_edit(profile, &host, port, &username, &auth)
+            });
+
         if let Some(profile) = self
             .profiles
             .iter_mut()
@@ -677,6 +831,14 @@ impl RemCmdApp {
 
         self.form_error = None;
         self.persist_profiles();
+        if credentials_changed {
+            self.delete_stored_credentials(
+                editor.profile_id,
+                None,
+                Some("Saved credentials cleared because connection details changed"),
+                cx,
+            );
+        }
 
         cx.notify();
     }
@@ -686,41 +848,133 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn connect_selected_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.connection_state.can_connect() {
+    fn connect_selected_profile(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connection_state.can_connect() || self.credential_lookup_task.is_some() {
             return;
         }
 
         let Some(profile) = self.selected_profile().cloned() else {
             return;
         };
+        if self
+            .credential_mutations_in_progress
+            .contains_key(&profile.id)
+        {
+            return;
+        }
 
-        let auth = match &profile.auth {
+        match &profile.auth {
             AuthConfig::Password => {
-                let input = self.open_credential_prompt(
-                    profile.id.clone(),
-                    CredentialPromptKind::Password,
-                    None,
-                    cx,
-                );
-                window.focus(&input.focus_handle(cx));
-                return;
+                self.lookup_credential_and_connect(profile, CredentialPromptKind::Password, cx);
             }
-            AuthConfig::PrivateKey { path } => AuthMethod::private_key(path.clone(), None),
-            AuthConfig::Agent => AuthMethod::Agent,
-        };
+            AuthConfig::PrivateKey { path } => {
+                let prompt_kind = CredentialPromptKind::PrivateKeyPassphrase { path: path.clone() };
+                self.lookup_credential_and_connect(profile, prompt_kind, cx);
+            }
+            AuthConfig::Agent => self.start_connection(profile, AuthMethod::Agent, None, cx),
+        }
+    }
 
-        self.start_connection(profile, auth, cx);
+    fn lookup_credential_and_connect(
+        &mut self,
+        profile: ConnectionProfile,
+        prompt_kind: CredentialPromptKind,
+        cx: &mut Context<Self>,
+    ) {
+        let profile_id = profile.id.clone();
+        let credential_kind = prompt_kind.credential_kind();
+        let runtime = cx.global::<SshRuntime>().handle();
+        self.connection_error = None;
+        self.connection_message = Some("Checking the system keychain".into());
+
+        self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
+            let lookup_profile_id = profile_id.clone();
+            let result = runtime
+                .spawn_blocking(move || load_credential(&lookup_profile_id, credential_kind))
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.credential_lookup_task = None;
+                if !this.connection_state.can_connect()
+                    || this.selected_profile_id.as_deref() != Some(profile_id.as_str())
+                    || this.selected_profile() != Some(&profile)
+                    || this
+                        .credential_mutations_in_progress
+                        .contains_key(&profile_id)
+                {
+                    if this.selected_profile_id.as_deref() == Some(profile_id.as_str()) {
+                        this.connection_message = None;
+                        cx.notify();
+                    }
+                    return;
+                }
+
+                let loaded = match result {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(format!(
+                        "Failed to access the system keychain task: {error}"
+                    )),
+                };
+
+                match loaded {
+                    Ok(Some(secret)) => {
+                        let auth = auth_method_with_secret(prompt_kind, secret);
+                        let credential =
+                            ConnectionCredential::from_keychain(profile_id, credential_kind);
+                        this.start_connection(profile, auth, Some(credential), cx);
+                    }
+                    Ok(None) => match prompt_kind {
+                        CredentialPromptKind::Password => {
+                            this.open_credential_prompt(
+                                profile_id,
+                                CredentialPromptKind::Password,
+                                None,
+                                cx,
+                            );
+                        }
+                        CredentialPromptKind::PrivateKeyPassphrase { path } => {
+                            let auth = AuthMethod::PrivateKey {
+                                path,
+                                passphrase: None,
+                            };
+                            this.start_connection(profile, auth, None, cx);
+                        }
+                    },
+                    Err(error) => match prompt_kind {
+                        CredentialPromptKind::Password => {
+                            this.open_credential_prompt(
+                                profile_id,
+                                CredentialPromptKind::Password,
+                                Some(error),
+                                cx,
+                            );
+                        }
+                        CredentialPromptKind::PrivateKeyPassphrase { path } => {
+                            let auth = AuthMethod::PrivateKey {
+                                path,
+                                passphrase: None,
+                            };
+                            this.start_connection(profile, auth, None, cx);
+                            this.connection_message = Some(error);
+                        }
+                    },
+                }
+            });
+        }));
+
+        cx.notify();
     }
 
     fn start_connection(
         &mut self,
         profile: ConnectionProfile,
         auth: AuthMethod,
+        credential: Option<ConnectionCredential>,
         cx: &mut Context<Self>,
     ) {
         self.dismiss_credential_prompt(cx);
         self.host_key_prompt = None;
+        self.credential_lookup_task = None;
 
         let runtime = cx.global::<SshRuntime>().handle();
         let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
@@ -730,6 +984,7 @@ impl RemCmdApp {
         self.connection_state = SessionState::Connecting;
         self.connection_handle = Some(handle);
         self.connection_profile_id = Some(profile.id.clone());
+        self.connection_credential = credential;
         self.connection_error = None;
         self.connection_message = None;
         self.terminal_end_reason = None;
@@ -775,6 +1030,7 @@ impl RemCmdApp {
 
         let profile_id = prompt.profile_id.clone();
         let kind = prompt.kind.clone();
+        let remember = prompt.remember;
         let input = prompt.input.clone();
 
         let Some(profile) = self
@@ -789,17 +1045,20 @@ impl RemCmdApp {
             return;
         };
 
-        let secret = input.update(cx, |input, cx| input.take_text(cx));
+        let secret = SecretString::new(
+            input
+                .update(cx, |input, cx| input.take_text(cx))
+                .into_boxed_str(),
+        );
         self.credential_prompt = None;
 
-        let auth = match kind {
-            CredentialPromptKind::Password => AuthMethod::password(secret),
-            CredentialPromptKind::PrivateKeyPassphrase { path } => {
-                AuthMethod::private_key(path, Some(secret))
-            }
-        };
+        let credential_kind = kind.credential_kind();
+        let save_on_success = remember.then(|| secret.clone());
+        let auth = auth_method_with_secret(kind, secret);
+        let credential =
+            ConnectionCredential::from_prompt(profile_id, credential_kind, save_on_success);
 
-        self.start_connection(profile, auth, cx);
+        self.start_connection(profile, auth, Some(credential), cx);
     }
 
     fn on_submit_credential(
@@ -891,6 +1150,98 @@ impl RemCmdApp {
             cx,
         );
         true
+    }
+
+    fn prompt_for_password(
+        &mut self,
+        profile_id: String,
+        error: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let uses_password = self.profiles.iter().any(|profile| {
+            profile.id == profile_id && matches!(profile.auth, AuthConfig::Password)
+        });
+        if !uses_password {
+            return false;
+        }
+
+        self.open_credential_prompt(profile_id, CredentialPromptKind::Password, Some(error), cx);
+        true
+    }
+
+    fn remove_rejected_credential_then_prompt(
+        &mut self,
+        profile_id: String,
+        kind: CredentialKind,
+        authentication_error: String,
+        cx: &mut Context<Self>,
+    ) {
+        let runtime = cx.global::<SshRuntime>().handle();
+        self.connection_message = Some("Removing the rejected saved credential".into());
+
+        self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
+            let delete_profile_id = profile_id.clone();
+            let result = runtime
+                .spawn_blocking(move || delete_credential(&delete_profile_id, kind))
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.credential_lookup_task = None;
+                if this.selected_profile_id.as_deref() != Some(profile_id.as_str()) {
+                    return;
+                }
+
+                let error = match result {
+                    Ok(Ok(())) => authentication_error,
+                    Ok(Err(error)) => format!("{authentication_error}\n{error}"),
+                    Err(error) => format!(
+                        "{authentication_error}\nFailed to access the system keychain task: {error}"
+                    ),
+                };
+
+                match kind {
+                    CredentialKind::Password => {
+                        this.prompt_for_password(profile_id, error, cx);
+                    }
+                    CredentialKind::PrivateKeyPassphrase => {
+                        this.prompt_for_private_key_passphrase(profile_id, error, cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn save_successful_credential(&mut self, cx: &mut Context<Self>) {
+        let Some(credential) = self.connection_credential.take() else {
+            return;
+        };
+        let Some(secret) = credential.save_on_success else {
+            return;
+        };
+
+        let profile_id = credential.profile_id;
+        let kind = credential.kind;
+        let runtime = cx.global::<SshRuntime>().handle();
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn_blocking(move || save_credential(&profile_id, kind, &secret))
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.connection_message = Some(match result {
+                    Ok(Ok(())) => "Credential saved in the system keychain".into(),
+                    Ok(Err(error)) => {
+                        format!("Connected, but the credential could not be saved: {error}")
+                    }
+                    Err(error) => {
+                        format!("Connected, but the system keychain task failed: {error}")
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn disconnect_active_connection(&mut self, cx: &mut Context<Self>) {
@@ -1366,11 +1717,16 @@ impl RemCmdApp {
                     terminal.was_connected = true;
                 }
 
+                if state == SessionState::Connected {
+                    self.save_successful_credential(cx);
+                }
+
                 if state == SessionState::Disconnected {
                     self.host_key_prompt = None;
                     self.terminal_resize_task = None;
                     self.connection_handle = None;
                     self.connection_profile_id = None;
+                    self.connection_credential = None;
                     if previous_state == SessionState::Disconnecting
                         && self.terminal_end_reason.is_none()
                     {
@@ -1387,27 +1743,54 @@ impl RemCmdApp {
             }
             ConnectionEvent::Failed(error) => {
                 let failed_profile_id = self.connection_profile_id.take();
+                let failed_credential = self.connection_credential.take();
                 self.connection_state = SessionState::Failed;
                 self.terminal_resize_task = None;
                 self.connection_handle = None;
                 self.host_key_prompt = None;
 
-                let prompted_for_passphrase = if error.kind() == SshErrorKind::PrivateKeyPassphrase
-                {
-                    failed_profile_id
-                        .map(|profile_id| {
-                            self.prompt_for_private_key_passphrase(
+                let authentication_error = error.to_string();
+                let prompted_for_credential =
+                    match (failed_profile_id, failed_credential, error.kind()) {
+                        (
+                            Some(profile_id),
+                            Some(credential),
+                            SshErrorKind::Authentication | SshErrorKind::PrivateKeyPassphrase,
+                        ) if credential.profile_id == profile_id => {
+                            if credential.source == CredentialSource::SystemKeychain {
+                                self.remove_rejected_credential_then_prompt(
+                                    profile_id,
+                                    credential.kind,
+                                    authentication_error,
+                                    cx,
+                                );
+                                true
+                            } else {
+                                match credential.kind {
+                                    CredentialKind::Password => self.prompt_for_password(
+                                        profile_id,
+                                        authentication_error,
+                                        cx,
+                                    ),
+                                    CredentialKind::PrivateKeyPassphrase => self
+                                        .prompt_for_private_key_passphrase(
+                                            profile_id,
+                                            authentication_error,
+                                            cx,
+                                        ),
+                                }
+                            }
+                        }
+                        (Some(profile_id), None, SshErrorKind::PrivateKeyPassphrase) => self
+                            .prompt_for_private_key_passphrase(
                                 profile_id,
-                                error.to_string(),
+                                authentication_error,
                                 cx,
-                            )
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+                            ),
+                        _ => false,
+                    };
 
-                if !prompted_for_passphrase {
+                if !prompted_for_credential {
                     self.connection_error = Some(error.to_string());
                 }
                 true
@@ -1764,6 +2147,45 @@ impl RemCmdApp {
                     .border_color(self.theme.border)
                     .bg(self.theme.surface_bg)
                     .child(prompt.input.clone()),
+            )
+            .child(
+                div()
+                    .id("credential_remember")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mt_3()
+                    .text_sm()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(16.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if prompt.remember {
+                                self.theme.accent
+                            } else {
+                                self.theme.border_strong
+                            })
+                            .bg(if prompt.remember {
+                                self.theme.accent
+                            } else {
+                                self.theme.surface_bg
+                            })
+                            .text_color(self.theme.on_accent)
+                            .when(prompt.remember, |this| this.child("✓")),
+                    )
+                    .child("Remember in system keychain")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(prompt) = this.credential_prompt.as_mut() {
+                            prompt.remember = !prompt.remember;
+                            cx.notify();
+                        }
+                    })),
             );
 
         if let Some(error) = prompt.error.as_ref() {
@@ -2165,6 +2587,9 @@ impl RemCmdApp {
                                 self.render_private_key_row(editor.private_key_path.clone(), cx),
                             )
                         })
+                        .when(editor.auth_kind != ProfileAuthKind::Agent, |this| {
+                            this.child(self.render_saved_credential_row(cx))
+                        })
                         .when_some(self.form_error.as_ref(), |this, error| {
                             this.child(
                                 div()
@@ -2381,10 +2806,21 @@ impl RemCmdApp {
     }
 
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_connect = self.connection_state.can_connect();
+        let checking_keychain = self.credential_lookup_task.is_some();
+        let updating_keychain = self
+            .selected_profile_id
+            .as_deref()
+            .is_some_and(|profile_id| {
+                self.credential_mutations_in_progress
+                    .contains_key(profile_id)
+            });
+        let can_connect =
+            self.connection_state.can_connect() && !checking_keychain && !updating_keychain;
         let can_disconnect = self.connection_state.can_disconnect();
 
         let label = match self.connection_state {
+            _ if checking_keychain => "Checking",
+            _ if updating_keychain => "Updating",
             SessionState::Failed => "Retry",
             SessionState::Disconnecting => "Disconnecting",
             _ if can_disconnect => "Disconnect",
@@ -2405,6 +2841,7 @@ impl RemCmdApp {
         };
 
         let status_color = match self.connection_state {
+            _ if checking_keychain || updating_keychain => self.theme.status_warn,
             SessionState::Connected => self.theme.status_ok,
             SessionState::Failed => self.theme.error_text,
             SessionState::Connecting
@@ -2451,6 +2888,20 @@ impl RemCmdApp {
     }
 
     fn connection_status_text(&self) -> String {
+        if self.credential_lookup_task.is_some() {
+            return "Checking system keychain".into();
+        }
+        if self
+            .selected_profile_id
+            .as_deref()
+            .is_some_and(|profile_id| {
+                self.credential_mutations_in_progress
+                    .contains_key(profile_id)
+            })
+        {
+            return "Updating system keychain".into();
+        }
+
         let state = match self.connection_state {
             SessionState::Disconnected => "Disconnected",
             SessionState::Connecting => "Connecting",
@@ -2622,6 +3073,32 @@ impl RemCmdApp {
             )
     }
 
+    fn render_saved_credential_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .mt_3()
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(112.0))
+                    .truncate()
+                    .child("Credential"),
+            )
+            .child(
+                button(
+                    "forget_saved_credential",
+                    "Forget",
+                    ButtonVariant::Secondary,
+                    true,
+                    &self.theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.forget_selected_credential(cx);
+                })),
+            )
+    }
+
     fn render_form_row(&self, label: &'static str, field: Entity<TextField>) -> impl IntoElement {
         div()
             .flex()
@@ -2737,6 +3214,29 @@ impl EntityInputHandler for RemCmdApp {
     ) -> Option<usize> {
         Some(self.terminal_marked_text.encode_utf16().count())
     }
+}
+
+fn auth_method_with_secret(prompt_kind: CredentialPromptKind, secret: SecretString) -> AuthMethod {
+    match prompt_kind {
+        CredentialPromptKind::Password => AuthMethod::Password { password: secret },
+        CredentialPromptKind::PrivateKeyPassphrase { path } => AuthMethod::PrivateKey {
+            path,
+            passphrase: Some(secret),
+        },
+    }
+}
+
+fn credentials_invalidated_by_edit(
+    profile: &ConnectionProfile,
+    host: &str,
+    port: u16,
+    username: &str,
+    auth: &AuthConfig,
+) -> bool {
+    profile.host != host
+        || profile.port != port
+        || profile.username != username
+        || profile.auth != *auth
 }
 
 fn terminal_layout_for_pixels(
@@ -2959,6 +3459,39 @@ mod tests {
             ProfileAuthKind::Agent.into_config("ignored"),
             Ok(AuthConfig::Agent)
         );
+    }
+
+    #[test]
+    fn profile_name_changes_keep_saved_credentials() {
+        let profile = ConnectionProfile::new("server-1", "Old name", "host", 22, "user");
+
+        assert!(!credentials_invalidated_by_edit(
+            &profile,
+            "host",
+            22,
+            "user",
+            &AuthConfig::Password,
+        ));
+    }
+
+    #[test]
+    fn connection_identity_or_auth_changes_invalidate_saved_credentials() {
+        let profile = ConnectionProfile::new("server-1", "Server", "old-host", 22, "user");
+
+        assert!(credentials_invalidated_by_edit(
+            &profile,
+            "new-host",
+            22,
+            "user",
+            &AuthConfig::Password,
+        ));
+        assert!(credentials_invalidated_by_edit(
+            &profile,
+            "old-host",
+            22,
+            "user",
+            &AuthConfig::Agent,
+        ));
     }
 
     #[test]
