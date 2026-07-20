@@ -76,9 +76,12 @@ struct RemCmdApp {
     form_error: Option<String>,
     profiles_path: PathBuf,
     credential_prompt: Option<CredentialPrompt>,
-    session: TerminalSession,
+    sessions: Vec<TerminalSession>,
+    active_session_id: Option<SessionId>,
+    next_session_id: u64,
     terminal_focus_handle: FocusHandle,
     credential_lookup_task: Option<Task<()>>,
+    credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
@@ -88,11 +91,15 @@ struct RemCmdApp {
     _appearance_subscription: Subscription,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SessionId(u64);
+
 struct TerminalSession {
+    id: SessionId,
+    profile_id: String,
+    close_when_disconnected: bool,
     connection_state: SessionState,
     connection_handle: Option<ConnectionHandle>,
-    connection_profile_id: Option<String>,
     connection_error: Option<String>,
     connection_message: Option<String>,
     terminal_end_reason: Option<String>,
@@ -107,31 +114,40 @@ struct TerminalSession {
 }
 
 impl TerminalSession {
-    fn is_terminal_visible(&self, profile_id: &str) -> bool {
-        let active_connection = self.connection_profile_id.as_deref() == Some(profile_id)
-            && !self.connection_state.can_connect();
+    fn new(id: SessionId, profile_id: String) -> Self {
+        Self {
+            id,
+            profile_id,
+            close_when_disconnected: false,
+            connection_state: SessionState::Disconnected,
+            connection_handle: None,
+            connection_error: None,
+            connection_message: None,
+            terminal_end_reason: None,
+            host_key_prompt: None,
+            terminal: None,
+            terminal_marked_text: String::new(),
+            terminal_selection: None,
+            terminal_selecting: false,
+            terminal_scroll_accumulator: 0.0,
+            terminal_resize_task: None,
+            connection_credential: None,
+        }
+    }
+
+    fn is_terminal_visible(&self) -> bool {
+        let active_connection = !self.connection_state.can_connect();
 
         self.terminal.as_ref().is_some_and(|terminal| {
-            terminal.profile_id == profile_id && (active_connection || terminal.was_connected)
+            terminal.profile_id == self.profile_id && (active_connection || terminal.was_connected)
         })
     }
 
-    fn terminal_has_ended(&self, profile_id: &str) -> bool {
+    fn terminal_has_ended(&self) -> bool {
         self.connection_state.can_connect()
-            && self.connection_profile_id.as_deref() != Some(profile_id)
-            && self
-                .terminal
-                .as_ref()
-                .is_some_and(|terminal| terminal.profile_id == profile_id && terminal.was_connected)
-    }
-
-    fn close_terminal_output(&mut self) {
-        self.terminal = None;
-        self.terminal_marked_text.clear();
-        self.terminal_selection = None;
-        self.terminal_selecting = false;
-        self.terminal_scroll_accumulator = 0.0;
-        self.terminal_resize_task = None;
+            && self.terminal.as_ref().is_some_and(|terminal| {
+                terminal.profile_id == self.profile_id && terminal.was_connected
+            })
     }
 }
 
@@ -280,6 +296,7 @@ impl ProfileAuthKind {
 }
 
 struct CredentialPrompt {
+    session_id: SessionId,
     profile_id: String,
     kind: CredentialPromptKind,
     input: Entity<TextField>,
@@ -387,9 +404,12 @@ impl RemCmdApp {
             editor: None,
             form_error,
             credential_prompt: None,
-            session: TerminalSession::default(),
+            sessions: Vec::new(),
+            active_session_id: None,
+            next_session_id: 1,
             terminal_focus_handle: terminal_focus_handle.clone(),
             credential_lookup_task: None,
+            credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
             active_panel: ActivePanel::Connection,
             theme_mode,
@@ -418,6 +438,121 @@ impl RemCmdApp {
         self.profiles
             .iter()
             .find(|profile| &profile.id == selected_id)
+    }
+
+    fn session(&self, session_id: SessionId) -> Option<&TerminalSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+    }
+
+    fn session_mut(&mut self, session_id: SessionId) -> Option<&mut TerminalSession> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+    }
+
+    fn active_session(&self) -> Option<&TerminalSession> {
+        self.active_session_id
+            .and_then(|session_id| self.session(session_id))
+    }
+
+    fn active_session_mut(&mut self) -> Option<&mut TerminalSession> {
+        let session_id = self.active_session_id?;
+        self.session_mut(session_id)
+    }
+
+    fn session_for_profile(&self, profile_id: &str) -> Option<&TerminalSession> {
+        self.sessions
+            .iter()
+            .rev()
+            .find(|session| session.profile_id == profile_id)
+    }
+
+    fn session_for_profile_mut(&mut self, profile_id: &str) -> Option<&mut TerminalSession> {
+        self.sessions
+            .iter_mut()
+            .rev()
+            .find(|session| session.profile_id == profile_id)
+    }
+
+    fn selected_session(&self) -> Option<&TerminalSession> {
+        let profile_id = self.selected_profile_id.as_deref()?;
+        self.active_session()
+            .filter(|session| session.profile_id == profile_id)
+    }
+
+    fn create_session_for_profile(&mut self, profile_id: &str) -> SessionId {
+        let session_id = SessionId(self.next_session_id);
+        self.next_session_id += 1;
+        self.sessions
+            .push(TerminalSession::new(session_id, profile_id.to_owned()));
+        session_id
+    }
+
+    fn activate_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(profile_id) = self
+            .session(session_id)
+            .map(|session| session.profile_id.clone())
+        else {
+            return false;
+        };
+
+        self.dismiss_credential_prompt(cx);
+        self.active_panel = ActivePanel::Connection;
+        self.active_session_id = Some(session_id);
+        self.selected_profile_id = Some(profile_id);
+        self.load_editor_for_selected_profile(cx);
+        true
+    }
+
+    fn remove_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        else {
+            return false;
+        };
+        let was_active = self.active_session_id == Some(session_id);
+        let removed_profile_id = self.sessions[index].profile_id.clone();
+        self.sessions.remove(index);
+
+        if self.credential_lookup_session_id == Some(session_id) {
+            self.credential_lookup_task = None;
+            self.credential_lookup_session_id = None;
+        }
+        if self
+            .credential_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.session_id == session_id)
+        {
+            self.dismiss_credential_prompt(cx);
+        }
+
+        if was_active {
+            let replacement = index
+                .checked_sub(1)
+                .and_then(|index| self.sessions.get(index))
+                .or_else(|| self.sessions.get(index))
+                .map(|session| (session.id, session.profile_id.clone()));
+
+            if let Some((replacement_id, profile_id)) = replacement {
+                self.active_session_id = Some(replacement_id);
+                self.active_panel = ActivePanel::Connection;
+                self.selected_profile_id = Some(profile_id);
+                self.load_editor_for_selected_profile(cx);
+            } else {
+                self.active_session_id = None;
+                if self.selected_profile_id.as_deref() != Some(removed_profile_id.as_str()) {
+                    self.selected_profile_id =
+                        self.profiles.first().map(|profile| profile.id.clone());
+                    self.load_editor_for_selected_profile(cx);
+                }
+            }
+        }
+
+        true
     }
 
     fn persist_profiles(&mut self) {
@@ -478,6 +613,7 @@ impl RemCmdApp {
 impl RemCmdApp {
     fn open_credential_prompt(
         &mut self,
+        session_id: SessionId,
         profile_id: String,
         kind: CredentialPromptKind,
         error: Option<String>,
@@ -501,14 +637,17 @@ impl RemCmdApp {
         .detach();
 
         self.credential_prompt = Some(CredentialPrompt {
+            session_id,
             profile_id,
             kind,
             input: input.clone(),
             remember: false,
             error,
         });
-        self.session.connection_error = None;
-        self.session.connection_message = None;
+        if let Some(session) = self.session_mut(session_id) {
+            session.connection_error = None;
+            session.connection_message = None;
+        }
         cx.notify();
 
         input
@@ -532,8 +671,8 @@ impl RemCmdApp {
             .credential_mutations_in_progress
             .entry(profile_id.clone())
             .or_default() += 1;
-        if self.selected_profile_id.as_deref() == Some(profile_id.as_str()) {
-            self.session.connection_message = Some("Updating the system keychain".into());
+        if let Some(session) = self.session_for_profile_mut(&profile_id) {
+            session.connection_message = Some("Updating the system keychain".into());
         }
 
         cx.spawn(async move |this, cx| {
@@ -556,8 +695,8 @@ impl RemCmdApp {
                 if remove_counter {
                     this.credential_mutations_in_progress
                         .remove(&deleted_profile_id);
-                    if this.selected_profile_id.as_deref() == Some(deleted_profile_id.as_str()) {
-                        this.session.connection_message = None;
+                    if let Some(session) = this.session_for_profile_mut(&deleted_profile_id) {
+                        session.connection_message = None;
                     }
                 }
 
@@ -567,8 +706,9 @@ impl RemCmdApp {
                             && remove_counter
                             && this.selected_profile_id.as_deref()
                                 == Some(deleted_profile_id.as_str())
+                            && let Some(session) = this.session_for_profile_mut(&deleted_profile_id)
                         {
-                            this.session.connection_message = Some(message.into());
+                            session.connection_message = Some(message.into());
                         }
                     }
                     Ok(Err(error)) => {
@@ -607,15 +747,18 @@ impl RemCmdApp {
 
     fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
-        self.credential_lookup_task = None;
         self.active_panel = ActivePanel::Connection;
+        self.active_session_id = self
+            .active_session()
+            .filter(|session| session.profile_id == profile_id)
+            .or_else(|| self.session_for_profile(&profile_id))
+            .map(|session| session.id);
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
         cx.notify();
     }
 
     fn add_profile(&mut self, cx: &mut Context<Self>) {
-        self.credential_lookup_task = None;
         let number = self.next_profile_number;
 
         let profile = ConnectionProfile::new(
@@ -627,6 +770,7 @@ impl RemCmdApp {
         );
 
         self.active_panel = ActivePanel::Connection;
+        self.active_session_id = None;
         self.selected_profile_id = Some(profile.id.clone());
         self.profiles.push(profile);
         self.next_profile_number += 1;
@@ -639,7 +783,6 @@ impl RemCmdApp {
 
     fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
-        self.credential_lookup_task = None;
         self.active_panel = ActivePanel::Settings;
         cx.notify();
     }
@@ -649,7 +792,9 @@ impl RemCmdApp {
             return;
         };
 
-        if self.session.connection_profile_id.as_deref() == Some(selected_id.as_str()) {
+        if self.sessions.iter().any(|session| {
+            session.profile_id == selected_id && session.connection_state.can_disconnect()
+        }) {
             self.form_error = Some("Disconnect this profile before deleting it".into());
             cx.notify();
             return;
@@ -665,16 +810,14 @@ impl RemCmdApp {
             return;
         };
 
-        if self
-            .session
-            .terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.profile_id == selected_id)
-        {
-            self.session.close_terminal_output();
-            self.session.connection_error = None;
-            self.session.connection_message = None;
-            self.session.terminal_end_reason = None;
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter(|session| session.profile_id == selected_id)
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.remove_session(session_id, cx);
         }
 
         self.profiles.remove(selected_index);
@@ -868,13 +1011,53 @@ impl RemCmdApp {
     }
 
     fn connect_selected_profile(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.session.connection_state.can_connect() || self.credential_lookup_task.is_some() {
-            return;
-        }
-
         let Some(profile) = self.selected_profile().cloned() else {
             return;
         };
+        let session_id = self
+            .selected_session()
+            .map(|session| session.id)
+            .unwrap_or_else(|| self.create_session_for_profile(&profile.id));
+        self.active_session_id = Some(session_id);
+        self.connect_profile_in_session(session_id, profile, cx);
+    }
+
+    fn connect_selected_profile_in_new_session(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.selected_profile().cloned() else {
+            return;
+        };
+        if self.credential_lookup_task.is_some()
+            || self
+                .credential_mutations_in_progress
+                .contains_key(&profile.id)
+        {
+            return;
+        }
+
+        let session_id = self.create_session_for_profile(&profile.id);
+        self.active_panel = ActivePanel::Connection;
+        self.active_session_id = Some(session_id);
+        self.connect_profile_in_session(session_id, profile, cx);
+    }
+
+    fn connect_profile_in_session(
+        &mut self,
+        session_id: SessionId,
+        profile: ConnectionProfile,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .session(session_id)
+            .is_some_and(|session| session.connection_state.can_connect())
+            || self.credential_lookup_task.is_some()
+        {
+            cx.notify();
+            return;
+        }
         if self
             .credential_mutations_in_progress
             .contains_key(&profile.id)
@@ -884,18 +1067,26 @@ impl RemCmdApp {
 
         match &profile.auth {
             AuthConfig::Password => {
-                self.lookup_credential_and_connect(profile, CredentialPromptKind::Password, cx);
+                self.lookup_credential_and_connect(
+                    session_id,
+                    profile,
+                    CredentialPromptKind::Password,
+                    cx,
+                );
             }
             AuthConfig::PrivateKey { path } => {
                 let prompt_kind = CredentialPromptKind::PrivateKeyPassphrase { path: path.clone() };
-                self.lookup_credential_and_connect(profile, prompt_kind, cx);
+                self.lookup_credential_and_connect(session_id, profile, prompt_kind, cx);
             }
-            AuthConfig::Agent => self.start_connection(profile, AuthMethod::Agent, None, cx),
+            AuthConfig::Agent => {
+                self.start_connection(session_id, profile, AuthMethod::Agent, None, cx);
+            }
         }
     }
 
     fn lookup_credential_and_connect(
         &mut self,
+        session_id: SessionId,
         profile: ConnectionProfile,
         prompt_kind: CredentialPromptKind,
         cx: &mut Context<Self>,
@@ -903,8 +1094,11 @@ impl RemCmdApp {
         let profile_id = profile.id.clone();
         let credential_kind = prompt_kind.credential_kind();
         let runtime = cx.global::<SshRuntime>().handle();
-        self.session.connection_error = None;
-        self.session.connection_message = Some("Checking the system keychain".into());
+        if let Some(session) = self.session_mut(session_id) {
+            session.connection_error = None;
+            session.connection_message = Some("Checking the system keychain".into());
+        }
+        self.credential_lookup_session_id = Some(session_id);
 
         self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
             let lookup_profile_id = profile_id.clone();
@@ -914,15 +1108,17 @@ impl RemCmdApp {
 
             let _ = this.update(cx, |this, cx| {
                 this.credential_lookup_task = None;
-                if !this.session.connection_state.can_connect()
-                    || this.selected_profile_id.as_deref() != Some(profile_id.as_str())
-                    || this.selected_profile() != Some(&profile)
+                this.credential_lookup_session_id = None;
+                if !this
+                    .session(session_id)
+                    .is_some_and(|session| session.connection_state.can_connect())
+                    || !this.profiles.iter().any(|candidate| candidate == &profile)
                     || this
                         .credential_mutations_in_progress
                         .contains_key(&profile_id)
                 {
-                    if this.selected_profile_id.as_deref() == Some(profile_id.as_str()) {
-                        this.session.connection_message = None;
+                    if let Some(session) = this.session_mut(session_id) {
+                        session.connection_message = None;
                         cx.notify();
                     }
                     return;
@@ -940,11 +1136,13 @@ impl RemCmdApp {
                         let auth = auth_method_with_secret(prompt_kind, secret);
                         let credential =
                             ConnectionCredential::from_keychain(profile_id, credential_kind);
-                        this.start_connection(profile, auth, Some(credential), cx);
+                        this.start_connection(session_id, profile, auth, Some(credential), cx);
                     }
                     Ok(None) => match prompt_kind {
                         CredentialPromptKind::Password => {
+                            this.activate_session(session_id, cx);
                             this.open_credential_prompt(
+                                session_id,
                                 profile_id,
                                 CredentialPromptKind::Password,
                                 None,
@@ -956,12 +1154,14 @@ impl RemCmdApp {
                                 path,
                                 passphrase: None,
                             };
-                            this.start_connection(profile, auth, None, cx);
+                            this.start_connection(session_id, profile, auth, None, cx);
                         }
                     },
                     Err(error) => match prompt_kind {
                         CredentialPromptKind::Password => {
+                            this.activate_session(session_id, cx);
                             this.open_credential_prompt(
+                                session_id,
                                 profile_id,
                                 CredentialPromptKind::Password,
                                 Some(error),
@@ -973,8 +1173,10 @@ impl RemCmdApp {
                                 path,
                                 passphrase: None,
                             };
-                            this.start_connection(profile, auth, None, cx);
-                            this.session.connection_message = Some(error);
+                            this.start_connection(session_id, profile, auth, None, cx);
+                            if let Some(session) = this.session_mut(session_id) {
+                                session.connection_message = Some(error);
+                            }
                         }
                     },
                 }
@@ -986,39 +1188,47 @@ impl RemCmdApp {
 
     fn start_connection(
         &mut self,
+        session_id: SessionId,
         profile: ConnectionProfile,
         auth: AuthMethod,
         credential: Option<ConnectionCredential>,
         cx: &mut Context<Self>,
     ) {
         self.dismiss_credential_prompt(cx);
-        self.session.host_key_prompt = None;
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.host_key_prompt = None;
         self.credential_lookup_task = None;
+        self.credential_lookup_session_id = None;
 
         let runtime = cx.global::<SshRuntime>().handle();
         let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
         let connection = SshConnection::spawn(&runtime, profile.clone(), auth, pty_size);
         let (handle, mut events) = connection.split();
 
-        self.session.connection_state = SessionState::Connecting;
-        self.session.connection_handle = Some(handle);
-        self.session.connection_profile_id = Some(profile.id.clone());
-        self.session.connection_credential = credential;
-        self.session.connection_error = None;
-        self.session.connection_message = None;
-        self.session.terminal_end_reason = None;
-        self.session.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
-        self.session.terminal_marked_text.clear();
-        self.session.terminal_selection = None;
-        self.session.terminal_selecting = false;
-        self.session.terminal_scroll_accumulator = 0.0;
-        self.session.terminal_resize_task = None;
+        let session = self
+            .session_mut(session_id)
+            .expect("session should exist while starting a connection");
+        session.close_when_disconnected = false;
+        session.connection_state = SessionState::Connecting;
+        session.connection_handle = Some(handle);
+        session.connection_credential = credential;
+        session.connection_error = None;
+        session.connection_message = None;
+        session.terminal_end_reason = None;
+        session.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
+        session.terminal_marked_text.clear();
+        session.terminal_selection = None;
+        session.terminal_selecting = false;
+        session.terminal_scroll_accumulator = 0.0;
+        session.terminal_resize_task = None;
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
                 if this
                     .update(cx, |this, cx| {
-                        this.handle_connection_event(event, cx);
+                        this.handle_connection_event(session_id, event, cx);
                     })
                     .is_err()
                 {
@@ -1048,6 +1258,7 @@ impl RemCmdApp {
         }
 
         let profile_id = prompt.profile_id.clone();
+        let session_id = prompt.session_id;
         let kind = prompt.kind.clone();
         let remember = prompt.remember;
         let input = prompt.input.clone();
@@ -1059,7 +1270,9 @@ impl RemCmdApp {
             .cloned()
         else {
             self.dismiss_credential_prompt(cx);
-            self.session.connection_error = Some("Connection profile no longer exists".into());
+            if let Some(session) = self.session_mut(session_id) {
+                session.connection_error = Some("Connection profile no longer exists".into());
+            }
             cx.notify();
             return;
         };
@@ -1077,7 +1290,7 @@ impl RemCmdApp {
         let credential =
             ConnectionCredential::from_prompt(profile_id, credential_kind, save_on_success);
 
-        self.start_connection(profile, auth, Some(credential), cx);
+        self.start_connection(session_id, profile, auth, Some(credential), cx);
     }
 
     fn on_submit_credential(
@@ -1100,38 +1313,44 @@ impl RemCmdApp {
     }
 
     fn trust_pending_host_key(&mut self, cx: &mut Context<Self>) {
-        let Some(info) = self.session.host_key_prompt.take() else {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        let Some(info) = session.host_key_prompt.take() else {
             return;
         };
 
-        let Some(handle) = self.session.connection_handle.as_ref() else {
-            self.session.connection_error = Some("SSH connection handle is missing".into());
+        let Some(handle) = session.connection_handle.as_ref() else {
+            session.connection_error = Some("SSH connection handle is missing".into());
             cx.notify();
             return;
         };
 
         match handle.trust_host_key() {
             Ok(()) => {
-                self.session.connection_message = Some(format!("Trusting {}", info.address()));
+                session.connection_message = Some(format!("Trusting {}", info.address()));
             }
             Err(error) => {
-                self.session.connection_error = Some(error.to_string());
+                session.connection_error = Some(error.to_string());
             }
         }
         cx.notify();
     }
 
     fn reject_pending_host_key(&mut self, cx: &mut Context<Self>) {
-        if self.session.host_key_prompt.take().is_none() {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        if session.host_key_prompt.take().is_none() {
             return;
         }
 
-        if let Some(handle) = self.session.connection_handle.as_ref()
+        if let Some(handle) = session.connection_handle.as_ref()
             && let Err(error) = handle.reject_host_key()
         {
-            self.session.connection_error = Some(error.to_string());
+            session.connection_error = Some(error.to_string());
         }
-        self.session.connection_message = None;
+        session.connection_message = None;
         cx.notify();
     }
 
@@ -1146,6 +1365,7 @@ impl RemCmdApp {
 
     fn prompt_for_private_key_passphrase(
         &mut self,
+        session_id: SessionId,
         profile_id: String,
         error: String,
         cx: &mut Context<Self>,
@@ -1162,7 +1382,9 @@ impl RemCmdApp {
             return false;
         };
 
+        self.activate_session(session_id, cx);
         self.open_credential_prompt(
+            session_id,
             profile_id,
             CredentialPromptKind::PrivateKeyPassphrase { path },
             Some(error),
@@ -1173,6 +1395,7 @@ impl RemCmdApp {
 
     fn prompt_for_password(
         &mut self,
+        session_id: SessionId,
         profile_id: String,
         error: String,
         cx: &mut Context<Self>,
@@ -1184,20 +1407,31 @@ impl RemCmdApp {
             return false;
         }
 
-        self.open_credential_prompt(profile_id, CredentialPromptKind::Password, Some(error), cx);
+        self.activate_session(session_id, cx);
+        self.open_credential_prompt(
+            session_id,
+            profile_id,
+            CredentialPromptKind::Password,
+            Some(error),
+            cx,
+        );
         true
     }
 
     fn remove_rejected_credential_then_prompt(
         &mut self,
+        session_id: SessionId,
         profile_id: String,
         kind: CredentialKind,
         authentication_error: String,
         cx: &mut Context<Self>,
     ) {
         let runtime = cx.global::<SshRuntime>().handle();
-        self.session.connection_message = Some("Removing the rejected saved credential".into());
+        if let Some(session) = self.session_mut(session_id) {
+            session.connection_message = Some("Removing the rejected saved credential".into());
+        }
 
+        self.credential_lookup_session_id = Some(session_id);
         self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
             let delete_profile_id = profile_id.clone();
             let result = runtime
@@ -1206,7 +1440,8 @@ impl RemCmdApp {
 
             let _ = this.update(cx, |this, cx| {
                 this.credential_lookup_task = None;
-                if this.selected_profile_id.as_deref() != Some(profile_id.as_str()) {
+                this.credential_lookup_session_id = None;
+                if this.session(session_id).is_none() {
                     return;
                 }
 
@@ -1220,10 +1455,10 @@ impl RemCmdApp {
 
                 match kind {
                     CredentialKind::Password => {
-                        this.prompt_for_password(profile_id, error, cx);
+                        this.prompt_for_password(session_id, profile_id, error, cx);
                     }
                     CredentialKind::PrivateKeyPassphrase => {
-                        this.prompt_for_private_key_passphrase(profile_id, error, cx);
+                        this.prompt_for_private_key_passphrase(session_id, profile_id, error, cx);
                     }
                 }
                 cx.notify();
@@ -1231,8 +1466,11 @@ impl RemCmdApp {
         }));
     }
 
-    fn save_successful_credential(&mut self, cx: &mut Context<Self>) {
-        let Some(credential) = self.session.connection_credential.take() else {
+    fn save_successful_credential(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let Some(credential) = self
+            .session_mut(session_id)
+            .and_then(|session| session.connection_credential.take())
+        else {
             return;
         };
         let Some(secret) = credential.save_on_success else {
@@ -1248,15 +1486,17 @@ impl RemCmdApp {
                 .await;
 
             let _ = this.update(cx, |this, cx| {
-                this.session.connection_message = Some(match result {
-                    Ok(Ok(())) => "Credential saved in the system keychain".into(),
-                    Ok(Err(error)) => {
-                        format!("Connected, but the credential could not be saved: {error}")
-                    }
-                    Err(error) => {
-                        format!("Connected, but the system keychain task failed: {error}")
-                    }
-                });
+                if let Some(session) = this.session_mut(session_id) {
+                    session.connection_message = Some(match result {
+                        Ok(Ok(())) => "Credential saved in the system keychain".into(),
+                        Ok(Err(error)) => {
+                            format!("Connected, but the credential could not be saved: {error}")
+                        }
+                        Err(error) => {
+                            format!("Connected, but the system keychain task failed: {error}")
+                        }
+                    });
+                }
                 cx.notify();
             });
         })
@@ -1264,38 +1504,52 @@ impl RemCmdApp {
     }
 
     fn disconnect_active_connection(&mut self, cx: &mut Context<Self>) {
-        if !self.session.connection_state.can_disconnect() {
-            return;
-        }
-
-        self.session.terminal_resize_task = None;
-
-        let Some(handle) = self.session.connection_handle.as_ref() else {
-            self.session.connection_state = SessionState::Failed;
-            self.session.connection_error = Some("SSH connection handle is missing".into());
-            self.session.connection_profile_id = None;
-            cx.notify();
+        let Some(session_id) = self.active_session_id else {
             return;
         };
+        self.disconnect_session(session_id, cx);
+    }
 
-        if let Err(error) = handle.disconnect() {
-            self.session.connection_state = SessionState::Failed;
-            self.session.connection_handle = None;
-            self.session.connection_profile_id = None;
-            self.session.connection_error = Some(error.to_string());
-        } else {
-            // Disable repeated clicks before the worker publishes its event.
-            self.session.connection_state = SessionState::Disconnecting;
-            self.session.terminal_end_reason = Some("Session disconnected".into());
+    fn disconnect_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let should_remove = {
+            let Some(session) = self.session_mut(session_id) else {
+                return;
+            };
+            if !session.connection_state.can_disconnect() {
+                return;
+            }
+
+            session.terminal_resize_task = None;
+
+            if let Some(handle) = session.connection_handle.as_ref() {
+                if let Err(error) = handle.disconnect() {
+                    session.connection_state = SessionState::Failed;
+                    session.connection_handle = None;
+                    session.connection_error = Some(error.to_string());
+                    session.close_when_disconnected
+                } else {
+                    // Disable repeated clicks before the worker publishes its event.
+                    session.connection_state = SessionState::Disconnecting;
+                    session.terminal_end_reason = Some("Session disconnected".into());
+                    false
+                }
+            } else {
+                session.connection_state = SessionState::Failed;
+                session.connection_error = Some("SSH connection handle is missing".into());
+                session.close_when_disconnected
+            }
+        };
+
+        if should_remove {
+            self.remove_session(session_id, cx);
         }
 
         cx.notify();
     }
 
     fn terminal_modes(&self) -> TerminalModes {
-        self.session
-            .terminal
-            .as_ref()
+        self.active_session()
+            .and_then(|session| session.terminal.as_ref())
             .map(ActiveTerminal::modes)
             .unwrap_or(TerminalModes::NONE)
     }
@@ -1309,7 +1563,7 @@ impl RemCmdApp {
     }
 
     fn terminal_point_for_position(&self, position: gpui::Point<Pixels>) -> Option<TerminalPoint> {
-        let terminal = self.session.terminal.as_ref()?;
+        let terminal = self.active_session()?.terminal.as_ref()?;
         let bounds = terminal.viewport_bounds?;
         let local = bounds.localize(&position)?;
         let size = terminal.engine.size();
@@ -1338,15 +1592,18 @@ impl RemCmdApp {
             return;
         };
 
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
         if event.modifiers.shift
-            && let Some(selection) = self.session.terminal_selection.as_mut()
+            && let Some(selection) = session.terminal_selection.as_mut()
         {
             selection.head = point;
         } else {
-            self.session.terminal_selection = Some(TerminalSelection::new(point, point));
+            session.terminal_selection = Some(TerminalSelection::new(point, point));
         }
 
-        self.session.terminal_selecting = true;
+        session.terminal_selecting = true;
         cx.stop_propagation();
         cx.notify();
     }
@@ -1357,14 +1614,21 @@ impl RemCmdApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.session.terminal_selecting || !event.dragging() {
+        if !self
+            .active_session()
+            .is_some_and(|session| session.terminal_selecting)
+            || !event.dragging()
+        {
             return;
         }
 
         let Some(point) = self.terminal_point_for_position(event.position) else {
             return;
         };
-        let Some(selection) = self.session.terminal_selection.as_mut() else {
+        let Some(selection) = self
+            .active_session_mut()
+            .and_then(|session| session.terminal_selection.as_mut())
+        else {
             return;
         };
 
@@ -1376,26 +1640,30 @@ impl RemCmdApp {
     }
 
     fn on_terminal_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.session.terminal_selecting = false;
-        if self
-            .session
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        session.terminal_selecting = false;
+        if session
             .terminal_selection
             .is_some_and(TerminalSelection::is_empty)
         {
-            self.session.terminal_selection = None;
+            session.terminal_selection = None;
             cx.notify();
         }
     }
 
     fn copy_terminal_selection(&self, cx: &mut Context<Self>) -> bool {
-        let Some(selection) = self
-            .session
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        let Some(selection) = session
             .terminal_selection
             .filter(|selection| !selection.is_empty())
         else {
             return false;
         };
-        let Some(terminal) = self.session.terminal.as_ref() else {
+        let Some(terminal) = session.terminal.as_ref() else {
             return false;
         };
 
@@ -1406,8 +1674,11 @@ impl RemCmdApp {
     }
 
     fn clear_terminal_selection(&mut self) -> bool {
-        let had_selection = self.session.terminal_selection.take().is_some();
-        let was_selecting = std::mem::take(&mut self.session.terminal_selecting);
+        let Some(session) = self.active_session_mut() else {
+            return false;
+        };
+        let had_selection = session.terminal_selection.take().is_some();
+        let was_selecting = std::mem::take(&mut session.terminal_selecting);
         had_selection || was_selecting
     }
 
@@ -1450,16 +1721,19 @@ impl RemCmdApp {
     }
 
     fn send_terminal_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
-        if data.is_empty() || self.session.connection_state != SessionState::Connected {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        if data.is_empty() || session.connection_state != SessionState::Connected {
             return;
         }
 
-        let Some(handle) = self.session.connection_handle.as_ref() else {
+        let Some(handle) = session.connection_handle.as_ref() else {
             return;
         };
 
         if let Err(error) = handle.send_input(data) {
-            self.session.connection_error = Some(error.to_string());
+            session.connection_error = Some(error.to_string());
             cx.notify();
         }
     }
@@ -1471,7 +1745,9 @@ impl RemCmdApp {
 
         let selection_cleared = self.clear_terminal_selection();
 
-        if let Some(terminal) = self.session.terminal.as_mut()
+        if let Some(terminal) = self
+            .active_session_mut()
+            .and_then(|session| session.terminal.as_mut())
             && terminal.engine.display_offset() != 0
         {
             terminal.engine.scroll(TerminalScroll::Bottom);
@@ -1487,16 +1763,14 @@ impl RemCmdApp {
 
     fn apply_terminal_layout(
         &mut self,
-        profile_id: &str,
+        session_id: SessionId,
         bounds: Bounds<Pixels>,
         layout: TerminalLayout,
         cx: &mut Context<Self>,
     ) {
         let Some(terminal) = self
-            .session
-            .terminal
-            .as_mut()
-            .filter(|terminal| terminal.profile_id == profile_id)
+            .session_mut(session_id)
+            .and_then(|session| session.terminal.as_mut())
         else {
             return;
         };
@@ -1514,40 +1788,45 @@ impl RemCmdApp {
             return;
         }
 
-        self.schedule_terminal_resize(profile_id.to_owned(), layout.pty_size, cx);
+        self.schedule_terminal_resize(session_id, layout.pty_size, cx);
         cx.notify();
     }
 
     fn schedule_terminal_resize(
         &mut self,
-        profile_id: String,
+        session_id: SessionId,
         size: PtySize,
         cx: &mut Context<Self>,
     ) {
         // Keep local reflow and the remote PTY on the same final size after live resizing settles.
-        self.session.terminal_resize_task = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             Timer::after(TERMINAL_RESIZE_DEBOUNCE).await;
 
             let _ = this.update(cx, |this, cx| {
-                let is_current_size = this.session.terminal.as_ref().is_some_and(|terminal| {
-                    terminal.profile_id == profile_id && terminal.pending_pty_size == Some(size)
-                });
-                if !is_current_size
-                    || this.session.connection_profile_id.as_deref() != Some(profile_id.as_str())
-                {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                let is_current_size = session
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.pending_pty_size == Some(size));
+                if !is_current_size {
                     return;
                 }
 
-                let Some(handle) = this.session.connection_handle.as_ref() else {
+                let Some(handle) = session.connection_handle.as_ref() else {
                     return;
                 };
 
                 if let Err(error) = handle.resize(size) {
-                    this.session.connection_error = Some(error.to_string());
+                    session.connection_error = Some(error.to_string());
                     cx.notify();
                 }
             });
-        }));
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.terminal_resize_task = Some(task);
+        }
     }
 
     fn on_terminal_scroll(
@@ -1557,9 +1836,8 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         let line_height = self
-            .session
-            .terminal
-            .as_ref()
+            .active_session()
+            .and_then(|session| session.terminal.as_ref())
             .map(|terminal| terminal.cell_height)
             .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
         let delta = f32::from(event.delta.pixel_delta(px(line_height)).y);
@@ -1568,22 +1846,24 @@ impl RemCmdApp {
         }
         cx.stop_propagation();
 
-        if self.session.terminal_scroll_accumulator.signum() != delta.signum() {
-            self.session.terminal_scroll_accumulator = 0.0;
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        if session.terminal_scroll_accumulator.signum() != delta.signum() {
+            session.terminal_scroll_accumulator = 0.0;
         }
-        self.session.terminal_scroll_accumulator += delta;
+        session.terminal_scroll_accumulator += delta;
 
-        let lines = (self.session.terminal_scroll_accumulator / line_height).trunc() as i32;
+        let lines = (session.terminal_scroll_accumulator / line_height).trunc() as i32;
         if lines == 0 {
             return;
         }
-        self.session.terminal_scroll_accumulator -= lines as f32 * line_height;
+        session.terminal_scroll_accumulator -= lines as f32 * line_height;
 
         let modes = self.terminal_modes();
         let display_offset = self
-            .session
-            .terminal
-            .as_ref()
+            .active_session()
+            .and_then(|session| session.terminal.as_ref())
             .map(|terminal| terminal.engine.display_offset())
             .unwrap_or_default();
         let alternate_scroll = should_translate_alternate_scroll(modes, display_offset);
@@ -1591,42 +1871,61 @@ impl RemCmdApp {
         if alternate_scroll {
             self.clear_terminal_selection();
             self.send_terminal_input(encode_alternate_scroll(lines, modes), cx);
-        } else if let Some(terminal) = self.session.terminal.as_mut() {
-            self.session.terminal_selection = None;
-            self.session.terminal_selecting = false;
+        } else if let Some(session) = self.active_session_mut() {
+            session.terminal_selection = None;
+            session.terminal_selecting = false;
+            let Some(terminal) = session.terminal.as_mut() else {
+                return;
+            };
             terminal.engine.scroll(TerminalScroll::Lines(lines));
             cx.notify();
         }
     }
 
-    fn process_terminal_output(&mut self, data: &[u8], cx: &mut Context<Self>) {
-        if !data.is_empty()
-            && self
-                .session
-                .terminal
-                .as_ref()
-                .is_some_and(|terminal| terminal.engine.display_offset() == 0)
-        {
-            self.session.terminal_selection = None;
-            self.session.terminal_selecting = false;
-        }
+    fn process_terminal_output(
+        &mut self,
+        session_id: SessionId,
+        data: &[u8],
+        cx: &mut Context<Self>,
+    ) {
+        let events = {
+            let Some(session) = self.session_mut(session_id) else {
+                return;
+            };
+            if !data.is_empty()
+                && session
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.engine.display_offset() == 0)
+            {
+                session.terminal_selection = None;
+                session.terminal_selecting = false;
+            }
 
-        let events = self
-            .session
-            .terminal
-            .as_mut()
-            .map(|terminal| terminal.process(data))
-            .unwrap_or_default();
+            session
+                .terminal
+                .as_mut()
+                .map(|terminal| terminal.process(data))
+                .unwrap_or_default()
+        };
 
         for event in events {
-            self.handle_terminal_event(event, cx);
+            self.handle_terminal_event(session_id, event, cx);
         }
     }
 
-    fn handle_terminal_event(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
+    fn handle_terminal_event(
+        &mut self,
+        session_id: SessionId,
+        event: TerminalEvent,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             TerminalEvent::TitleChanged(title) => {
-                if let Some(terminal) = self.session.terminal.as_mut() {
+                if let Some(terminal) = self
+                    .session_mut(session_id)
+                    .and_then(|session| session.terminal.as_mut())
+                {
                     terminal.title = title;
                 }
             }
@@ -1639,36 +1938,50 @@ impl RemCmdApp {
                     .read_terminal_clipboard(request.clipboard, cx)
                     .and_then(|item| item.text())
                     .unwrap_or_default();
-                self.send_terminal_response(request.response(&contents));
+                self.send_terminal_response(session_id, request.response(&contents));
             }
             TerminalEvent::ColorRequest(request) => {
                 let palette = self.terminal_palette();
-                if let Some(terminal) = self.session.terminal.as_ref() {
-                    let snapshot = terminal.snapshot();
-                    let color = palette_color(&snapshot, request.index, palette).into();
-                    self.send_terminal_response(request.response(color));
+                let color = self
+                    .session(session_id)
+                    .and_then(|session| session.terminal.as_ref())
+                    .map(|terminal| {
+                        palette_color(&terminal.snapshot(), request.index, palette).into()
+                    });
+                if let Some(color) = color {
+                    self.send_terminal_response(session_id, request.response(color));
                 }
             }
-            TerminalEvent::WriteToPty(data) => self.send_terminal_response(data),
+            TerminalEvent::WriteToPty(data) => self.send_terminal_response(session_id, data),
             TerminalEvent::TextAreaSizeRequest(request) => {
-                if let Some(terminal) = self.session.terminal.as_ref() {
-                    self.send_terminal_response(request.response(terminal.text_area_size()));
+                let size = self
+                    .session(session_id)
+                    .and_then(|session| session.terminal.as_ref())
+                    .map(ActiveTerminal::text_area_size);
+                if let Some(size) = size {
+                    self.send_terminal_response(session_id, request.response(size));
                 }
             }
             TerminalEvent::Bell => {
-                self.session.connection_message = Some("Remote terminal bell".into());
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some("Remote terminal bell".into());
+                }
             }
             TerminalEvent::ExitRequested => {
-                self.session.connection_message = Some("Remote terminal requested exit".into());
-                self.session.terminal_end_reason = Some("Remote terminal requested exit".into());
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some("Remote terminal requested exit".into());
+                    session.terminal_end_reason = Some("Remote terminal requested exit".into());
+                }
             }
             TerminalEvent::ChildExited(status) => {
-                self.session.terminal_end_reason = status
-                    .map(|status| format!("Remote terminal exited with status {status}"))
-                    .or_else(|| Some("Remote terminal exited".into()));
-                self.session
-                    .connection_message
-                    .clone_from(&self.session.terminal_end_reason);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.terminal_end_reason = status
+                        .map(|status| format!("Remote terminal exited with status {status}"))
+                        .or_else(|| Some("Remote terminal exited".into()));
+                    session
+                        .connection_message
+                        .clone_from(&session.terminal_end_reason);
+                }
             }
             TerminalEvent::MouseCursorDirty
             | TerminalEvent::CursorBlinkingChanged
@@ -1676,13 +1989,16 @@ impl RemCmdApp {
         }
     }
 
-    fn send_terminal_response(&mut self, data: Vec<u8>) {
-        let Some(handle) = self.session.connection_handle.as_ref() else {
+    fn send_terminal_response(&mut self, session_id: SessionId, data: Vec<u8>) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let Some(handle) = session.connection_handle.as_ref() else {
             return;
         };
 
         if let Err(error) = handle.send_input(data) {
-            self.session.connection_error = Some(error.to_string());
+            session.connection_error = Some(error.to_string());
         }
     }
 
@@ -1725,69 +2041,101 @@ impl RemCmdApp {
         }
     }
 
-    fn handle_connection_event(&mut self, event: ConnectionEvent, cx: &mut Context<Self>) {
+    fn handle_connection_event(
+        &mut self,
+        session_id: SessionId,
+        event: ConnectionEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session(session_id).is_none() {
+            return;
+        }
+
         let should_notify = match event {
             ConnectionEvent::StateChanged(state) => {
-                let previous_state = self.session.connection_state;
-                self.session.connection_state = state;
+                let close_when_disconnected = {
+                    let session = self
+                        .session_mut(session_id)
+                        .expect("checked session should still exist");
+                    let previous_state = session.connection_state;
+                    session.connection_state = state;
 
-                if matches!(
-                    state,
-                    SessionState::Authenticating | SessionState::Connected
-                ) {
-                    self.session.host_key_prompt = None;
-                    self.session.connection_message = None;
-                }
+                    if matches!(
+                        state,
+                        SessionState::Authenticating | SessionState::Connected
+                    ) {
+                        session.host_key_prompt = None;
+                        session.connection_message = None;
+                    }
 
-                if state == SessionState::Connected
-                    && let Some(terminal) = self.session.terminal.as_mut()
-                {
-                    terminal.was_connected = true;
-                }
+                    if state == SessionState::Connected
+                        && let Some(terminal) = session.terminal.as_mut()
+                    {
+                        terminal.was_connected = true;
+                    }
+
+                    if state == SessionState::Disconnected {
+                        session.host_key_prompt = None;
+                        session.terminal_resize_task = None;
+                        session.connection_handle = None;
+                        session.connection_credential = None;
+                        if previous_state == SessionState::Disconnecting
+                            && session.terminal_end_reason.is_none()
+                        {
+                            session.terminal_end_reason = Some("Session disconnected".into());
+                        }
+                    }
+
+                    state == SessionState::Disconnected && session.close_when_disconnected
+                };
 
                 if state == SessionState::Connected {
-                    self.save_successful_credential(cx);
-                }
-
-                if state == SessionState::Disconnected {
-                    self.session.host_key_prompt = None;
-                    self.session.terminal_resize_task = None;
-                    self.session.connection_handle = None;
-                    self.session.connection_profile_id = None;
-                    self.session.connection_credential = None;
-                    if previous_state == SessionState::Disconnecting
-                        && self.session.terminal_end_reason.is_none()
-                    {
-                        self.session.terminal_end_reason = Some("Session disconnected".into());
-                    }
+                    self.save_successful_credential(session_id, cx);
+                } else if close_when_disconnected {
+                    self.remove_session(session_id, cx);
                 }
 
                 true
             }
             ConnectionEvent::HostKeyVerificationRequired(info) => {
-                self.session.connection_message =
-                    Some(format!("Verify host key for {}", info.address()));
-                self.session.host_key_prompt = Some(info);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message =
+                        Some(format!("Verify host key for {}", info.address()));
+                    session.host_key_prompt = Some(info);
+                }
+                self.activate_session(session_id, cx);
                 true
             }
             ConnectionEvent::Failed(error) => {
-                let failed_profile_id = self.session.connection_profile_id.take();
-                let failed_credential = self.session.connection_credential.take();
-                self.session.connection_state = SessionState::Failed;
-                self.session.terminal_resize_task = None;
-                self.session.connection_handle = None;
-                self.session.host_key_prompt = None;
+                let (failed_profile_id, failed_credential, close_when_disconnected) = {
+                    let session = self
+                        .session_mut(session_id)
+                        .expect("checked session should still exist");
+                    let profile_id = session.profile_id.clone();
+                    let credential = session.connection_credential.take();
+                    session.connection_state = SessionState::Failed;
+                    session.terminal_resize_task = None;
+                    session.connection_handle = None;
+                    session.host_key_prompt = None;
+                    (profile_id, credential, session.close_when_disconnected)
+                };
+
+                if close_when_disconnected {
+                    self.remove_session(session_id, cx);
+                    return;
+                }
 
                 let authentication_error = error.to_string();
                 let prompted_for_credential =
                     match (failed_profile_id, failed_credential, error.kind()) {
                         (
-                            Some(profile_id),
+                            profile_id,
                             Some(credential),
                             SshErrorKind::Authentication | SshErrorKind::PrivateKeyPassphrase,
                         ) if credential.profile_id == profile_id => {
                             if credential.source == CredentialSource::SystemKeychain {
                                 self.remove_rejected_credential_then_prompt(
+                                    session_id,
                                     profile_id,
                                     credential.kind,
                                     authentication_error,
@@ -1797,12 +2145,14 @@ impl RemCmdApp {
                             } else {
                                 match credential.kind {
                                     CredentialKind::Password => self.prompt_for_password(
+                                        session_id,
                                         profile_id,
                                         authentication_error,
                                         cx,
                                     ),
                                     CredentialKind::PrivateKeyPassphrase => self
                                         .prompt_for_private_key_passphrase(
+                                            session_id,
                                             profile_id,
                                             authentication_error,
                                             cx,
@@ -1810,8 +2160,9 @@ impl RemCmdApp {
                                 }
                             }
                         }
-                        (Some(profile_id), None, SshErrorKind::PrivateKeyPassphrase) => self
+                        (profile_id, None, SshErrorKind::PrivateKeyPassphrase) => self
                             .prompt_for_private_key_passphrase(
+                                session_id,
                                 profile_id,
                                 authentication_error,
                                 cx,
@@ -1819,37 +2170,34 @@ impl RemCmdApp {
                         _ => false,
                     };
 
-                if !prompted_for_credential {
-                    self.session.connection_error = Some(error.to_string());
+                if !prompted_for_credential && let Some(session) = self.session_mut(session_id) {
+                    session.connection_error = Some(error.to_string());
                 }
                 true
             }
             ConnectionEvent::Resized(size) => {
                 let dimensions_changed = self
-                    .session
-                    .terminal
-                    .as_mut()
-                    .filter(|terminal| {
-                        self.session.connection_profile_id.as_deref()
-                            == Some(terminal.profile_id.as_str())
-                    })
+                    .session_mut(session_id)
+                    .and_then(|session| session.terminal.as_mut())
                     .is_some_and(|terminal| terminal.acknowledge_resize(size));
-                if dimensions_changed {
-                    self.session.terminal_selection = None;
-                    self.session.terminal_selecting = false;
+                if dimensions_changed && let Some(session) = self.session_mut(session_id) {
+                    session.terminal_selection = None;
+                    session.terminal_selecting = false;
                 }
                 true
             }
             ConnectionEvent::Shell(
                 ShellEvent::Output(data) | ShellEvent::ExtendedOutput { data, .. },
             ) => {
-                self.process_terminal_output(&data, cx);
+                self.process_terminal_output(session_id, &data, cx);
                 true
             }
             ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
                 let message = format!("Remote shell exited with status {status}");
-                self.session.connection_message = Some(message.clone());
-                self.session.terminal_end_reason = Some(message);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some(message.clone());
+                    session.terminal_end_reason = Some(message);
+                }
                 true
             }
             ConnectionEvent::Shell(ShellEvent::ExitSignal {
@@ -1860,21 +2208,27 @@ impl RemCmdApp {
                 let core_dump = if core_dumped { " (core dumped)" } else { "" };
                 let message =
                     format!("Remote shell exited on signal {signal}{core_dump}: {message}");
-                self.session.connection_message = Some(message.clone());
-                self.session.terminal_end_reason = Some(message);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some(message.clone());
+                    session.terminal_end_reason = Some(message);
+                }
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Eof) => {
-                self.session.connection_message = Some("Remote shell reached EOF".into());
-                if self.session.terminal_end_reason.is_none() {
-                    self.session.terminal_end_reason = Some("Remote shell reached EOF".into());
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some("Remote shell reached EOF".into());
+                    if session.terminal_end_reason.is_none() {
+                        session.terminal_end_reason = Some("Remote shell reached EOF".into());
+                    }
                 }
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Closed) => {
-                self.session.connection_message = Some("Remote shell closed".into());
-                if self.session.terminal_end_reason.is_none() {
-                    self.session.terminal_end_reason = Some("Remote shell closed".into());
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some("Remote shell closed".into());
+                    if session.terminal_end_reason.is_none() {
+                        session.terminal_end_reason = Some("Remote shell closed".into());
+                    }
                 }
                 true
             }
@@ -1903,7 +2257,10 @@ impl Render for RemCmdApp {
             .child(self.render_sidebar(cx))
             .child(self.render_detail_panel(selected_profile, cx));
 
-        if self.session.host_key_prompt.is_some() {
+        if self
+            .active_session()
+            .is_some_and(|session| session.host_key_prompt.is_some())
+        {
             root = root.child(self.render_host_key_prompt(cx));
         } else if let Some(prompt) = self.credential_prompt.as_ref() {
             let focus_handle = prompt.input.focus_handle(cx);
@@ -1922,44 +2279,60 @@ impl Render for RemCmdApp {
 
 impl RemCmdApp {
     fn is_terminal_visible(&self, profile_id: &str) -> bool {
-        self.session.is_terminal_visible(profile_id)
+        self.active_session()
+            .filter(|session| session.profile_id == profile_id)
+            .is_some_and(TerminalSession::is_terminal_visible)
     }
 
     fn terminal_has_ended(&self, profile_id: &str) -> bool {
-        self.session.terminal_has_ended(profile_id)
+        self.active_session()
+            .filter(|session| session.profile_id == profile_id)
+            .is_some_and(TerminalSession::terminal_has_ended)
     }
 
     fn close_terminal(&mut self, cx: &mut Context<Self>) {
-        if self.session.connection_state.can_disconnect() {
+        let Some(session_id) = self.active_session_id else {
             return;
-        }
+        };
+        self.close_session(session_id, cx);
+    }
 
-        self.session.close_terminal_output();
+    fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let Some(can_disconnect) = self
+            .session(session_id)
+            .map(|session| session.connection_state.can_disconnect())
+        else {
+            return;
+        };
+
+        if can_disconnect {
+            if let Some(session) = self.session_mut(session_id) {
+                session.close_when_disconnected = true;
+            }
+            self.disconnect_session(session_id, cx);
+        } else {
+            self.remove_session(session_id, cx);
+        }
         cx.notify();
     }
 
     fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.terminal_palette();
+        let session_id = self.active_session_id.unwrap_or(SessionId(0));
         let cell_height = self
-            .session
-            .terminal
-            .as_ref()
+            .active_session()
+            .and_then(|session| session.terminal.as_ref())
             .map(|terminal| terminal.cell_height)
             .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
-        let model = self.session.terminal.as_ref().map(|terminal| {
-            TerminalViewModel::from_snapshot_with_selection(
-                &terminal.snapshot(),
-                self.session.terminal_selection,
-                palette,
-            )
+        let model = self.active_session().and_then(|session| {
+            session.terminal.as_ref().map(|terminal| {
+                TerminalViewModel::from_snapshot_with_selection(
+                    &terminal.snapshot(),
+                    session.terminal_selection,
+                    palette,
+                )
+            })
         });
-
-        let profile_id = self
-            .session
-            .terminal
-            .as_ref()
-            .map(|terminal| terminal.profile_id.clone())
-            .unwrap_or_default();
         let input_entity = cx.entity();
         let layout_entity = input_entity.clone();
         let input_focus_handle = self.terminal_focus_handle.clone();
@@ -1989,7 +2362,7 @@ impl RemCmdApp {
 
                 cx.defer(move |cx| {
                     layout_entity.update(cx, |this, cx| {
-                        this.apply_terminal_layout(&profile_id, bounds, layout, cx);
+                        this.apply_terminal_layout(session_id, bounds, layout, cx);
                     });
                 });
             },
@@ -2035,13 +2408,17 @@ impl RemCmdApp {
     }
 
     fn render_terminal_lifecycle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (message, color) = if let Some(error) = self.session.connection_error.as_ref() {
-            (error.clone(), self.theme.error_text)
-        } else if let Some(message) = self.session.terminal_end_reason.as_ref() {
-            (message.clone(), self.theme.text_muted)
-        } else {
-            ("Session ended".into(), self.theme.text_muted)
-        };
+        let session = self.active_session();
+        let (message, color) =
+            if let Some(error) = session.and_then(|session| session.connection_error.as_ref()) {
+                (error.clone(), self.theme.error_text)
+            } else if let Some(message) =
+                session.and_then(|session| session.terminal_end_reason.as_ref())
+            {
+                (message.clone(), self.theme.text_muted)
+            } else {
+                ("Session ended".into(), self.theme.text_muted)
+            };
 
         div()
             .flex()
@@ -2269,7 +2646,8 @@ impl RemCmdApp {
 
     fn render_host_key_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let info = self
-            .session
+            .active_session()
+            .expect("host-key prompt requires an active session")
             .host_key_prompt
             .as_ref()
             .expect("host-key prompt should exist before rendering");
@@ -2531,7 +2909,9 @@ impl RemCmdApp {
             return self.render_settings(cx);
         }
 
-        let mut panel = self.detail_panel_shell();
+        let mut panel = self
+            .detail_panel_shell()
+            .child(self.render_session_tabs(cx));
 
         match selected_profile {
             Some(profile) => {
@@ -2617,22 +2997,30 @@ impl RemCmdApp {
                                     .child(error.clone()),
                             )
                         })
-                        .when_some(self.session.connection_error.as_ref(), |this, error| {
-                            this.child(
-                                div()
-                                    .mt_3()
-                                    .text_color(self.theme.error_text)
-                                    .child(error.clone()),
-                            )
-                        })
-                        .when_some(self.session.connection_message.as_ref(), |this, message| {
-                            this.child(
-                                div()
-                                    .mt_3()
-                                    .text_color(self.theme.text_muted)
-                                    .child(message.clone()),
-                            )
-                        })
+                        .when_some(
+                            self.selected_session()
+                                .and_then(|session| session.connection_error.as_ref()),
+                            |this, error| {
+                                this.child(
+                                    div()
+                                        .mt_3()
+                                        .text_color(self.theme.error_text)
+                                        .child(error.clone()),
+                                )
+                            },
+                        )
+                        .when_some(
+                            self.selected_session()
+                                .and_then(|session| session.connection_message.as_ref()),
+                            |this, message| {
+                                this.child(
+                                    div()
+                                        .mt_3()
+                                        .text_color(self.theme.text_muted)
+                                        .child(message.clone()),
+                                )
+                            },
+                        )
                         .child(
                             div()
                                 .flex()
@@ -2687,6 +3075,151 @@ impl RemCmdApp {
         }
 
         panel
+    }
+
+    fn render_session_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sessions.is_empty() {
+            return div().id("session_tabs_empty");
+        }
+
+        let mut tabs = div()
+            .id("session_tabs")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(36.0))
+            .mb_3()
+            .pb_1()
+            .overflow_x_scroll()
+            .border_b_1()
+            .border_color(self.theme.border);
+
+        for (session_index, session) in self.sessions.iter().enumerate() {
+            let session_id = session.id;
+            let is_active = self.active_panel == ActivePanel::Connection
+                && self.active_session_id == Some(session_id);
+            let background = if is_active {
+                self.theme.list_selected_bg
+            } else {
+                self.theme.transparent
+            };
+            let hover_background = if is_active {
+                self.theme.list_selected_hover_bg
+            } else {
+                self.theme.list_hover_bg
+            };
+            let close_hover = self.theme.control_hover_bg;
+            let status_color = match session.connection_state {
+                SessionState::Connected => self.theme.status_ok,
+                SessionState::Failed => self.theme.error_text,
+                SessionState::Connecting
+                | SessionState::Authenticating
+                | SessionState::Disconnecting => self.theme.status_warn,
+                SessionState::Disconnected => self.theme.text_faint,
+            };
+            let mut label = self
+                .profiles
+                .iter()
+                .find(|profile| profile.id == session.profile_id)
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| session.profile_id.clone());
+            let duplicate_count = self
+                .sessions
+                .iter()
+                .filter(|candidate| candidate.profile_id == session.profile_id)
+                .count();
+            if duplicate_count > 1 {
+                let duplicate_index = self.sessions[..=session_index]
+                    .iter()
+                    .filter(|candidate| candidate.profile_id == session.profile_id)
+                    .count();
+                label = format!("{label} #{duplicate_index}");
+            }
+
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("session-tab-{}", session_id.0)))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.0))
+                    .min_w(px(120.0))
+                    .max_w(px(220.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(background)
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover_background))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(status_color),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "close-session-tab-{}",
+                                session_id.0
+                            )))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(20.0))
+                            .rounded_sm()
+                            .text_color(self.theme.text_muted)
+                            .hover(move |this| this.bg(close_hover))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_session(session_id, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.activate_session(session_id, cx) {
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let can_create_session = self.active_panel == ActivePanel::Connection
+            && self.selected_profile_id.is_some()
+            && self.credential_lookup_task.is_none()
+            && self
+                .selected_profile_id
+                .as_deref()
+                .is_none_or(|profile_id| {
+                    !self
+                        .credential_mutations_in_progress
+                        .contains_key(profile_id)
+                });
+        tabs = tabs.child(
+            button(
+                "new_session_tab",
+                "+",
+                ButtonVariant::Ghost,
+                can_create_session,
+                &self.theme,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.connect_selected_profile_in_new_session(window, cx);
+            })),
+        );
+
+        tabs
     }
 
     fn detail_panel_shell(&self) -> gpui::Div {
@@ -2761,6 +3294,7 @@ impl RemCmdApp {
             });
 
         self.detail_panel_shell()
+            .child(self.render_session_tabs(cx))
             .child(
                 div()
                     .flex_none()
@@ -2825,7 +3359,14 @@ impl RemCmdApp {
     }
 
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let checking_keychain = self.credential_lookup_task.is_some();
+        let session = self.selected_session();
+        let state = session
+            .map(|session| session.connection_state)
+            .unwrap_or(SessionState::Disconnected);
+        let checking_keychain = session.is_some_and(|session| {
+            self.credential_lookup_task.is_some()
+                && self.credential_lookup_session_id == Some(session.id)
+        });
         let updating_keychain = self
             .selected_profile_id
             .as_deref()
@@ -2833,11 +3374,10 @@ impl RemCmdApp {
                 self.credential_mutations_in_progress
                     .contains_key(profile_id)
             });
-        let can_connect =
-            self.session.connection_state.can_connect() && !checking_keychain && !updating_keychain;
-        let can_disconnect = self.session.connection_state.can_disconnect();
+        let can_connect = state.can_connect() && !checking_keychain && !updating_keychain;
+        let can_disconnect = state.can_disconnect();
 
-        let label = match self.session.connection_state {
+        let label = match state {
             _ if checking_keychain => "Checking",
             _ if updating_keychain => "Updating",
             SessionState::Failed => "Retry",
@@ -2859,7 +3399,7 @@ impl RemCmdApp {
             ButtonVariant::Primary
         };
 
-        let status_color = match self.session.connection_state {
+        let status_color = match state {
             _ if checking_keychain || updating_keychain => self.theme.status_warn,
             SessionState::Connected => self.theme.status_ok,
             SessionState::Failed => self.theme.error_text,
@@ -2907,7 +3447,11 @@ impl RemCmdApp {
     }
 
     fn connection_status_text(&self) -> String {
-        if self.credential_lookup_task.is_some() {
+        let session = self.selected_session();
+        if session.is_some_and(|session| {
+            self.credential_lookup_task.is_some()
+                && self.credential_lookup_session_id == Some(session.id)
+        }) {
             return "Checking system keychain".into();
         }
         if self
@@ -2921,7 +3465,10 @@ impl RemCmdApp {
             return "Updating system keychain".into();
         }
 
-        let state = match self.session.connection_state {
+        let state = match session
+            .map(|session| session.connection_state)
+            .unwrap_or(SessionState::Disconnected)
+        {
             SessionState::Disconnected => "Disconnected",
             SessionState::Connecting => "Connecting",
             SessionState::Authenticating => "Authenticating",
@@ -2930,7 +3477,7 @@ impl RemCmdApp {
             SessionState::Failed => "Failed",
         };
 
-        let Some(profile_id) = self.session.connection_profile_id.as_deref() else {
+        let Some(profile_id) = session.map(|session| session.profile_id.as_str()) else {
             return state.into();
         };
 
@@ -3145,20 +3692,17 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let utf16_len = self.session.terminal_marked_text.encode_utf16().count();
+        let marked_text = &self.active_session()?.terminal_marked_text;
+        let utf16_len = marked_text.encode_utf16().count();
         let start_utf16 = range_utf16.start.min(utf16_len);
         let end_utf16 = range_utf16.end.clamp(start_utf16, utf16_len);
-        let start = utf16_offset_to_utf8(&self.session.terminal_marked_text, start_utf16);
-        let end = utf16_offset_to_utf8(&self.session.terminal_marked_text, end_utf16);
-        let adjusted_start = self.session.terminal_marked_text[..start]
-            .encode_utf16()
-            .count();
-        let adjusted_end = self.session.terminal_marked_text[..end]
-            .encode_utf16()
-            .count();
+        let start = utf16_offset_to_utf8(marked_text, start_utf16);
+        let end = utf16_offset_to_utf8(marked_text, end_utf16);
+        let adjusted_start = marked_text[..start].encode_utf16().count();
+        let adjusted_end = marked_text[..end].encode_utf16().count();
 
         adjusted_range.replace(adjusted_start..adjusted_end);
-        Some(self.session.terminal_marked_text[start..end].to_owned())
+        Some(marked_text[start..end].to_owned())
     }
 
     fn selected_text_range(
@@ -3167,7 +3711,10 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let cursor = self.session.terminal_marked_text.encode_utf16().count();
+        let cursor = self
+            .active_session()
+            .map(|session| session.terminal_marked_text.encode_utf16().count())
+            .unwrap_or_default();
         Some(UTF16Selection {
             range: cursor..cursor,
             reversed: false,
@@ -3175,12 +3722,18 @@ impl EntityInputHandler for RemCmdApp {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        let len = self.session.terminal_marked_text.encode_utf16().count();
+        let len = self
+            .active_session()
+            .map(|session| session.terminal_marked_text.encode_utf16().count())
+            .unwrap_or_default();
         (len != 0).then_some(0..len)
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let text = std::mem::take(&mut self.session.terminal_marked_text);
+        let text = self
+            .active_session_mut()
+            .map(|session| std::mem::take(&mut session.terminal_marked_text))
+            .unwrap_or_default();
         self.send_terminal_user_input(text.into_bytes(), cx);
     }
 
@@ -3191,7 +3744,9 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.session.terminal_marked_text.clear();
+        if let Some(session) = self.active_session_mut() {
+            session.terminal_marked_text.clear();
+        }
         self.send_terminal_user_input(new_text.as_bytes().to_vec(), cx);
     }
 
@@ -3203,7 +3758,9 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        new_text.clone_into(&mut self.session.terminal_marked_text);
+        if let Some(session) = self.active_session_mut() {
+            new_text.clone_into(&mut session.terminal_marked_text);
+        }
         cx.notify();
     }
 
@@ -3214,7 +3771,7 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let terminal = self.session.terminal.as_ref()?;
+        let terminal = self.active_session()?.terminal.as_ref()?;
         let cursor = terminal.snapshot().cursor;
         let (row, column) = cursor
             .map(|cursor| (cursor.row, cursor.column))
@@ -3235,7 +3792,11 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.session.terminal_marked_text.encode_utf16().count())
+        Some(
+            self.active_session()
+                .map(|session| session.terminal_marked_text.encode_utf16().count())
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -3518,9 +4079,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_session_keeps_ended_output_until_the_tab_is_closed() {
+    fn terminal_session_keeps_ended_output_available_for_its_tab() {
         let profile_id = "server-1";
-        let mut session = TerminalSession::default();
+        let mut session = TerminalSession::new(SessionId(1), profile_id.into());
         let mut terminal = ActiveTerminal::new(profile_id.into(), PtySize::new(80, 24));
         terminal.was_connected = true;
         session.terminal = Some(terminal);
@@ -3532,17 +4093,33 @@ mod tests {
         session.terminal_selecting = true;
         session.terminal_scroll_accumulator = 12.0;
 
-        assert!(session.is_terminal_visible(profile_id));
-        assert!(session.terminal_has_ended(profile_id));
+        assert!(session.is_terminal_visible());
+        assert!(session.terminal_has_ended());
+        assert_eq!(session.profile_id, profile_id);
+        assert_eq!(session.id, SessionId(1));
+    }
 
-        session.close_terminal_output();
+    #[test]
+    fn same_profile_terminal_sessions_keep_independent_screen_state() {
+        let mut first = TerminalSession::new(SessionId(1), "server-1".into());
+        let mut second = TerminalSession::new(SessionId(2), "server-1".into());
+        first.terminal = Some(ActiveTerminal::new(
+            first.profile_id.clone(),
+            PtySize::new(80, 24),
+        ));
+        second.terminal = Some(ActiveTerminal::new(
+            second.profile_id.clone(),
+            PtySize::new(80, 24),
+        ));
 
-        assert!(!session.is_terminal_visible(profile_id));
-        assert!(session.terminal.is_none());
-        assert!(session.terminal_marked_text.is_empty());
-        assert!(session.terminal_selection.is_none());
-        assert!(!session.terminal_selecting);
-        assert_eq!(session.terminal_scroll_accumulator, 0.0);
+        first.terminal.as_mut().unwrap().process(b"first session");
+        second.terminal.as_mut().unwrap().process(b"second session");
+
+        let first_snapshot = first.terminal.as_ref().unwrap().snapshot();
+        let second_snapshot = second.terminal.as_ref().unwrap().snapshot();
+        assert_ne!(first_snapshot, second_snapshot);
+        assert_eq!(first.id, SessionId(1));
+        assert_eq!(second.id, SessionId(2));
     }
 
     #[test]
