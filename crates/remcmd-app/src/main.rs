@@ -1,6 +1,9 @@
 mod text_field;
 use text_field::{TextField, bind_text_field_keys};
 
+mod pane_layout;
+use pane_layout::{PaneId, PaneLayout, SplitAxis};
+
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
@@ -25,12 +28,12 @@ mod private_key_picker;
 use std::{collections::HashMap, ops::Range, path::PathBuf, time::Duration};
 
 use gpui::{
-    App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions,
-    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div,
-    point, prelude::*, px, rgb, size,
+    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Subscription, Task, Timer,
+    TitlebarOptions, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
 };
 use secrecy::SecretString;
 
@@ -79,7 +82,10 @@ struct RemCmdApp {
     sessions: Vec<TerminalSession>,
     active_session_id: Option<SessionId>,
     next_session_id: u64,
-    terminal_focus_handle: FocusHandle,
+    panes: Vec<TerminalPane>,
+    pane_layout: Option<PaneLayout>,
+    active_pane_id: Option<PaneId>,
+    next_pane_id: u64,
     credential_lookup_task: Option<Task<()>>,
     credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
@@ -93,6 +99,13 @@ struct RemCmdApp {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SessionId(u64);
+
+struct TerminalPane {
+    id: PaneId,
+    session_id: SessionId,
+    focus_handle: FocusHandle,
+    focused: bool,
+}
 
 struct TerminalSession {
     id: SessionId,
@@ -395,7 +408,6 @@ impl RemCmdApp {
             this.refresh_system_theme(window, cx);
         });
 
-        let terminal_focus_handle = cx.focus_handle();
         let mut app = Self {
             profiles,
             profiles_path,
@@ -407,7 +419,10 @@ impl RemCmdApp {
             sessions: Vec::new(),
             active_session_id: None,
             next_session_id: 1,
-            terminal_focus_handle: terminal_focus_handle.clone(),
+            panes: Vec::new(),
+            pane_layout: None,
+            active_pane_id: None,
+            next_pane_id: 1,
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
@@ -418,15 +433,6 @@ impl RemCmdApp {
             settings_error,
             _appearance_subscription: appearance_subscription,
         };
-
-        cx.on_focus(&terminal_focus_handle, window, |this, _, cx| {
-            this.report_terminal_focus(true, cx);
-        })
-        .detach();
-        cx.on_blur(&terminal_focus_handle, window, |this, _, cx| {
-            this.report_terminal_focus(false, cx);
-        })
-        .detach();
 
         app.load_editor_for_selected_profile(cx);
         app
@@ -490,6 +496,150 @@ impl RemCmdApp {
         session_id
     }
 
+    fn pane(&self, pane_id: PaneId) -> Option<&TerminalPane> {
+        self.panes.iter().find(|pane| pane.id == pane_id)
+    }
+
+    fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut TerminalPane> {
+        self.panes.iter_mut().find(|pane| pane.id == pane_id)
+    }
+
+    fn pane_for_session(&self, session_id: SessionId) -> Option<&TerminalPane> {
+        self.panes.iter().find(|pane| pane.session_id == session_id)
+    }
+
+    fn active_pane(&self) -> Option<&TerminalPane> {
+        self.active_pane_id.and_then(|pane_id| self.pane(pane_id))
+    }
+
+    fn create_terminal_pane(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneId {
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        let focus_handle = cx.focus_handle();
+
+        cx.on_focus(&focus_handle, window, move |this, _, cx| {
+            this.handle_pane_focus(pane_id, true, cx);
+        })
+        .detach();
+        cx.on_blur(&focus_handle, window, move |this, _, cx| {
+            this.handle_pane_focus(pane_id, false, cx);
+        })
+        .detach();
+
+        self.panes.push(TerminalPane {
+            id: pane_id,
+            session_id,
+            focus_handle,
+            focused: false,
+        });
+        pane_id
+    }
+
+    fn set_pane_session(&mut self, pane_id: PaneId, session_id: SessionId) -> bool {
+        let Some((previous_session_id, focused)) = self
+            .pane(pane_id)
+            .map(|pane| (pane.session_id, pane.focused))
+        else {
+            return false;
+        };
+        if previous_session_id == session_id {
+            return true;
+        }
+
+        if focused {
+            let previous_modes = self
+                .session(previous_session_id)
+                .and_then(|session| session.terminal.as_ref())
+                .map(ActiveTerminal::modes)
+                .unwrap_or(TerminalModes::NONE);
+            if let Some(bytes) = encode_focus(false, previous_modes) {
+                self.send_terminal_response(previous_session_id, bytes);
+            }
+        }
+
+        self.pane_mut(pane_id)
+            .expect("pane should remain present while replacing its session")
+            .session_id = session_id;
+
+        if focused {
+            let next_modes = self
+                .session(session_id)
+                .and_then(|session| session.terminal.as_ref())
+                .map(ActiveTerminal::modes)
+                .unwrap_or(TerminalModes::NONE);
+            if let Some(bytes) = encode_focus(true, next_modes) {
+                self.send_terminal_response(session_id, bytes);
+            }
+        }
+        true
+    }
+
+    fn set_active_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> bool {
+        let Some((session_id, profile_id)) = self.pane(pane_id).and_then(|pane| {
+            self.session(pane.session_id)
+                .map(|session| (session.id, session.profile_id.clone()))
+        }) else {
+            return false;
+        };
+
+        let profile_changed = self.selected_profile_id.as_deref() != Some(profile_id.as_str());
+        self.active_pane_id = Some(pane_id);
+        self.active_session_id = Some(session_id);
+        self.active_panel = ActivePanel::Connection;
+        self.selected_profile_id = Some(profile_id);
+        if profile_changed {
+            self.load_editor_for_selected_profile(cx);
+        }
+        true
+    }
+
+    fn handle_pane_focus(&mut self, pane_id: PaneId, focused: bool, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        pane.focused = focused;
+        let session_id = pane.session_id;
+        if focused {
+            self.set_active_pane(pane_id, cx);
+        }
+
+        let modes = self
+            .session(session_id)
+            .and_then(|session| session.terminal.as_ref())
+            .map(ActiveTerminal::modes)
+            .unwrap_or(TerminalModes::NONE);
+        if let Some(bytes) = encode_focus(focused, modes) {
+            self.send_terminal_response(session_id, bytes);
+        }
+        cx.notify();
+    }
+
+    fn activate_session_in_window(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.panes.is_empty() {
+            let pane_id = self.create_terminal_pane(session_id, window, cx);
+            self.pane_layout = Some(PaneLayout::Pane(pane_id));
+            self.active_pane_id = Some(pane_id);
+        }
+        if !self.activate_session(session_id, cx) {
+            return false;
+        }
+
+        if let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone()) {
+            focus_handle.focus(window);
+        }
+        true
+    }
+
     fn activate_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
         let Some(profile_id) = self
             .session(session_id)
@@ -499,10 +649,60 @@ impl RemCmdApp {
         };
 
         self.dismiss_credential_prompt(cx);
+        let pane_id = self
+            .pane_for_session(session_id)
+            .map(|pane| pane.id)
+            .or(self.active_pane_id)
+            .or_else(|| self.pane_layout.as_ref().map(PaneLayout::first_pane));
+        if let Some(pane_id) = pane_id {
+            self.set_pane_session(pane_id, session_id);
+            self.active_pane_id = Some(pane_id);
+        }
         self.active_panel = ActivePanel::Connection;
         self.active_session_id = Some(session_id);
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
+        true
+    }
+
+    fn remove_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) else {
+            return false;
+        };
+        let Some(layout) = self.pane_layout.take() else {
+            return false;
+        };
+        let (next_layout, removed) = layout.without(pane_id);
+        if !removed {
+            self.pane_layout = next_layout;
+            return false;
+        }
+
+        let (session_id, focused) = {
+            let pane = &self.panes[index];
+            (pane.session_id, pane.focused)
+        };
+        if focused {
+            let modes = self
+                .session(session_id)
+                .and_then(|session| session.terminal.as_ref())
+                .map(ActiveTerminal::modes)
+                .unwrap_or(TerminalModes::NONE);
+            if let Some(bytes) = encode_focus(false, modes) {
+                self.send_terminal_response(session_id, bytes);
+            }
+        }
+        self.panes.remove(index);
+        self.pane_layout = next_layout;
+
+        if self.active_pane_id == Some(pane_id) {
+            self.active_pane_id = self.pane_layout.as_ref().map(PaneLayout::first_pane);
+            if let Some(replacement_pane) = self.active_pane_id {
+                self.set_active_pane(replacement_pane, cx);
+            } else {
+                self.active_session_id = None;
+            }
+        }
         true
     }
 
@@ -516,6 +716,21 @@ impl RemCmdApp {
         };
         let was_active = self.active_session_id == Some(session_id);
         let removed_profile_id = self.sessions[index].profile_id.clone();
+        let replacement = index
+            .checked_sub(1)
+            .and_then(|index| self.sessions.get(index))
+            .or_else(|| self.sessions.get(index + 1))
+            .map(|session| (session.id, session.profile_id.clone()));
+
+        if let Some(pane_id) = self.pane_for_session(session_id).map(|pane| pane.id) {
+            if self.panes.len() == 1
+                && let Some((replacement_id, _)) = replacement.as_ref()
+            {
+                self.set_pane_session(pane_id, *replacement_id);
+            } else {
+                self.remove_pane(pane_id, cx);
+            }
+        }
         self.sessions.remove(index);
 
         if self.credential_lookup_session_id == Some(session_id) {
@@ -531,11 +746,11 @@ impl RemCmdApp {
         }
 
         if was_active {
-            let replacement = index
-                .checked_sub(1)
-                .and_then(|index| self.sessions.get(index))
-                .or_else(|| self.sessions.get(index))
-                .map(|session| (session.id, session.profile_id.clone()));
+            if let Some(pane_id) = self.active_pane_id
+                && self.set_active_pane(pane_id, cx)
+            {
+                return true;
+            }
 
             if let Some((replacement_id, profile_id)) = replacement {
                 self.active_session_id = Some(replacement_id);
@@ -745,16 +960,20 @@ impl RemCmdApp {
         );
     }
 
-    fn select_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+    fn select_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::Connection;
-        self.active_session_id = self
+        let session_id = self
             .active_session()
             .filter(|session| session.profile_id == profile_id)
             .or_else(|| self.session_for_profile(&profile_id))
             .map(|session| session.id);
+        self.active_session_id = session_id;
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
+        if let Some(session_id) = session_id {
+            self.activate_session_in_window(session_id, window, cx);
+        }
         cx.notify();
     }
 
@@ -1010,7 +1229,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn connect_selected_profile(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn connect_selected_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.selected_profile().cloned() else {
             return;
         };
@@ -1018,13 +1237,13 @@ impl RemCmdApp {
             .selected_session()
             .map(|session| session.id)
             .unwrap_or_else(|| self.create_session_for_profile(&profile.id));
-        self.active_session_id = Some(session_id);
+        self.activate_session_in_window(session_id, window, cx);
         self.connect_profile_in_session(session_id, profile, cx);
     }
 
     fn connect_selected_profile_in_new_session(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(profile) = self.selected_profile().cloned() else {
@@ -1039,9 +1258,69 @@ impl RemCmdApp {
         }
 
         let session_id = self.create_session_for_profile(&profile.id);
-        self.active_panel = ActivePanel::Connection;
-        self.active_session_id = Some(session_id);
+        self.activate_session_in_window(session_id, window, cx);
         self.connect_profile_in_session(session_id, profile, cx);
+    }
+
+    fn split_active_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_pane_id) = self.active_pane_id else {
+            return;
+        };
+        let Some(profile) = self
+            .active_session()
+            .and_then(|session| {
+                self.profiles
+                    .iter()
+                    .find(|profile| profile.id == session.profile_id)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        if self.credential_lookup_task.is_some()
+            || self
+                .credential_mutations_in_progress
+                .contains_key(&profile.id)
+            || !self
+                .pane_layout
+                .as_ref()
+                .is_some_and(|layout| layout.contains(active_pane_id))
+        {
+            return;
+        }
+
+        let session_id = self.create_session_for_profile(&profile.id);
+        let pane_id = self.create_terminal_pane(session_id, window, cx);
+        let split = self
+            .pane_layout
+            .as_mut()
+            .expect("validated pane layout should remain present")
+            .split(active_pane_id, pane_id, axis);
+        debug_assert!(split, "validated active pane should be splittable");
+
+        self.active_pane_id = Some(pane_id);
+        self.activate_session(session_id, cx);
+        self.connect_profile_in_session(session_id, profile, cx);
+        if let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) {
+            focus_handle.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn close_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panes.len() <= 1 {
+            return;
+        }
+        let Some(pane_id) = self.active_pane_id else {
+            return;
+        };
+
+        if self.remove_pane(pane_id, cx)
+            && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
+        {
+            focus_handle.focus(window);
+        }
+        cx.notify();
     }
 
     fn connect_profile_in_session(
@@ -1582,11 +1861,18 @@ impl RemCmdApp {
 
     fn on_terminal_mouse_down(
         &mut self,
+        pane_id: PaneId,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.terminal_focus_handle.focus(window);
+        if !self.set_active_pane(pane_id, cx) {
+            return;
+        }
+        let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) else {
+            return;
+        };
+        focus_handle.focus(window);
 
         let Some(point) = self.terminal_point_for_position(event.position) else {
             return;
@@ -1714,12 +2000,6 @@ impl RemCmdApp {
         self.send_terminal_user_input(bytes, cx);
     }
 
-    fn report_terminal_focus(&mut self, focused: bool, cx: &mut Context<Self>) {
-        if let Some(bytes) = encode_focus(focused, self.terminal_modes()) {
-            self.send_terminal_input(bytes, cx);
-        }
-    }
-
     fn send_terminal_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
         let Some(session) = self.active_session_mut() else {
             return;
@@ -1831,10 +2111,18 @@ impl RemCmdApp {
 
     fn on_terminal_scroll(
         &mut self,
+        pane_id: PaneId,
         event: &ScrollWheelEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.set_active_pane(pane_id, cx) {
+            return;
+        }
+        if let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) {
+            focus_handle.focus(window);
+        }
+
         let line_height = self
             .active_session()
             .and_then(|session| session.terminal.as_ref())
@@ -2269,8 +2557,11 @@ impl Render for RemCmdApp {
             }
 
             root = root.child(self.render_credential_prompt(cx));
-        } else if should_focus_terminal && !self.terminal_focus_handle.is_focused(window) {
-            window.focus(&self.terminal_focus_handle);
+        } else if should_focus_terminal
+            && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
+            && !focus_handle.is_focused(window)
+        {
+            window.focus(&focus_handle);
         }
 
         root
@@ -2284,17 +2575,18 @@ impl RemCmdApp {
             .is_some_and(TerminalSession::is_terminal_visible)
     }
 
+    fn has_terminal_workspace(&self, profile_id: &str) -> bool {
+        self.pane_layout.is_some()
+            && self.active_pane_id.is_some()
+            && self
+                .active_session()
+                .is_some_and(|session| session.profile_id == profile_id)
+    }
+
     fn terminal_has_ended(&self, profile_id: &str) -> bool {
         self.active_session()
             .filter(|session| session.profile_id == profile_id)
             .is_some_and(TerminalSession::terminal_has_ended)
-    }
-
-    fn close_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some(session_id) = self.active_session_id else {
-            return;
-        };
-        self.close_session(session_id, cx);
     }
 
     fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
@@ -2316,15 +2608,91 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn reconnect_session(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .session(session_id)
+            .and_then(|session| {
+                self.profiles
+                    .iter()
+                    .find(|profile| profile.id == session.profile_id)
+            })
+            .cloned()
+        else {
+            return;
+        };
+
+        if self.activate_session_in_window(session_id, window, cx) {
+            self.connect_profile_in_session(session_id, profile, cx);
+        }
+    }
+
+    fn render_pane_layout(&self, layout: &PaneLayout, cx: &mut Context<Self>) -> AnyElement {
+        match layout {
+            PaneLayout::Pane(pane_id) => self.render_terminal_pane(*pane_id, cx),
+            PaneLayout::Split {
+                axis,
+                first,
+                second,
+            } => {
+                let first = self.render_pane_layout(first, cx);
+                let second = self.render_pane_layout(second, cx);
+                match axis {
+                    SplitAxis::Horizontal => div()
+                        .flex()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(first)
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(1.0))
+                                .h_full()
+                                .bg(self.theme.border_strong),
+                        )
+                        .child(second)
+                        .into_any_element(),
+                    SplitAxis::Vertical => div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(first)
+                        .child(
+                            div()
+                                .flex_none()
+                                .h(px(1.0))
+                                .w_full()
+                                .bg(self.theme.border_strong),
+                        )
+                        .child(second)
+                        .into_any_element(),
+                }
+            }
+        }
+    }
+
+    fn render_terminal_pane(&self, pane_id: PaneId, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pane) = self.pane(pane_id) else {
+            return div().into_any_element();
+        };
         let palette = self.terminal_palette();
-        let session_id = self.active_session_id.unwrap_or(SessionId(0));
+        let session_id = pane.session_id;
+        let session = self.session(session_id);
         let cell_height = self
-            .active_session()
+            .session(session_id)
             .and_then(|session| session.terminal.as_ref())
             .map(|terminal| terminal.cell_height)
             .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
-        let model = self.active_session().and_then(|session| {
+        let model = session.and_then(|session| {
             session.terminal.as_ref().map(|terminal| {
                 TerminalViewModel::from_snapshot_with_selection(
                     &terminal.snapshot(),
@@ -2335,7 +2703,7 @@ impl RemCmdApp {
         });
         let input_entity = cx.entity();
         let layout_entity = input_entity.clone();
-        let input_focus_handle = self.terminal_focus_handle.clone();
+        let input_focus_handle = pane.focus_handle.clone();
         let input_layer = canvas(
             move |bounds, window, _| {
                 let metrics = TerminalCellMetrics::measure(window);
@@ -2372,18 +2740,23 @@ impl RemCmdApp {
         .left_0()
         .size_full();
 
-        div()
-            .id("terminal_view")
+        let border = if self.active_pane_id == Some(pane_id) {
+            self.theme.border_strong
+        } else {
+            self.theme.border
+        };
+        let terminal_view = div()
+            .id(SharedString::from(format!("terminal-view-{}", pane_id.0)))
             .key_context("Terminal")
-            .track_focus(&self.terminal_focus_handle)
+            .track_focus(&pane.focus_handle)
             .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
             .w_full()
-            .mt_4()
             .p_3()
             .overflow_hidden()
-            .rounded_md()
             .border_1()
-            .border_color(self.theme.border)
+            .border_color(border)
             .bg(rgb(palette.background.hex()))
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(14.0))
@@ -2391,11 +2764,18 @@ impl RemCmdApp {
             .cursor(CursorStyle::IBeam)
             .focus(|style| style.border_color(self.theme.border_strong))
             .on_key_down(cx.listener(Self::on_terminal_key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_terminal_mouse_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, window, cx| {
+                    this.on_terminal_mouse_down(pane_id, event, window, cx);
+                }),
+            )
             .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_terminal_scroll))
+            .on_scroll_wheel(cx.listener(move |this, event, window, cx| {
+                this.on_terminal_scroll(pane_id, event, window, cx);
+            }))
             .child(
                 div()
                     .relative()
@@ -2404,11 +2784,30 @@ impl RemCmdApp {
                     .size_full()
                     .overflow_hidden()
                     .child(input_layer),
-            )
+            );
+
+        let mut pane_view = div()
+            .id(SharedString::from(format!("terminal-pane-{}", pane_id.0)))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(120.0))
+            .min_h(px(100.0))
+            .overflow_hidden()
+            .child(terminal_view);
+        if session.is_some_and(TerminalSession::terminal_has_ended) {
+            pane_view = pane_view.child(self.render_terminal_lifecycle(session_id, cx));
+        }
+
+        pane_view.into_any_element()
     }
 
-    fn render_terminal_lifecycle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = self.active_session();
+    fn render_terminal_lifecycle(
+        &self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let session = self.session(session_id);
         let (message, color) =
             if let Some(error) = session.and_then(|session| session.connection_error.as_ref()) {
                 (error.clone(), self.theme.error_text)
@@ -2451,26 +2850,28 @@ impl RemCmdApp {
                     .gap_2()
                     .child(
                         button(
-                            "terminal_reconnect",
+                            SharedString::from(format!("terminal-reconnect-{}", session_id.0)),
                             "Reconnect",
                             ButtonVariant::Primary,
                             true,
                             &self.theme,
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.connect_selected_profile(window, cx);
-                        })),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.reconnect_session(session_id, window, cx);
+                            },
+                        )),
                     )
                     .child(
                         button(
-                            "terminal_close",
+                            SharedString::from(format!("terminal-close-{}", session_id.0)),
                             "Close terminal",
                             ButtonVariant::Secondary,
                             true,
                             &self.theme,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_terminal(cx);
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_session(session_id, cx);
                         })),
                     ),
             )
@@ -2816,8 +3217,8 @@ impl RemCmdApp {
                         .text_color(self.theme.text_muted)
                         .child(profile.address()),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_profile(profile_id.clone(), cx);
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_profile(profile_id.clone(), window, cx);
                 }));
 
             connection_list = connection_list.child(profile_item);
@@ -2943,6 +3344,7 @@ impl RemCmdApp {
                                 .items_center()
                                 .justify_end()
                                 .gap_2()
+                                .child(self.render_pane_controls(cx))
                                 .child(self.render_connection_controls(cx))
                                 .child(
                                     button(
@@ -2961,10 +3363,18 @@ impl RemCmdApp {
                         ),
                 );
 
-                if self.is_terminal_visible(&profile.id) {
-                    panel = panel.child(self.render_terminal(cx));
-                    if self.terminal_has_ended(&profile.id) {
-                        panel = panel.child(self.render_terminal_lifecycle(cx));
+                if self.has_terminal_workspace(&profile.id) {
+                    if let Some(layout) = self.pane_layout.as_ref() {
+                        panel = panel.child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .min_h(px(0.0))
+                                .mt_4()
+                                .overflow_hidden()
+                                .child(self.render_pane_layout(layout, cx)),
+                        );
                     }
                 } else {
                     let form = div()
@@ -3187,8 +3597,8 @@ impl RemCmdApp {
                                 this.close_session(session_id, cx);
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.activate_session(session_id, cx) {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.activate_session_in_window(session_id, window, cx) {
                             cx.notify();
                         }
                     })),
@@ -3356,6 +3766,69 @@ impl RemCmdApp {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.set_theme_mode(mode, window, cx);
             }))
+    }
+
+    fn render_pane_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_workspace = self
+            .selected_profile_id
+            .as_deref()
+            .is_some_and(|profile_id| self.has_terminal_workspace(profile_id));
+        if !has_workspace {
+            return div().id("pane_controls_empty");
+        }
+
+        let can_split = self.credential_lookup_task.is_none()
+            && self
+                .selected_profile_id
+                .as_deref()
+                .is_none_or(|profile_id| {
+                    !self
+                        .credential_mutations_in_progress
+                        .contains_key(profile_id)
+                });
+
+        div()
+            .id("pane_controls")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(
+                button(
+                    "split_pane_right",
+                    "Split right",
+                    ButtonVariant::Secondary,
+                    can_split,
+                    &self.theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.split_active_pane(SplitAxis::Horizontal, window, cx);
+                })),
+            )
+            .child(
+                button(
+                    "split_pane_down",
+                    "Split down",
+                    ButtonVariant::Secondary,
+                    can_split,
+                    &self.theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.split_active_pane(SplitAxis::Vertical, window, cx);
+                })),
+            )
+            .child(
+                button(
+                    "close_active_pane",
+                    "Close pane",
+                    ButtonVariant::Ghost,
+                    self.panes.len() > 1,
+                    &self.theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_active_pane(window, cx);
+                })),
+            )
     }
 
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {

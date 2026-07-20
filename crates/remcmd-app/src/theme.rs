@@ -181,7 +181,7 @@ pub enum ButtonVariant {
 /// element before its `on_click` handler is attached so callers stay in charge
 /// of behavior while the look stays centralized.
 pub fn button(
-    id: &'static str,
+    id: impl Into<gpui::ElementId>,
     label: &'static str,
     variant: ButtonVariant,
     enabled: bool,
