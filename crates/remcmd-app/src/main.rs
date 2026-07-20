@@ -4,11 +4,14 @@ use text_field::{TextField, bind_text_field_keys};
 mod pane_layout;
 use pane_layout::{PaneId, PaneLayout, SplitAxis};
 
+mod icons;
+use icons::{IconName, RemCmdAssets, icon};
+
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
 mod theme;
-use theme::{ButtonVariant, Theme, button, set_global_theme};
+use theme::{IconTone, Theme, icon_button, set_global_theme};
 
 mod terminal_input;
 use terminal_input::{
@@ -28,7 +31,7 @@ mod private_key_picker;
 use std::{collections::HashMap, ops::Range, path::PathBuf, time::Duration};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle,
+    AnyElement, AnyView, App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Subscription, Task, Timer,
@@ -82,10 +85,15 @@ struct RemCmdApp {
     sessions: Vec<TerminalSession>,
     active_session_id: Option<SessionId>,
     next_session_id: u64,
+    tabs: Vec<TerminalTab>,
+    active_tab_id: Option<TabId>,
+    next_tab_id: u64,
     panes: Vec<TerminalPane>,
-    pane_layout: Option<PaneLayout>,
     active_pane_id: Option<PaneId>,
     next_pane_id: u64,
+    sidebar_search: Entity<TextField>,
+    sidebar_search_visible: bool,
+    connections_expanded: bool,
     credential_lookup_task: Option<Task<()>>,
     credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
@@ -100,8 +108,19 @@ struct RemCmdApp {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SessionId(u64);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TabId(u64);
+
+struct TerminalTab {
+    id: TabId,
+    profile_id: String,
+    layout: PaneLayout,
+    active_pane_id: PaneId,
+}
+
 struct TerminalPane {
     id: PaneId,
+    tab_id: TabId,
     session_id: SessionId,
     focus_handle: FocusHandle,
     focused: bool,
@@ -174,6 +193,32 @@ struct ActiveTerminal {
     cell_height: f32,
     viewport_bounds: Option<Bounds<Pixels>>,
     was_connected: bool,
+}
+
+struct CommandTooltip {
+    label: SharedString,
+    theme: Theme,
+}
+
+impl Render for CommandTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py(px(5.0))
+            .rounded_md()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.modal_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(3.0)),
+                blur_radius: px(10.0),
+                spread_radius: px(-3.0),
+            }])
+            .text_sm()
+            .text_color(self.theme.text_primary)
+            .child(self.label.clone())
+    }
 }
 
 impl ActiveTerminal {
@@ -407,6 +452,8 @@ impl RemCmdApp {
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
         });
+        let sidebar_search = cx.new(|cx| TextField::new(cx, "", "Search connections"));
+        cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
 
         let mut app = Self {
             profiles,
@@ -419,10 +466,15 @@ impl RemCmdApp {
             sessions: Vec::new(),
             active_session_id: None,
             next_session_id: 1,
+            tabs: Vec::new(),
+            active_tab_id: None,
+            next_tab_id: 1,
             panes: Vec::new(),
-            pane_layout: None,
             active_pane_id: None,
             next_pane_id: 1,
+            sidebar_search,
+            sidebar_search_visible: false,
+            connections_expanded: true,
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
@@ -468,13 +520,6 @@ impl RemCmdApp {
         self.session_mut(session_id)
     }
 
-    fn session_for_profile(&self, profile_id: &str) -> Option<&TerminalSession> {
-        self.sessions
-            .iter()
-            .rev()
-            .find(|session| session.profile_id == profile_id)
-    }
-
     fn session_for_profile_mut(&mut self, profile_id: &str) -> Option<&mut TerminalSession> {
         self.sessions
             .iter_mut()
@@ -496,6 +541,42 @@ impl RemCmdApp {
         session_id
     }
 
+    fn tab(&self, tab_id: TabId) -> Option<&TerminalTab> {
+        self.tabs.iter().find(|tab| tab.id == tab_id)
+    }
+
+    fn tab_mut(&mut self, tab_id: TabId) -> Option<&mut TerminalTab> {
+        self.tabs.iter_mut().find(|tab| tab.id == tab_id)
+    }
+
+    fn active_tab(&self) -> Option<&TerminalTab> {
+        self.active_tab_id.and_then(|tab_id| self.tab(tab_id))
+    }
+
+    fn tab_session(&self, tab: &TerminalTab) -> Option<&TerminalSession> {
+        self.pane(tab.active_pane_id)
+            .and_then(|pane| self.session(pane.session_id))
+    }
+
+    fn create_tab_for_session(
+        &mut self,
+        session_id: SessionId,
+        profile_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabId {
+        let tab_id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let pane_id = self.create_terminal_pane(tab_id, session_id, window, cx);
+        self.tabs.push(TerminalTab {
+            id: tab_id,
+            profile_id,
+            layout: PaneLayout::Pane(pane_id),
+            active_pane_id: pane_id,
+        });
+        tab_id
+    }
+
     fn pane(&self, pane_id: PaneId) -> Option<&TerminalPane> {
         self.panes.iter().find(|pane| pane.id == pane_id)
     }
@@ -514,6 +595,7 @@ impl RemCmdApp {
 
     fn create_terminal_pane(
         &mut self,
+        tab_id: TabId,
         session_id: SessionId,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -533,6 +615,7 @@ impl RemCmdApp {
 
         self.panes.push(TerminalPane {
             id: pane_id,
+            tab_id,
             session_id,
             focus_handle,
             focused: false,
@@ -540,54 +623,19 @@ impl RemCmdApp {
         pane_id
     }
 
-    fn set_pane_session(&mut self, pane_id: PaneId, session_id: SessionId) -> bool {
-        let Some((previous_session_id, focused)) = self
-            .pane(pane_id)
-            .map(|pane| (pane.session_id, pane.focused))
-        else {
-            return false;
-        };
-        if previous_session_id == session_id {
-            return true;
-        }
-
-        if focused {
-            let previous_modes = self
-                .session(previous_session_id)
-                .and_then(|session| session.terminal.as_ref())
-                .map(ActiveTerminal::modes)
-                .unwrap_or(TerminalModes::NONE);
-            if let Some(bytes) = encode_focus(false, previous_modes) {
-                self.send_terminal_response(previous_session_id, bytes);
-            }
-        }
-
-        self.pane_mut(pane_id)
-            .expect("pane should remain present while replacing its session")
-            .session_id = session_id;
-
-        if focused {
-            let next_modes = self
-                .session(session_id)
-                .and_then(|session| session.terminal.as_ref())
-                .map(ActiveTerminal::modes)
-                .unwrap_or(TerminalModes::NONE);
-            if let Some(bytes) = encode_focus(true, next_modes) {
-                self.send_terminal_response(session_id, bytes);
-            }
-        }
-        true
-    }
-
     fn set_active_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> bool {
-        let Some((session_id, profile_id)) = self.pane(pane_id).and_then(|pane| {
+        let Some((tab_id, session_id, profile_id)) = self.pane(pane_id).and_then(|pane| {
             self.session(pane.session_id)
-                .map(|session| (session.id, session.profile_id.clone()))
+                .map(|session| (pane.tab_id, session.id, session.profile_id.clone()))
         }) else {
             return false;
         };
 
         let profile_changed = self.selected_profile_id.as_deref() != Some(profile_id.as_str());
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.active_pane_id = pane_id;
+        }
+        self.active_tab_id = Some(tab_id);
         self.active_pane_id = Some(pane_id);
         self.active_session_id = Some(session_id);
         self.active_panel = ActivePanel::Connection;
@@ -625,10 +673,14 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.panes.is_empty() {
-            let pane_id = self.create_terminal_pane(session_id, window, cx);
-            self.pane_layout = Some(PaneLayout::Pane(pane_id));
-            self.active_pane_id = Some(pane_id);
+        if self.pane_for_session(session_id).is_none() {
+            let Some(profile_id) = self
+                .session(session_id)
+                .map(|session| session.profile_id.clone())
+            else {
+                return false;
+            };
+            self.create_tab_for_session(session_id, profile_id, window, cx);
         }
         if !self.activate_session(session_id, cx) {
             return false;
@@ -641,27 +693,29 @@ impl RemCmdApp {
     }
 
     fn activate_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
-        let Some(profile_id) = self
-            .session(session_id)
-            .map(|session| session.profile_id.clone())
-        else {
+        let Some(pane_id) = self.pane_for_session(session_id).map(|pane| pane.id) else {
             return false;
         };
 
         self.dismiss_credential_prompt(cx);
-        let pane_id = self
-            .pane_for_session(session_id)
-            .map(|pane| pane.id)
-            .or(self.active_pane_id)
-            .or_else(|| self.pane_layout.as_ref().map(PaneLayout::first_pane));
-        if let Some(pane_id) = pane_id {
-            self.set_pane_session(pane_id, session_id);
-            self.active_pane_id = Some(pane_id);
+        self.set_active_pane(pane_id, cx)
+    }
+
+    fn activate_tab_in_window(
+        &mut self,
+        tab_id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pane_id) = self.tab(tab_id).map(|tab| tab.active_pane_id) else {
+            return false;
+        };
+        if !self.set_active_pane(pane_id, cx) {
+            return false;
         }
-        self.active_panel = ActivePanel::Connection;
-        self.active_session_id = Some(session_id);
-        self.selected_profile_id = Some(profile_id);
-        self.load_editor_for_selected_profile(cx);
+        if let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone()) {
+            focus_handle.focus(window);
+        }
         true
     }
 
@@ -669,12 +723,12 @@ impl RemCmdApp {
         let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) else {
             return false;
         };
-        let Some(layout) = self.pane_layout.take() else {
+        let tab_id = self.panes[index].tab_id;
+        let Some(layout) = self.tab(tab_id).map(|tab| tab.layout.clone()) else {
             return false;
         };
         let (next_layout, removed) = layout.without(pane_id);
         if !removed {
-            self.pane_layout = next_layout;
             return false;
         }
 
@@ -693,14 +747,45 @@ impl RemCmdApp {
             }
         }
         self.panes.remove(index);
-        self.pane_layout = next_layout;
-
-        if self.active_pane_id == Some(pane_id) {
-            self.active_pane_id = self.pane_layout.as_ref().map(PaneLayout::first_pane);
-            if let Some(replacement_pane) = self.active_pane_id {
+        if let Some(next_layout) = next_layout {
+            let replacement_pane = next_layout.first_pane();
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.layout = next_layout;
+                if tab.active_pane_id == pane_id {
+                    tab.active_pane_id = replacement_pane;
+                }
+            }
+            if self.active_tab_id == Some(tab_id) && self.active_pane_id == Some(pane_id) {
                 self.set_active_pane(replacement_pane, cx);
-            } else {
-                self.active_session_id = None;
+            }
+        } else {
+            self.remove_tab_record(tab_id, cx);
+        }
+        true
+    }
+
+    fn remove_tab_record(&mut self, tab_id: TabId, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return false;
+        };
+        let was_active = self.active_tab_id == Some(tab_id);
+        let replacement = index
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+            .or_else(|| self.tabs.get(index + 1))
+            .map(|tab| tab.id);
+        self.tabs.remove(index);
+
+        if was_active {
+            self.active_tab_id = None;
+            self.active_pane_id = None;
+            self.active_session_id = None;
+            if let Some(replacement) = replacement {
+                let pane_id = self
+                    .tab(replacement)
+                    .expect("replacement tab should remain present")
+                    .active_pane_id;
+                self.set_active_pane(pane_id, cx);
             }
         }
         true
@@ -714,22 +799,8 @@ impl RemCmdApp {
         else {
             return false;
         };
-        let was_active = self.active_session_id == Some(session_id);
-        let removed_profile_id = self.sessions[index].profile_id.clone();
-        let replacement = index
-            .checked_sub(1)
-            .and_then(|index| self.sessions.get(index))
-            .or_else(|| self.sessions.get(index + 1))
-            .map(|session| (session.id, session.profile_id.clone()));
-
         if let Some(pane_id) = self.pane_for_session(session_id).map(|pane| pane.id) {
-            if self.panes.len() == 1
-                && let Some((replacement_id, _)) = replacement.as_ref()
-            {
-                self.set_pane_session(pane_id, *replacement_id);
-            } else {
-                self.remove_pane(pane_id, cx);
-            }
+            self.remove_pane(pane_id, cx);
         }
         self.sessions.remove(index);
 
@@ -745,26 +816,11 @@ impl RemCmdApp {
             self.dismiss_credential_prompt(cx);
         }
 
-        if was_active {
-            if let Some(pane_id) = self.active_pane_id
-                && self.set_active_pane(pane_id, cx)
-            {
-                return true;
-            }
-
-            if let Some((replacement_id, profile_id)) = replacement {
-                self.active_session_id = Some(replacement_id);
-                self.active_panel = ActivePanel::Connection;
-                self.selected_profile_id = Some(profile_id);
-                self.load_editor_for_selected_profile(cx);
-            } else {
-                self.active_session_id = None;
-                if self.selected_profile_id.as_deref() != Some(removed_profile_id.as_str()) {
-                    self.selected_profile_id =
-                        self.profiles.first().map(|profile| profile.id.clone());
-                    self.load_editor_for_selected_profile(cx);
-                }
-            }
+        if self.active_session_id == Some(session_id) {
+            self.active_session_id = self
+                .active_pane()
+                .map(|pane| pane.session_id)
+                .filter(|replacement| *replacement != session_id);
         }
 
         true
@@ -963,16 +1019,21 @@ impl RemCmdApp {
     fn select_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::Connection;
-        let session_id = self
-            .active_session()
-            .filter(|session| session.profile_id == profile_id)
-            .or_else(|| self.session_for_profile(&profile_id))
-            .map(|session| session.id);
-        self.active_session_id = session_id;
+        let tab_id = self
+            .active_tab()
+            .filter(|tab| tab.profile_id == profile_id)
+            .or_else(|| {
+                self.tabs
+                    .iter()
+                    .rev()
+                    .find(|tab| tab.profile_id == profile_id)
+            })
+            .map(|tab| tab.id);
+        self.active_session_id = None;
         self.selected_profile_id = Some(profile_id);
         self.load_editor_for_selected_profile(cx);
-        if let Some(session_id) = session_id {
-            self.activate_session_in_window(session_id, window, cx);
+        if let Some(tab_id) = tab_id {
+            self.activate_tab_in_window(tab_id, window, cx);
         }
         cx.notify();
     }
@@ -1003,6 +1064,22 @@ impl RemCmdApp {
     fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::Settings;
+        cx.notify();
+    }
+
+    fn toggle_sidebar_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_search_visible = !self.sidebar_search_visible;
+        if self.sidebar_search_visible {
+            self.sidebar_search.focus_handle(cx).focus(window);
+        } else {
+            self.sidebar_search
+                .update(cx, |search, cx| search.clear(cx));
+        }
+        cx.notify();
+    }
+
+    fn toggle_connections(&mut self, cx: &mut Context<Self>) {
+        self.connections_expanded = !self.connections_expanded;
         cx.notify();
     }
 
@@ -1266,6 +1343,9 @@ impl RemCmdApp {
         let Some(active_pane_id) = self.active_pane_id else {
             return;
         };
+        let Some(tab_id) = self.active_tab_id else {
+            return;
+        };
         let Some(profile) = self
             .active_session()
             .and_then(|session| {
@@ -1282,23 +1362,21 @@ impl RemCmdApp {
                 .credential_mutations_in_progress
                 .contains_key(&profile.id)
             || !self
-                .pane_layout
-                .as_ref()
-                .is_some_and(|layout| layout.contains(active_pane_id))
+                .tab(tab_id)
+                .is_some_and(|tab| tab.layout.contains(active_pane_id))
         {
             return;
         }
 
         let session_id = self.create_session_for_profile(&profile.id);
-        let pane_id = self.create_terminal_pane(session_id, window, cx);
+        let pane_id = self.create_terminal_pane(tab_id, session_id, window, cx);
         let split = self
-            .pane_layout
-            .as_mut()
-            .expect("validated pane layout should remain present")
+            .tab_mut(tab_id)
+            .expect("validated tab should remain present")
+            .layout
             .split(active_pane_id, pane_id, axis);
         debug_assert!(split, "validated active pane should be splittable");
 
-        self.active_pane_id = Some(pane_id);
         self.activate_session(session_id, cx);
         self.connect_profile_in_session(session_id, profile, cx);
         if let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) {
@@ -1308,17 +1386,30 @@ impl RemCmdApp {
     }
 
     fn close_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.panes.len() <= 1 {
+        let Some(tab_id) = self.active_tab_id else {
+            return;
+        };
+        if self
+            .panes
+            .iter()
+            .filter(|pane| pane.tab_id == tab_id)
+            .count()
+            <= 1
+        {
             return;
         }
         let Some(pane_id) = self.active_pane_id else {
             return;
         };
+        let Some(session_id) = self.pane(pane_id).map(|pane| pane.session_id) else {
+            return;
+        };
 
-        if self.remove_pane(pane_id, cx)
-            && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
-        {
-            focus_handle.focus(window);
+        if self.remove_pane(pane_id, cx) {
+            self.close_session(session_id, cx);
+            if let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone()) {
+                focus_handle.focus(window);
+            }
         }
         cx.notify();
     }
@@ -2569,6 +2660,32 @@ impl Render for RemCmdApp {
 }
 
 impl RemCmdApp {
+    fn render_icon_button(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        icon_name: IconName,
+        tooltip: impl Into<SharedString>,
+        tone: IconTone,
+        enabled: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        let tooltip = tooltip.into();
+        icon_button(
+            id,
+            icon(icon_name, theme, tone, 18.0),
+            tone,
+            enabled,
+            &theme,
+        )
+        .tooltip(move |_, cx| -> AnyView {
+            cx.new(|_| CommandTooltip {
+                label: tooltip.clone(),
+                theme,
+            })
+            .into()
+        })
+    }
+
     fn is_terminal_visible(&self, profile_id: &str) -> bool {
         self.active_session()
             .filter(|session| session.profile_id == profile_id)
@@ -2576,11 +2693,9 @@ impl RemCmdApp {
     }
 
     fn has_terminal_workspace(&self, profile_id: &str) -> bool {
-        self.pane_layout.is_some()
+        self.active_tab()
+            .is_some_and(|tab| tab.profile_id == profile_id)
             && self.active_pane_id.is_some()
-            && self
-                .active_session()
-                .is_some_and(|session| session.profile_id == profile_id)
     }
 
     fn terminal_has_ended(&self, profile_id: &str) -> bool {
@@ -2604,6 +2719,27 @@ impl RemCmdApp {
             self.disconnect_session(session_id, cx);
         } else {
             self.remove_session(session_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let pane_ids = self
+            .panes
+            .iter()
+            .filter(|pane| pane.tab_id == tab_id)
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        let session_ids = pane_ids
+            .iter()
+            .filter_map(|pane_id| self.pane(*pane_id).map(|pane| pane.session_id))
+            .collect::<Vec<_>>();
+
+        for pane_id in pane_ids {
+            self.remove_pane(pane_id, cx);
+        }
+        for session_id in session_ids {
+            self.close_session(session_id, cx);
         }
         cx.notify();
     }
@@ -2849,12 +2985,12 @@ impl RemCmdApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        button(
+                        self.render_icon_button(
                             SharedString::from(format!("terminal-reconnect-{}", session_id.0)),
+                            IconName::Reconnect,
                             "Reconnect",
-                            ButtonVariant::Primary,
+                            IconTone::Accent,
                             true,
-                            &self.theme,
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
@@ -2863,12 +2999,12 @@ impl RemCmdApp {
                         )),
                     )
                     .child(
-                        button(
+                        self.render_icon_button(
                             SharedString::from(format!("terminal-close-{}", session_id.0)),
+                            IconName::Cancel,
                             "Close terminal",
-                            ButtonVariant::Secondary,
+                            IconTone::Default,
                             true,
-                            &self.theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_session(session_id, cx);
@@ -3001,12 +3137,12 @@ impl RemCmdApp {
                 .gap_2()
                 .mt_4()
                 .child(
-                    button(
+                    self.render_icon_button(
                         "credential_cancel",
+                        IconName::Cancel,
                         "Cancel",
-                        ButtonVariant::Secondary,
+                        IconTone::Default,
                         true,
-                        &self.theme,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.dismiss_credential_prompt(cx);
@@ -3014,12 +3150,12 @@ impl RemCmdApp {
                     })),
                 )
                 .child(
-                    button(
+                    self.render_icon_button(
                         "credential_submit",
+                        IconName::Connect,
                         "Connect",
-                        ButtonVariant::Primary,
+                        IconTone::Accent,
                         true,
-                        &self.theme,
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.submit_credential_prompt(window, cx);
@@ -3125,24 +3261,24 @@ impl RemCmdApp {
                     .gap_2()
                     .mt_4()
                     .child(
-                        button(
+                        self.render_icon_button(
                             "host_key_cancel",
+                            IconName::Cancel,
                             "Cancel",
-                            ButtonVariant::Secondary,
+                            IconTone::Default,
                             true,
-                            &self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.reject_pending_host_key(cx);
                         })),
                     )
                     .child(
-                        button(
+                        self.render_icon_button(
                             "host_key_trust",
+                            IconName::Trust,
                             "Trust and connect",
-                            ButtonVariant::Primary,
+                            IconTone::Accent,
                             true,
-                            &self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.trust_pending_host_key(cx);
@@ -3168,7 +3304,10 @@ impl RemCmdApp {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut connection_list = div()
+        let query = self.sidebar_search.read(cx).text().trim().to_lowercase();
+        let list_hover_background = self.theme.list_hover_bg;
+        let pressed_background = self.theme.control_pressed_bg;
+        let mut connection_tree = div()
             .id("connection_list")
             .flex_1()
             .min_h(px(0.0))
@@ -3176,52 +3315,155 @@ impl RemCmdApp {
             .overflow_y_scroll()
             .mt_2();
 
-        for profile in &self.profiles {
-            let profile_id = profile.id.clone();
-            let is_selected = self.active_panel == ActivePanel::Connection
-                && self.selected_profile_id.as_ref() == Some(&profile.id);
-            let item_background = if is_selected {
-                self.theme.list_selected_bg
-            } else {
-                self.theme.transparent
-            };
-            let hover_background = if is_selected {
-                self.theme.list_selected_hover_bg
-            } else {
-                self.theme.list_hover_bg
-            };
-
-            let profile_item = div()
-                .id(SharedString::from(format!("profile-{}", profile.id)))
-                .mb_1()
-                .w_full()
-                .px_3()
-                .py_2()
+        let section_icon = if self.connections_expanded {
+            IconName::Collapse
+        } else {
+            IconName::Expand
+        };
+        connection_tree = connection_tree.child(
+            div()
+                .id("toggle_connections")
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(30.0))
+                .px_2()
                 .rounded_md()
-                .bg(item_background)
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(self.theme.text_muted)
                 .cursor_pointer()
-                .hover(move |this| this.bg(hover_background))
-                .child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(profile.name.clone()),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .w_full()
-                        .truncate()
-                        .text_sm()
-                        .text_color(self.theme.text_muted)
-                        .child(profile.address()),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.select_profile(profile_id.clone(), window, cx);
-                }));
+                .hover(move |this| this.bg(list_hover_background))
+                .active(move |this| this.bg(pressed_background))
+                .child(icon(section_icon, self.theme, IconTone::Default, 14.0))
+                .child("Connections")
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_connections(cx))),
+        );
 
-            connection_list = connection_list.child(profile_item);
+        let mut visible_profiles = 0usize;
+        if self.connections_expanded {
+            for profile in &self.profiles {
+                if !query.is_empty()
+                    && !profile.name.to_lowercase().contains(&query)
+                    && !profile.host.to_lowercase().contains(&query)
+                    && !profile.address().to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                visible_profiles += 1;
+
+                let profile_id = profile.id.clone();
+                let active_tab_matches = self
+                    .active_tab()
+                    .is_some_and(|tab| tab.profile_id == profile.id);
+                let is_selected = self.active_panel == ActivePanel::Connection
+                    && self.selected_profile_id.as_ref() == Some(&profile.id)
+                    && !active_tab_matches;
+                let background = if is_selected {
+                    self.theme.list_selected_bg
+                } else {
+                    self.theme.transparent
+                };
+                let hover = if is_selected {
+                    self.theme.list_selected_hover_bg
+                } else {
+                    self.theme.list_hover_bg
+                };
+                connection_tree = connection_tree.child(
+                    div()
+                        .id(SharedString::from(format!("profile-{}", profile.id)))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(32.0))
+                        .ml_2()
+                        .px_2()
+                        .rounded_md()
+                        .bg(background)
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(hover))
+                        .active(move |this| this.bg(pressed_background))
+                        .child(icon(IconName::Server, self.theme, IconTone::Default, 18.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_sm()
+                                .child(profile.name.clone()),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_profile(profile_id.clone(), window, cx);
+                        })),
+                );
+
+                for (terminal_index, tab) in self
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.profile_id == profile.id)
+                    .enumerate()
+                {
+                    let tab_id = tab.id;
+                    let is_active = self.active_panel == ActivePanel::Connection
+                        && self.active_tab_id == Some(tab_id);
+                    let background = if is_active {
+                        self.theme.list_selected_bg
+                    } else {
+                        self.theme.transparent
+                    };
+                    let hover = if is_active {
+                        self.theme.list_selected_hover_bg
+                    } else {
+                        self.theme.list_hover_bg
+                    };
+                    connection_tree = connection_tree.child(
+                        div()
+                            .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(30.0))
+                            .ml(px(28.0))
+                            .px_2()
+                            .rounded_md()
+                            .bg(background)
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(hover))
+                            .active(move |this| this.bg(pressed_background))
+                            .child(icon(
+                                IconName::Terminal,
+                                self.theme,
+                                IconTone::Default,
+                                16.0,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(self.theme.text_muted)
+                                    .child(format!("Terminal {}", terminal_index + 1)),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.activate_tab_in_window(tab_id, window, cx) {
+                                    cx.notify();
+                                }
+                            })),
+                    );
+                }
+            }
+        }
+
+        if self.connections_expanded && visible_profiles == 0 {
+            connection_tree = connection_tree.child(
+                div()
+                    .ml(px(32.0))
+                    .mt_2()
+                    .text_sm()
+                    .text_color(self.theme.text_faint)
+                    .child("No matching connections"),
+            );
         }
 
         let settings_selected = self.active_panel == ActivePanel::Settings;
@@ -3254,13 +3496,13 @@ impl RemCmdApp {
                     .bg(settings_background)
                     .cursor_pointer()
                     .hover(move |this| this.bg(settings_hover))
-                    .child(
-                        div()
-                            .w(px(18.0))
-                            .text_center()
-                            .text_size(px(16.0))
-                            .child("\u{2699}"),
-                    )
+                    .active(move |this| this.bg(pressed_background))
+                    .child(icon(
+                        IconName::Settings,
+                        self.theme,
+                        IconTone::Default,
+                        18.0,
+                    ))
                     .child("Settings")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_settings(cx);
@@ -3274,7 +3516,7 @@ impl RemCmdApp {
             .w(px(300.0))
             .h_full()
             .bg(self.theme.sidebar_bg)
-            .px_4()
+            .px_3()
             .pb_4()
             .pt(px(52.0))
             .child(
@@ -3283,21 +3525,63 @@ impl RemCmdApp {
                     .items_center()
                     .justify_between()
                     .flex_none()
-                    .child("Connections")
+                    .h(px(34.0))
+                    .px_2()
                     .child(
-                        button(
-                            "add_connection",
-                            "Add",
-                            ButtonVariant::Ghost,
+                        div()
+                            .text_size(px(18.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child("RemCmd"),
+                    )
+                    .child(
+                        self.render_icon_button(
+                            "toggle_sidebar_search",
+                            IconName::Search,
+                            "Search connections",
+                            IconTone::Default,
                             true,
-                            &self.theme,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.add_profile(cx);
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_sidebar_search(window, cx);
                         })),
                     ),
             )
-            .child(connection_list)
+            .when(self.sidebar_search_visible, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .mt_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(self.theme.border)
+                        .bg(self.theme.surface_bg)
+                        .child(self.sidebar_search.clone()),
+                )
+            })
+            .child(
+                div()
+                    .id("add_connection")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(34.0))
+                    .mt_2()
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(list_hover_background))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(icon(
+                        IconName::NewConnection,
+                        self.theme,
+                        IconTone::Default,
+                        19.0,
+                    ))
+                    .child("New Connection")
+                    .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
+            )
+            .child(connection_tree)
             .child(settings_footer)
     }
 
@@ -3347,12 +3631,12 @@ impl RemCmdApp {
                                 .child(self.render_pane_controls(cx))
                                 .child(self.render_connection_controls(cx))
                                 .child(
-                                    button(
+                                    self.render_icon_button(
                                         "delete_connection",
+                                        IconName::Delete,
                                         "Delete",
-                                        ButtonVariant::Danger,
+                                        IconTone::Danger,
                                         true,
-                                        &self.theme,
                                     )
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
@@ -3364,7 +3648,7 @@ impl RemCmdApp {
                 );
 
                 if self.has_terminal_workspace(&profile.id) {
-                    if let Some(layout) = self.pane_layout.as_ref() {
+                    if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
                         panel = panel.child(
                             div()
                                 .flex()
@@ -3440,12 +3724,12 @@ impl RemCmdApp {
                                 .gap_2()
                                 .pb_2()
                                 .child(
-                                    button(
+                                    self.render_icon_button(
                                         "save_profile",
+                                        IconName::Save,
                                         "Save",
-                                        ButtonVariant::Primary,
+                                        IconTone::Accent,
                                         true,
-                                        &self.theme,
                                     )
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
@@ -3454,12 +3738,12 @@ impl RemCmdApp {
                                     )),
                                 )
                                 .child(
-                                    button(
+                                    self.render_icon_button(
                                         "cancel_profile",
+                                        IconName::Cancel,
                                         "Cancel",
-                                        ButtonVariant::Secondary,
+                                        IconTone::Default,
                                         true,
-                                        &self.theme,
                                     )
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
@@ -3488,7 +3772,7 @@ impl RemCmdApp {
     }
 
     fn render_session_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.sessions.is_empty() {
+        if self.tabs.is_empty() {
             return div().id("session_tabs_empty");
         }
 
@@ -3505,10 +3789,10 @@ impl RemCmdApp {
             .border_b_1()
             .border_color(self.theme.border);
 
-        for (session_index, session) in self.sessions.iter().enumerate() {
-            let session_id = session.id;
-            let is_active = self.active_panel == ActivePanel::Connection
-                && self.active_session_id == Some(session_id);
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            let tab_id = tab.id;
+            let is_active =
+                self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
             let background = if is_active {
                 self.theme.list_selected_bg
             } else {
@@ -3519,8 +3803,12 @@ impl RemCmdApp {
             } else {
                 self.theme.list_hover_bg
             };
-            let close_hover = self.theme.control_hover_bg;
-            let status_color = match session.connection_state {
+            let pressed_background = self.theme.control_pressed_bg;
+            let state = self
+                .tab_session(tab)
+                .map(|session| session.connection_state)
+                .unwrap_or(SessionState::Disconnected);
+            let status_color = match state {
                 SessionState::Connected => self.theme.status_ok,
                 SessionState::Failed => self.theme.error_text,
                 SessionState::Connecting
@@ -3531,25 +3819,25 @@ impl RemCmdApp {
             let mut label = self
                 .profiles
                 .iter()
-                .find(|profile| profile.id == session.profile_id)
+                .find(|profile| profile.id == tab.profile_id)
                 .map(|profile| profile.name.clone())
-                .unwrap_or_else(|| session.profile_id.clone());
+                .unwrap_or_else(|| tab.profile_id.clone());
             let duplicate_count = self
-                .sessions
+                .tabs
                 .iter()
-                .filter(|candidate| candidate.profile_id == session.profile_id)
+                .filter(|candidate| candidate.profile_id == tab.profile_id)
                 .count();
             if duplicate_count > 1 {
-                let duplicate_index = self.sessions[..=session_index]
+                let duplicate_index = self.tabs[..=tab_index]
                     .iter()
-                    .filter(|candidate| candidate.profile_id == session.profile_id)
+                    .filter(|candidate| candidate.profile_id == tab.profile_id)
                     .count();
                 label = format!("{label} #{duplicate_index}");
             }
 
             tabs = tabs.child(
                 div()
-                    .id(SharedString::from(format!("session-tab-{}", session_id.0)))
+                    .id(SharedString::from(format!("session-tab-{}", tab_id.0)))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -3562,6 +3850,7 @@ impl RemCmdApp {
                     .bg(background)
                     .cursor_pointer()
                     .hover(move |this| this.bg(hover_background))
+                    .active(move |this| this.bg(pressed_background))
                     .child(
                         div()
                             .flex_none()
@@ -3578,27 +3867,21 @@ impl RemCmdApp {
                             .child(label),
                     )
                     .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "close-session-tab-{}",
-                                session_id.0
-                            )))
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(px(20.0))
-                            .rounded_sm()
-                            .text_color(self.theme.text_muted)
-                            .hover(move |this| this.bg(close_hover))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_session(session_id, cx);
-                            })),
+                        self.render_icon_button(
+                            SharedString::from(format!("close-session-tab-{}", tab_id.0)),
+                            IconName::Cancel,
+                            "Close terminal",
+                            IconTone::Default,
+                            true,
+                        )
+                        .size(px(22.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(tab_id, cx);
+                        })),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.activate_session_in_window(session_id, window, cx) {
+                        if this.activate_tab_in_window(tab_id, window, cx) {
                             cx.notify();
                         }
                     })),
@@ -3617,12 +3900,12 @@ impl RemCmdApp {
                         .contains_key(profile_id)
                 });
         tabs = tabs.child(
-            button(
+            self.render_icon_button(
                 "new_session_tab",
-                "+",
-                ButtonVariant::Ghost,
+                IconName::Add,
+                "New terminal",
+                IconTone::Default,
                 can_create_session,
-                &self.theme,
             )
             .on_click(cx.listener(|this, _, window, cx| {
                 this.connect_selected_profile_in_new_session(window, cx);
@@ -3794,36 +4077,42 @@ impl RemCmdApp {
             .items_center()
             .gap_1()
             .child(
-                button(
+                self.render_icon_button(
                     "split_pane_right",
+                    IconName::SplitRight,
                     "Split right",
-                    ButtonVariant::Secondary,
+                    IconTone::Default,
                     can_split,
-                    &self.theme,
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.split_active_pane(SplitAxis::Horizontal, window, cx);
                 })),
             )
             .child(
-                button(
+                self.render_icon_button(
                     "split_pane_down",
+                    IconName::SplitDown,
                     "Split down",
-                    ButtonVariant::Secondary,
+                    IconTone::Default,
                     can_split,
-                    &self.theme,
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.split_active_pane(SplitAxis::Vertical, window, cx);
                 })),
             )
             .child(
-                button(
+                self.render_icon_button(
                     "close_active_pane",
+                    IconName::ClosePane,
                     "Close pane",
-                    ButtonVariant::Ghost,
-                    self.panes.len() > 1,
-                    &self.theme,
+                    IconTone::Default,
+                    self.active_tab_id.is_some_and(|tab_id| {
+                        self.panes
+                            .iter()
+                            .filter(|pane| pane.tab_id == tab_id)
+                            .count()
+                            > 1
+                    }),
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.close_active_pane(window, cx);
@@ -3866,10 +4155,22 @@ impl RemCmdApp {
             _ => "Connect",
         };
 
-        let button_variant = if can_disconnect {
-            ButtonVariant::Danger
+        let tone = if can_disconnect {
+            IconTone::Danger
         } else {
-            ButtonVariant::Primary
+            IconTone::Accent
+        };
+        let icon = if can_disconnect {
+            IconName::Disconnect
+        } else if state == SessionState::Failed
+            || self
+                .selected_profile_id
+                .as_deref()
+                .is_some_and(|profile_id| self.terminal_has_ended(profile_id))
+        {
+            IconName::Reconnect
+        } else {
+            IconName::Connect
         };
 
         let status_color = match state {
@@ -3882,12 +4183,12 @@ impl RemCmdApp {
             SessionState::Disconnected => self.theme.text_muted,
         };
 
-        let mut action = button(
+        let mut action = self.render_icon_button(
             "connection_action",
+            icon,
             label,
-            button_variant,
+            tone,
             can_connect || can_disconnect,
-            &self.theme,
         );
 
         if can_connect {
@@ -4098,12 +4399,12 @@ impl RemCmdApp {
                             .child(field),
                     )
                     .child(
-                        button(
+                        self.render_icon_button(
                             "browse_private_key",
+                            IconName::Folder,
                             "Browse",
-                            ButtonVariant::Secondary,
+                            IconTone::Default,
                             true,
-                            &self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.browse_private_key(cx);
@@ -4125,12 +4426,12 @@ impl RemCmdApp {
                     .child("Credential"),
             )
             .child(
-                button(
+                self.render_icon_button(
                     "forget_saved_credential",
+                    IconName::ForgetCredential,
                     "Forget",
-                    ButtonVariant::Secondary,
+                    IconTone::Danger,
                     true,
-                    &self.theme,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.forget_selected_credential(cx);
@@ -4463,7 +4764,7 @@ fn launch(cx: &mut App) {
 }
 
 fn main() {
-    Application::new().run(launch);
+    Application::new().with_assets(RemCmdAssets).run(launch);
 }
 
 #[cfg(test)]
@@ -4593,6 +4894,28 @@ mod tests {
         assert_ne!(first_snapshot, second_snapshot);
         assert_eq!(first.id, SessionId(1));
         assert_eq!(second.id, SessionId(2));
+    }
+
+    #[test]
+    fn terminal_tab_keeps_split_panes_in_one_layout() {
+        let first_pane = PaneId(1);
+        let second_pane = PaneId(2);
+        let mut tab = TerminalTab {
+            id: TabId(1),
+            profile_id: "server-1".into(),
+            layout: PaneLayout::Pane(first_pane),
+            active_pane_id: first_pane,
+        };
+
+        assert!(
+            tab.layout
+                .split(first_pane, second_pane, SplitAxis::Horizontal)
+        );
+        tab.active_pane_id = second_pane;
+
+        assert!(tab.layout.contains(first_pane));
+        assert!(tab.layout.contains(second_pane));
+        assert_eq!(tab.active_pane_id, second_pane);
     }
 
     #[test]

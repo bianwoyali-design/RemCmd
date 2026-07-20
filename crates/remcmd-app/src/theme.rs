@@ -1,4 +1,6 @@
-use gpui::{App, Global, Hsla, Window, WindowAppearance, div, hsla, prelude::*, px, rgb, rgba};
+use gpui::{
+    AnyElement, App, Global, Hsla, Window, WindowAppearance, div, hsla, prelude::*, px, rgb, rgba,
+};
 
 use remcmd_core::ThemeMode;
 
@@ -46,6 +48,7 @@ pub struct Theme {
     pub list_selected_hover_bg: Hsla,
     pub control_bg: Hsla,
     pub control_hover_bg: Hsla,
+    pub control_pressed_bg: Hsla,
 
     pub input_cursor: Hsla,
     pub input_placeholder: Hsla,
@@ -87,6 +90,7 @@ impl Theme {
             list_selected_hover_bg: opaque(0x59575b),
             control_bg: alpha(0xffffff0d),
             control_hover_bg: alpha(0xffffff1f),
+            control_pressed_bg: alpha(0xffffff33),
 
             input_cursor: hsla(0.0, 0.0, 1.0, 0.9),
             input_placeholder: hsla(0.0, 0.0, 1.0, 0.45),
@@ -126,6 +130,7 @@ impl Theme {
             list_selected_hover_bg: alpha(0x00000018),
             control_bg: alpha(0x00000005),
             control_hover_bg: alpha(0x0000000f),
+            control_pressed_bg: alpha(0x0000001f),
 
             input_cursor: hsla(0.0, 0.0, 0.0, 0.8),
             input_placeholder: hsla(0.0, 0.0, 0.0, 0.4),
@@ -168,34 +173,28 @@ pub fn set_global_theme(theme: Theme, cx: &mut App) {
     cx.set_global(theme);
 }
 
-/// The visual treatment of an interactive button.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ButtonVariant {
-    Primary,
-    Secondary,
+/// The foreground treatment of an icon-only command.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IconTone {
+    Default,
+    Accent,
     Danger,
-    Ghost,
 }
 
-/// Builds a consistently styled, Codex-like button. Returns the configured
-/// element before its `on_click` handler is attached so callers stay in charge
-/// of behavior while the look stays centralized.
-pub fn button(
+/// Builds an icon-only command with a transparent resting state. Callers attach
+/// behavior and a tooltip while this helper keeps hover and pressed feedback
+/// consistent throughout the app.
+pub fn icon_button(
     id: impl Into<gpui::ElementId>,
-    label: &'static str,
-    variant: ButtonVariant,
+    icon: AnyElement,
+    tone: IconTone,
     enabled: bool,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    let (base_bg, hover_bg, text) = match variant {
-        ButtonVariant::Primary => (theme.accent, theme.accent_hover, theme.on_accent),
-        ButtonVariant::Danger => (theme.danger, theme.danger_hover, theme.on_accent),
-        ButtonVariant::Secondary => (theme.surface_bg, theme.control_hover_bg, theme.text_primary),
-        ButtonVariant::Ghost => (
-            theme.transparent,
-            theme.control_hover_bg,
-            theme.text_primary,
-        ),
+    let text = match tone {
+        IconTone::Default => theme.text_primary,
+        IconTone::Accent => theme.accent,
+        IconTone::Danger => theme.danger,
     };
 
     let mut el = div()
@@ -204,24 +203,19 @@ pub fn button(
         .flex_none()
         .items_center()
         .justify_center()
-        .px_3()
-        .py(px(6.0))
+        .size(px(32.0))
         .rounded_md()
-        .bg(base_bg)
+        .bg(theme.transparent)
         .text_color(text)
-        .text_sm()
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .whitespace_nowrap()
-        .child(label);
+        .child(icon);
 
     if enabled {
-        el = el.cursor_pointer().hover(move |this| this.bg(hover_bg));
+        el = el
+            .cursor_pointer()
+            .hover(move |this| this.bg(theme.control_hover_bg))
+            .active(move |this| this.bg(theme.control_pressed_bg));
     } else {
         el = el.opacity(0.5);
-    }
-
-    if matches!(variant, ButtonVariant::Secondary) {
-        el = el.border_1().border_color(theme.border);
     }
 
     el
