@@ -181,6 +181,12 @@ pub enum IconTone {
     Danger,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextButtonTone {
+    Primary,
+    Secondary,
+}
+
 /// Builds an icon-only command with a transparent resting state. Callers attach
 /// behavior and a tooltip while this helper keeps hover and pressed feedback
 /// consistent throughout the app.
@@ -214,6 +220,50 @@ pub fn icon_button(
             .cursor_pointer()
             .hover(move |this| this.bg(theme.control_hover_bg))
             .active(move |this| this.bg(theme.control_pressed_bg));
+    } else {
+        el = el.opacity(0.5);
+    }
+
+    el
+}
+
+/// Builds labeled confirmation and cancellation controls. Text remains visible
+/// for decisions whose outcome should not rely on icon recognition.
+pub fn text_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    tone: TextButtonTone,
+    enabled: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let (text, hover_text, border) = match tone {
+        TextButtonTone::Primary => (theme.accent, theme.accent_hover, theme.accent),
+        TextButtonTone::Secondary => (theme.text_primary, theme.text_primary, theme.border),
+    };
+
+    let mut el = div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .min_h(px(32.0))
+        .px_3()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(theme.transparent)
+        .text_color(text)
+        .text_sm()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .whitespace_nowrap()
+        .child(label);
+
+    if enabled {
+        el = el
+            .cursor_pointer()
+            .hover(move |this| this.bg(theme.control_hover_bg).text_color(hover_text))
+            .active(move |this| this.bg(theme.control_pressed_bg).text_color(text));
     } else {
         el = el.opacity(0.5);
     }

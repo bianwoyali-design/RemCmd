@@ -11,7 +11,7 @@ mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
 mod theme;
-use theme::{IconTone, Theme, icon_button, set_global_theme};
+use theme::{IconTone, TextButtonTone, Theme, icon_button, set_global_theme, text_button};
 
 mod terminal_input;
 use terminal_input::{
@@ -551,11 +551,6 @@ impl RemCmdApp {
 
     fn active_tab(&self) -> Option<&TerminalTab> {
         self.active_tab_id.and_then(|tab_id| self.tab(tab_id))
-    }
-
-    fn tab_session(&self, tab: &TerminalTab) -> Option<&TerminalSession> {
-        self.pane(tab.active_pane_id)
-            .and_then(|pane| self.session(pane.session_id))
     }
 
     fn create_tab_for_session(
@@ -2686,6 +2681,16 @@ impl RemCmdApp {
         })
     }
 
+    fn render_sidebar_icon(&self, icon_name: IconName, size: f32) -> gpui::Div {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(20.0))
+            .child(icon(icon_name, self.theme, IconTone::Default, size))
+    }
+
     fn is_terminal_visible(&self, profile_id: &str) -> bool {
         self.active_session()
             .filter(|session| session.profile_id == profile_id)
@@ -3137,12 +3142,12 @@ impl RemCmdApp {
                 .gap_2()
                 .mt_4()
                 .child(
-                    self.render_icon_button(
+                    text_button(
                         "credential_cancel",
-                        IconName::Cancel,
                         "Cancel",
-                        IconTone::Default,
+                        TextButtonTone::Secondary,
                         true,
+                        &self.theme,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.dismiss_credential_prompt(cx);
@@ -3150,12 +3155,12 @@ impl RemCmdApp {
                     })),
                 )
                 .child(
-                    self.render_icon_button(
+                    text_button(
                         "credential_submit",
-                        IconName::Connect,
                         "Connect",
-                        IconTone::Accent,
+                        TextButtonTone::Primary,
                         true,
+                        &self.theme,
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.submit_credential_prompt(window, cx);
@@ -3261,24 +3266,24 @@ impl RemCmdApp {
                     .gap_2()
                     .mt_4()
                     .child(
-                        self.render_icon_button(
+                        text_button(
                             "host_key_cancel",
-                            IconName::Cancel,
                             "Cancel",
-                            IconTone::Default,
+                            TextButtonTone::Secondary,
                             true,
+                            &self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.reject_pending_host_key(cx);
                         })),
                     )
                     .child(
-                        self.render_icon_button(
+                        text_button(
                             "host_key_trust",
-                            IconName::Trust,
-                            "Trust and connect",
-                            IconTone::Accent,
+                            "Trust and Connect",
+                            TextButtonTone::Primary,
                             true,
+                            &self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.trust_pending_host_key(cx);
@@ -3309,11 +3314,14 @@ impl RemCmdApp {
         let pressed_background = self.theme.control_pressed_bg;
         let mut connection_tree = div()
             .id("connection_list")
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h(px(0.0))
+            .gap(px(2.0))
             .overflow_x_hidden()
             .overflow_y_scroll()
-            .mt_2();
+            .mt_3();
 
         let section_icon = if self.connections_expanded {
             IconName::Collapse
@@ -3325,8 +3333,8 @@ impl RemCmdApp {
                 .id("toggle_connections")
                 .flex()
                 .items_center()
-                .gap_2()
-                .h(px(30.0))
+                .gap(px(10.0))
+                .h(px(32.0))
                 .px_2()
                 .rounded_md()
                 .text_sm()
@@ -3335,7 +3343,7 @@ impl RemCmdApp {
                 .cursor_pointer()
                 .hover(move |this| this.bg(list_hover_background))
                 .active(move |this| this.bg(pressed_background))
-                .child(icon(section_icon, self.theme, IconTone::Default, 14.0))
+                .child(self.render_sidebar_icon(section_icon, 15.0))
                 .child("Connections")
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_connections(cx))),
         );
@@ -3352,7 +3360,29 @@ impl RemCmdApp {
                 }
                 visible_profiles += 1;
 
-                let profile_id = profile.id.clone();
+                let select_profile_id = profile.id.clone();
+                let new_terminal_profile_id = profile.id.clone();
+                let can_create_terminal = self.credential_lookup_task.is_none()
+                    && !self
+                        .credential_mutations_in_progress
+                        .contains_key(&profile.id);
+                let mut new_terminal_button = self
+                    .render_icon_button(
+                        SharedString::from(format!("new-terminal-{}", profile.id)),
+                        IconName::Add,
+                        "New terminal",
+                        IconTone::Default,
+                        can_create_terminal,
+                    )
+                    .size(px(24.0));
+                if can_create_terminal {
+                    new_terminal_button =
+                        new_terminal_button.on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.select_profile(new_terminal_profile_id.clone(), window, cx);
+                            this.connect_selected_profile_in_new_session(window, cx);
+                        }));
+                }
                 let active_tab_matches = self
                     .active_tab()
                     .is_some_and(|tab| tab.profile_id == profile.id);
@@ -3374,8 +3404,8 @@ impl RemCmdApp {
                         .id(SharedString::from(format!("profile-{}", profile.id)))
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .h(px(32.0))
+                        .gap(px(10.0))
+                        .h(px(34.0))
                         .ml_2()
                         .px_2()
                         .rounded_md()
@@ -3383,7 +3413,7 @@ impl RemCmdApp {
                         .cursor_pointer()
                         .hover(move |this| this.bg(hover))
                         .active(move |this| this.bg(pressed_background))
-                        .child(icon(IconName::Server, self.theme, IconTone::Default, 18.0))
+                        .child(self.render_sidebar_icon(IconName::Server, 18.0))
                         .child(
                             div()
                                 .flex_1()
@@ -3392,8 +3422,9 @@ impl RemCmdApp {
                                 .text_sm()
                                 .child(profile.name.clone()),
                         )
+                        .child(new_terminal_button)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_profile(profile_id.clone(), window, cx);
+                            this.select_profile(select_profile_id.clone(), window, cx);
                         })),
                 );
 
@@ -3422,7 +3453,7 @@ impl RemCmdApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .h(px(30.0))
+                            .h(px(32.0))
                             .ml(px(28.0))
                             .px_2()
                             .rounded_md()
@@ -3430,12 +3461,7 @@ impl RemCmdApp {
                             .cursor_pointer()
                             .hover(move |this| this.bg(hover))
                             .active(move |this| this.bg(pressed_background))
-                            .child(icon(
-                                IconName::Terminal,
-                                self.theme,
-                                IconTone::Default,
-                                16.0,
-                            ))
+                            .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
                             .child(
                                 div()
                                     .flex_1()
@@ -3444,6 +3470,22 @@ impl RemCmdApp {
                                     .text_sm()
                                     .text_color(self.theme.text_muted)
                                     .child(format!("Terminal {}", terminal_index + 1)),
+                            )
+                            .child(
+                                self.render_icon_button(
+                                    SharedString::from(format!("close-sidebar-tab-{}", tab_id.0)),
+                                    IconName::Cancel,
+                                    "Close terminal",
+                                    IconTone::Default,
+                                    true,
+                                )
+                                .size(px(24.0))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_tab(tab_id, cx);
+                                    },
+                                )),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if this.activate_tab_in_window(tab_id, window, cx) {
@@ -3479,7 +3521,7 @@ impl RemCmdApp {
         };
         let settings_footer = div()
             .flex_none()
-            .mt_2()
+            .mt_3()
             .pt_3()
             .border_t_1()
             .border_color(self.theme.border)
@@ -3488,21 +3530,16 @@ impl RemCmdApp {
                     .id("show_settings")
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(10.0))
                     .w_full()
-                    .px_3()
-                    .py_2()
+                    .h(px(34.0))
+                    .px_2()
                     .rounded_md()
                     .bg(settings_background)
                     .cursor_pointer()
                     .hover(move |this| this.bg(settings_hover))
                     .active(move |this| this.bg(pressed_background))
-                    .child(icon(
-                        IconName::Settings,
-                        self.theme,
-                        IconTone::Default,
-                        18.0,
-                    ))
+                    .child(self.render_sidebar_icon(IconName::Settings, 18.0))
                     .child("Settings")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_settings(cx);
@@ -3564,20 +3601,15 @@ impl RemCmdApp {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_2()
-                    .h(px(34.0))
-                    .mt_2()
+                    .gap(px(10.0))
+                    .h(px(36.0))
+                    .mt_3()
                     .px_2()
                     .rounded_md()
                     .cursor_pointer()
                     .hover(move |this| this.bg(list_hover_background))
                     .active(move |this| this.bg(pressed_background))
-                    .child(icon(
-                        IconName::NewConnection,
-                        self.theme,
-                        IconTone::Default,
-                        19.0,
-                    ))
+                    .child(self.render_sidebar_icon(IconName::NewConnection, 19.0))
                     .child("New Connection")
                     .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
             )
@@ -3594,9 +3626,7 @@ impl RemCmdApp {
             return self.render_settings(cx);
         }
 
-        let mut panel = self
-            .detail_panel_shell()
-            .child(self.render_session_tabs(cx));
+        let mut panel = self.detail_panel_shell();
 
         match selected_profile {
             Some(profile) => {
@@ -3724,12 +3754,12 @@ impl RemCmdApp {
                                 .gap_2()
                                 .pb_2()
                                 .child(
-                                    self.render_icon_button(
+                                    text_button(
                                         "save_profile",
-                                        IconName::Save,
                                         "Save",
-                                        IconTone::Accent,
+                                        TextButtonTone::Primary,
                                         true,
+                                        &self.theme,
                                     )
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
@@ -3738,12 +3768,12 @@ impl RemCmdApp {
                                     )),
                                 )
                                 .child(
-                                    self.render_icon_button(
+                                    text_button(
                                         "cancel_profile",
-                                        IconName::Cancel,
                                         "Cancel",
-                                        IconTone::Default,
+                                        TextButtonTone::Secondary,
                                         true,
+                                        &self.theme,
                                     )
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
@@ -3769,150 +3799,6 @@ impl RemCmdApp {
         }
 
         panel
-    }
-
-    fn render_session_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.tabs.is_empty() {
-            return div().id("session_tabs_empty");
-        }
-
-        let mut tabs = div()
-            .id("session_tabs")
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .h(px(36.0))
-            .mb_3()
-            .pb_1()
-            .overflow_x_scroll()
-            .border_b_1()
-            .border_color(self.theme.border);
-
-        for (tab_index, tab) in self.tabs.iter().enumerate() {
-            let tab_id = tab.id;
-            let is_active =
-                self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
-            let background = if is_active {
-                self.theme.list_selected_bg
-            } else {
-                self.theme.transparent
-            };
-            let hover_background = if is_active {
-                self.theme.list_selected_hover_bg
-            } else {
-                self.theme.list_hover_bg
-            };
-            let pressed_background = self.theme.control_pressed_bg;
-            let state = self
-                .tab_session(tab)
-                .map(|session| session.connection_state)
-                .unwrap_or(SessionState::Disconnected);
-            let status_color = match state {
-                SessionState::Connected => self.theme.status_ok,
-                SessionState::Failed => self.theme.error_text,
-                SessionState::Connecting
-                | SessionState::Authenticating
-                | SessionState::Disconnecting => self.theme.status_warn,
-                SessionState::Disconnected => self.theme.text_faint,
-            };
-            let mut label = self
-                .profiles
-                .iter()
-                .find(|profile| profile.id == tab.profile_id)
-                .map(|profile| profile.name.clone())
-                .unwrap_or_else(|| tab.profile_id.clone());
-            let duplicate_count = self
-                .tabs
-                .iter()
-                .filter(|candidate| candidate.profile_id == tab.profile_id)
-                .count();
-            if duplicate_count > 1 {
-                let duplicate_index = self.tabs[..=tab_index]
-                    .iter()
-                    .filter(|candidate| candidate.profile_id == tab.profile_id)
-                    .count();
-                label = format!("{label} #{duplicate_index}");
-            }
-
-            tabs = tabs.child(
-                div()
-                    .id(SharedString::from(format!("session-tab-{}", tab_id.0)))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .h(px(30.0))
-                    .min_w(px(120.0))
-                    .max_w(px(220.0))
-                    .px_2()
-                    .rounded_md()
-                    .bg(background)
-                    .cursor_pointer()
-                    .hover(move |this| this.bg(hover_background))
-                    .active(move |this| this.bg(pressed_background))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .bg(status_color),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_sm()
-                            .child(label),
-                    )
-                    .child(
-                        self.render_icon_button(
-                            SharedString::from(format!("close-session-tab-{}", tab_id.0)),
-                            IconName::Cancel,
-                            "Close terminal",
-                            IconTone::Default,
-                            true,
-                        )
-                        .size(px(22.0))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.close_tab(tab_id, cx);
-                        })),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.activate_tab_in_window(tab_id, window, cx) {
-                            cx.notify();
-                        }
-                    })),
-            );
-        }
-
-        let can_create_session = self.active_panel == ActivePanel::Connection
-            && self.selected_profile_id.is_some()
-            && self.credential_lookup_task.is_none()
-            && self
-                .selected_profile_id
-                .as_deref()
-                .is_none_or(|profile_id| {
-                    !self
-                        .credential_mutations_in_progress
-                        .contains_key(profile_id)
-                });
-        tabs = tabs.child(
-            self.render_icon_button(
-                "new_session_tab",
-                IconName::Add,
-                "New terminal",
-                IconTone::Default,
-                can_create_session,
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.connect_selected_profile_in_new_session(window, cx);
-            })),
-        );
-
-        tabs
     }
 
     fn detail_panel_shell(&self) -> gpui::Div {
@@ -3987,7 +3873,6 @@ impl RemCmdApp {
             });
 
         self.detail_panel_shell()
-            .child(self.render_session_tabs(cx))
             .child(
                 div()
                     .flex_none()

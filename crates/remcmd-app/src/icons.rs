@@ -20,14 +20,12 @@ pub(crate) enum IconName {
     ForgetCredential,
     NewConnection,
     Reconnect,
-    Save,
     Search,
     Server,
     Settings,
     SplitDown,
     SplitRight,
     Terminal,
-    Trust,
 }
 
 impl IconName {
@@ -45,14 +43,12 @@ impl IconName {
             Self::ForgetCredential => "icons/forget-credential.svg",
             Self::NewConnection => "icons/new-connection.svg",
             Self::Reconnect => "icons/reconnect.svg",
-            Self::Save => "icons/save.svg",
             Self::Search => "icons/search.svg",
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
             Self::SplitDown => "icons/split-down.svg",
             Self::SplitRight => "icons/split-right.svg",
             Self::Terminal => "icons/terminal.svg",
-            Self::Trust => "icons/trust.svg",
         }
     }
 
@@ -70,14 +66,12 @@ impl IconName {
             "icons/forget-credential.svg" => Self::ForgetCredential,
             "icons/new-connection.svg" => Self::NewConnection,
             "icons/reconnect.svg" => Self::Reconnect,
-            "icons/save.svg" => Self::Save,
             "icons/search.svg" => Self::Search,
             "icons/server.svg" => Self::Server,
             "icons/settings.svg" => Self::Settings,
             "icons/split-down.svg" => Self::SplitDown,
             "icons/split-right.svg" => Self::SplitRight,
             "icons/terminal.svg" => Self::Terminal,
-            "icons/trust.svg" => Self::Trust,
             _ => return None,
         })
     }
@@ -112,7 +106,6 @@ impl IconName {
             Self::Reconnect => {
                 r#"<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>"#
             }
-            Self::Save => r#"<path d="M20 6 9 17l-5-5"/>"#,
             Self::Search => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
             Self::Server => {
                 r#"<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>"#
@@ -128,9 +121,6 @@ impl IconName {
             }
             Self::Terminal => {
                 r#"<path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/>"#
-            }
-            Self::Trust => {
-                r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>"#
             }
         }
     }
