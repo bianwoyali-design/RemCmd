@@ -20,6 +20,7 @@ struct TestServerState {
     resized_size: Option<PtySize>,
     input: Vec<u8>,
     integration_input: Vec<u8>,
+    delay_integration_ready: bool,
 }
 
 /// Test server handler for one SSH connection.
@@ -108,11 +109,14 @@ impl server::Handler for TestServer {
             .windows(b"remcmd-shell-ready".len())
             .any(|window| window == b"remcmd-shell-ready")
         {
-            self.state
-                .lock()
-                .expect("test state lock")
-                .integration_input
-                .extend_from_slice(data);
+            let delay_ready = {
+                let mut state = self.state.lock().expect("test state lock");
+                state.integration_input.extend_from_slice(data);
+                state.delay_integration_ready
+            };
+            if delay_ready {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             session.data(channel, data.to_vec())?;
             session.data(channel, b"\n".to_vec())?;
             let (start, end) = super::INTEGRATION_READY_MARKER.split_at(11);
@@ -288,7 +292,7 @@ async fn interactive_shell_supports_pty_io_resize_and_exit() {
 
     let initial_size = PtySize::new(100, 30).with_pixels(1000, 600);
 
-    let shell = SshShell::open(&handle, initial_size, None)
+    let shell = SshShell::open(&handle, initial_size, false)
         .await
         .expect("interactive shell");
 
@@ -368,10 +372,17 @@ async fn shell_integration_preserves_native_shell_and_stays_hidden() {
             .success()
     );
 
-    let integration = crate::shell_integration::ShellIntegration::detect(b"/bin/bash").unwrap();
-    let shell = SshShell::open(&handle, PtySize::default(), Some(&integration))
-        .await
-        .expect("integrated shell");
+    state
+        .lock()
+        .expect("test state lock")
+        .delay_integration_ready = true;
+    let shell = tokio::time::timeout(
+        Duration::from_millis(250),
+        SshShell::open(&handle, PtySize::default(), true),
+    )
+    .await
+    .expect("opening the shell must not wait for the cwd marker")
+    .expect("integrated shell");
     let (mut reader, writer) = shell.split();
 
     assert_eq!(

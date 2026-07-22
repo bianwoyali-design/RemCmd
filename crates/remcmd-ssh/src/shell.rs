@@ -1,13 +1,10 @@
-use std::collections::VecDeque;
-
 use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty, client};
 
-use crate::{SshError, SshErrorKind, shell_integration::ShellIntegration};
+use crate::{SshError, SshErrorKind, shell_integration};
 
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
 const INTEGRATION_READY_MARKER: &[u8] = b"\x1b]777;remcmd-shell-ready\x07";
-const INTEGRATION_COMMAND_PREFIX: &str = " stty -echo; ";
-const INTEGRATION_READY_COMMAND: &str = "stty echo; printf '\\033]777;remcmd-shell-ready\\007'; __remcmd_last_cwd=$PWD; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
+const INTEGRATION_READY_COMMAND: &str = "stty echo; printf '\\033]777;remcmd-shell-ready\\007'; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
 
 /// Dimensions reported to the remote pseudo-terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +76,14 @@ pub enum ShellEvent {
 
 pub struct SshShell {
     channel: Channel<client::Msg>,
-    initial_events: VecDeque<ShellEvent>,
+    filter_integration_startup: bool,
 }
 
 impl SshShell {
     pub(crate) async fn open<H>(
         handle: &client::Handle<H>,
         size: PtySize,
-        shell_integration: Option<&ShellIntegration>,
+        install_cwd_hook: bool,
     ) -> Result<Self, SshError>
     where
         H: client::Handler,
@@ -96,7 +93,7 @@ impl SshShell {
             .await
             .map_err(SshError::from)?;
 
-        let terminal_modes = if shell_integration.is_some() {
+        let terminal_modes = if install_cwd_hook {
             vec![(Pty::ECHO, 0)]
         } else {
             Vec::new()
@@ -121,89 +118,19 @@ impl SshShell {
 
         Self::wait_for_request_success(&mut channel, "shell").await?;
 
-        let initial_events = if let Some(shell_integration) = shell_integration {
-            Self::install_shell_integration(&mut channel, shell_integration).await?
-        } else {
-            VecDeque::new()
-        };
+        if install_cwd_hook {
+            channel
+                .data_bytes(shell_integration::install_command(
+                    INTEGRATION_READY_COMMAND,
+                ))
+                .await
+                .map_err(SshError::from)?;
+        }
 
         Ok(Self {
             channel,
-            initial_events,
+            filter_integration_startup: install_cwd_hook,
         })
-    }
-
-    async fn install_shell_integration(
-        channel: &mut Channel<client::Msg>,
-        shell_integration: &ShellIntegration,
-    ) -> Result<VecDeque<ShellEvent>, SshError> {
-        let install_command = format!(
-            "{INTEGRATION_COMMAND_PREFIX}{}; {INTEGRATION_READY_COMMAND}",
-            shell_integration.install_command()
-        );
-        channel
-            .data_bytes(install_command.into_bytes())
-            .await
-            .map_err(SshError::from)?;
-
-        let (_, ready_output) = Self::read_until_marker(channel, INTEGRATION_READY_MARKER).await?;
-        let mut initial_events = VecDeque::new();
-
-        // The first prompt can span multiple lines, and there is no protocol
-        // boundary that reliably separates it from MOTD output. Drop all
-        // pre-marker output so installing the hook cannot duplicate a prompt.
-        if !ready_output.is_empty() {
-            initial_events.push_back(ShellEvent::Output(ready_output));
-        }
-
-        Ok(initial_events)
-    }
-
-    async fn read_until_marker(
-        channel: &mut Channel<client::Msg>,
-        marker: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), SshError> {
-        let mut output = Vec::new();
-
-        loop {
-            match channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    output.extend_from_slice(&data);
-                    if let Some(index) = find_bytes(&output, marker) {
-                        let after_marker = output.split_off(index + marker.len());
-                        output.truncate(index);
-                        return Ok((output, after_marker));
-                    }
-                }
-
-                Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    output.extend_from_slice(&data);
-                }
-
-                Some(ChannelMsg::Failure) => {
-                    return Err(SshError::new(
-                        SshErrorKind::Protocol,
-                        "server rejected shell integration input",
-                    ));
-                }
-
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    return Err(SshError::new(
-                        SshErrorKind::Protocol,
-                        format!("remote shell exited with status {exit_status} during startup"),
-                    ));
-                }
-
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    return Err(SshError::new(
-                        SshErrorKind::Network,
-                        "channel closed while installing shell integration",
-                    ));
-                }
-
-                Some(_) => {}
-            }
-        }
     }
 
     async fn wait_for_request_success(
@@ -250,7 +177,7 @@ impl SshShell {
         (
             SshShellReader {
                 read_half,
-                pending_events: self.initial_events,
+                startup_output: self.filter_integration_startup.then(Vec::new),
             },
             SshShellWriter { write_half },
         )
@@ -259,7 +186,7 @@ impl SshShell {
 
 pub struct SshShellReader {
     read_half: ChannelReadHalf,
-    pending_events: VecDeque<ShellEvent>,
+    startup_output: Option<Vec<u8>>,
 }
 
 pub struct SshShellWriter {
@@ -268,17 +195,29 @@ pub struct SshShellWriter {
 
 impl SshShellReader {
     pub async fn next_event(&mut self) -> ShellEvent {
-        if let Some(event) = self.pending_events.pop_front() {
-            return event;
-        }
-
         loop {
             match self.read_half.wait().await {
                 Some(ChannelMsg::Data { data }) => {
+                    if let Some(output) = self.startup_output.as_mut() {
+                        output.extend_from_slice(&data);
+                        let Some(index) = find_bytes(output, INTEGRATION_READY_MARKER) else {
+                            continue;
+                        };
+                        let visible = output.split_off(index + INTEGRATION_READY_MARKER.len());
+                        self.startup_output = None;
+                        if visible.is_empty() {
+                            continue;
+                        }
+                        return ShellEvent::Output(visible);
+                    }
                     return ShellEvent::Output(data.to_vec());
                 }
 
                 Some(ChannelMsg::ExtendedData { data, ext }) => {
+                    if let Some(output) = self.startup_output.as_mut() {
+                        output.extend_from_slice(&data);
+                        continue;
+                    }
                     return ShellEvent::ExtendedOutput {
                         code: ext,
                         data: data.to_vec(),
