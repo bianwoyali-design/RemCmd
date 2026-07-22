@@ -17,6 +17,7 @@ struct TestServerState {
     initial_size: Option<PtySize>,
     resized_size: Option<PtySize>,
     input: Vec<u8>,
+    integration_command: Option<String>,
 }
 
 /// Test server handler for one SSH connection.
@@ -80,6 +81,21 @@ impl server::Handler for TestServer {
         session.channel_success(channel)?;
 
         // Initial output will prove that ShellEvent::Output works.
+        session.data(channel, b"ready\r\n".to_vec())?;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.state
+            .lock()
+            .expect("test state lock")
+            .integration_command = Some(String::from_utf8_lossy(data).into_owned());
+        session.channel_success(channel)?;
         session.data(channel, b"ready\r\n".to_vec())?;
         Ok(())
     }
@@ -253,7 +269,7 @@ async fn interactive_shell_supports_pty_io_resize_and_exit() {
 
     let initial_size = PtySize::new(100, 30).with_pixels(1000, 600);
 
-    let shell = SshShell::open(&handle, initial_size)
+    let shell = SshShell::open(&handle, initial_size, None)
         .await
         .expect("interactive shell");
 
@@ -311,6 +327,57 @@ async fn interactive_shell_supports_pty_io_resize_and_exit() {
         .await
         .expect("test disconnect");
 
+    tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("test server should stop")
+        .expect("test server task");
+}
+
+#[tokio::test]
+async fn interactive_shell_can_start_through_shell_integration() {
+    let (address, server_task, state) = start_test_server().await;
+    let mut handle = client::connect(Arc::new(client::Config::default()), address, TestClient)
+        .await
+        .expect("test client connection");
+    assert!(
+        handle
+            .authenticate_none("tester")
+            .await
+            .expect("test authentication")
+            .success()
+    );
+
+    let integration = crate::shell_integration::ShellIntegration::detect(b"/bin/bash").unwrap();
+    let shell = SshShell::open(&handle, PtySize::default(), Some(&integration))
+        .await
+        .expect("integrated shell");
+    let (mut reader, writer) = shell.split();
+
+    assert_eq!(
+        reader.next_event().await,
+        ShellEvent::Output(b"ready\r\n".to_vec())
+    );
+    assert!(
+        state
+            .lock()
+            .expect("test state lock")
+            .integration_command
+            .as_deref()
+            .is_some_and(|command| command.contains("7;file://%s"))
+    );
+
+    writer
+        .send_input(b"exit\r".to_vec())
+        .await
+        .expect("exit command");
+    assert_eq!(reader.next_event().await, ShellEvent::ExitStatus(0));
+    assert_eq!(reader.next_event().await, ShellEvent::Eof);
+    assert_eq!(reader.next_event().await, ShellEvent::Closed);
+
+    handle
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .expect("test disconnect");
     tokio::time::timeout(Duration::from_secs(1), server_task)
         .await
         .expect("test server should stop")

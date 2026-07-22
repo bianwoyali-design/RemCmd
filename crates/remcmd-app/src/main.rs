@@ -211,6 +211,7 @@ struct ActiveTerminal {
     profile_id: String,
     engine: TerminalEngine,
     title: Option<String>,
+    remote_cwd: Option<String>,
     pty_size: PtySize,
     pending_pty_size: Option<PtySize>,
     cell_width: f32,
@@ -255,6 +256,7 @@ impl ActiveTerminal {
             profile_id,
             engine,
             title: None,
+            remote_cwd: None,
             pty_size: size,
             pending_pty_size: None,
             cell_width: f32::from(TERMINAL_CELL_WIDTH),
@@ -347,6 +349,8 @@ struct SftpBrowserState {
     error: Option<String>,
     next_request_id: u64,
     active_request_id: Option<u64>,
+    active_request_path: Option<String>,
+    resolved_source_path: Option<String>,
 }
 
 impl Default for SftpBrowserState {
@@ -359,15 +363,23 @@ impl Default for SftpBrowserState {
             error: None,
             next_request_id: 1,
             active_request_id: None,
+            active_request_path: None,
+            resolved_source_path: None,
         }
     }
 }
 
 impl SftpBrowserState {
-    fn begin_request(&mut self) -> u64 {
+    fn needs_request(&self, path: &str) -> bool {
+        self.active_request_path.as_deref() != Some(path)
+            && self.resolved_source_path.as_deref() != Some(path)
+    }
+
+    fn begin_request(&mut self, path: String) -> u64 {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         self.active_request_id = Some(request_id);
+        self.active_request_path = Some(path);
         self.loading = true;
         self.error = None;
         request_id
@@ -384,6 +396,7 @@ impl SftpBrowserState {
         self.loaded = true;
         self.error = None;
         self.active_request_id = None;
+        self.resolved_source_path = self.active_request_path.take();
         true
     }
 
@@ -395,12 +408,14 @@ impl SftpBrowserState {
         self.loading = false;
         self.error = Some(error);
         self.active_request_id = None;
+        self.active_request_path = None;
         true
     }
 
     fn stop_loading(&mut self) {
         self.loading = false;
         self.active_request_id = None;
+        self.active_request_path = None;
     }
 }
 
@@ -690,11 +705,19 @@ impl RemCmdApp {
     }
 
     fn ensure_sftp_directory(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let needs_load = self
-            .session(session_id)
-            .is_some_and(|session| !session.sftp.loaded && !session.sftp.loading);
+        let Some((path, needs_load)) = self.session(session_id).map(|session| {
+            let path = session
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.remote_cwd.clone())
+                .unwrap_or_else(|| ".".into());
+            let needs_load = session.sftp.needs_request(&path);
+            (path, needs_load)
+        }) else {
+            return;
+        };
         if needs_load {
-            self.request_sftp_directory(session_id, ".".into(), cx);
+            self.request_sftp_directory(session_id, path, cx);
         }
     }
 
@@ -722,7 +745,7 @@ impl RemCmdApp {
             let session = self
                 .session_mut(session_id)
                 .expect("SFTP session should still exist");
-            let request_id = session.sftp.begin_request();
+            let request_id = session.sftp.begin_request(path.clone());
             (request_id, path)
         };
 
@@ -2560,6 +2583,19 @@ impl RemCmdApp {
                     terminal.title = title;
                 }
             }
+            TerminalEvent::WorkingDirectoryChanged(path) => {
+                if let Some(terminal) = self
+                    .session_mut(session_id)
+                    .and_then(|session| session.terminal.as_mut())
+                {
+                    terminal.remote_cwd = Some(path);
+                }
+                if self.active_session_id == Some(session_id)
+                    && self.active_tab_view() == TerminalTabView::Files
+                {
+                    self.ensure_sftp_directory(session_id, cx);
+                }
+            }
             TerminalEvent::ClipboardStore {
                 clipboard,
                 contents,
@@ -3003,8 +3039,13 @@ impl RemCmdApp {
             .and_then(|pane| self.session(pane.session_id))
             .filter(|session| session.sftp.loaded)
             .map(|session| session.sftp.path.as_str());
+        let remote_cwd = self
+            .pane(tab.active_pane_id)
+            .and_then(|pane| self.session(pane.session_id))
+            .and_then(|session| session.terminal.as_ref())
+            .and_then(|terminal| terminal.remote_cwd.as_deref());
 
-        workspace_tab_title(tab.view, terminal_number, sftp_path)
+        workspace_tab_title(tab.view, terminal_number, sftp_path, remote_cwd)
     }
 
     fn render_titlebar_tabs(
@@ -5603,10 +5644,13 @@ fn workspace_tab_title(
     view: TerminalTabView,
     terminal_number: usize,
     sftp_path: Option<&str>,
+    remote_cwd: Option<&str>,
 ) -> String {
     match view {
-        TerminalTabView::Terminal => format!("Terminal {terminal_number}"),
-        TerminalTabView::Files => sftp_path.unwrap_or("Files").to_owned(),
+        TerminalTabView::Terminal => remote_cwd
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Terminal {terminal_number}")),
+        TerminalTabView::Files => sftp_path.or(remote_cwd).unwrap_or("Files").to_owned(),
     }
 }
 
@@ -5848,18 +5892,27 @@ mod tests {
     }
 
     #[test]
-    fn file_tab_title_uses_only_a_loaded_canonical_path() {
+    fn tab_title_prefers_the_path_for_its_active_view() {
         assert_eq!(
-            workspace_tab_title(TerminalTabView::Files, 1, Some("/home/test")),
+            workspace_tab_title(
+                TerminalTabView::Files,
+                1,
+                Some("/home/test"),
+                Some("/ignored")
+            ),
             "/home/test"
         );
         assert_eq!(
-            workspace_tab_title(TerminalTabView::Files, 1, None),
-            "Files"
+            workspace_tab_title(TerminalTabView::Files, 1, None, Some("/var/log")),
+            "/var/log"
         );
         assert_eq!(
-            workspace_tab_title(TerminalTabView::Terminal, 2, Some("/ignored")),
+            workspace_tab_title(TerminalTabView::Terminal, 2, Some("/ignored"), None),
             "Terminal 2"
+        );
+        assert_eq!(
+            workspace_tab_title(TerminalTabView::Terminal, 2, None, Some("/srv/app")),
+            "/srv/app"
         );
     }
 
@@ -5873,8 +5926,8 @@ mod tests {
     #[test]
     fn stale_sftp_response_does_not_replace_the_latest_directory() {
         let mut browser = SftpBrowserState::default();
-        let stale_request = browser.begin_request();
-        let current_request = browser.begin_request();
+        let stale_request = browser.begin_request("/stale".into());
+        let current_request = browser.begin_request("/current".into());
 
         assert!(!browser.complete_request(
             stale_request,
@@ -5891,7 +5944,27 @@ mod tests {
             },
         ));
         assert_eq!(browser.path, "/current");
+        assert_eq!(browser.resolved_source_path.as_deref(), Some("/current"));
         assert!(!browser.loading);
+    }
+
+    #[test]
+    fn canonical_sftp_result_remains_linked_to_its_shell_cwd_request() {
+        let mut browser = SftpBrowserState::default();
+        assert!(browser.needs_request("."));
+
+        let request = browser.begin_request(".".into());
+        assert!(!browser.needs_request("."));
+        assert!(browser.complete_request(
+            request,
+            RemoteDirectory {
+                path: "/home/test".into(),
+                entries: Vec::new(),
+            }
+        ));
+
+        assert!(!browser.needs_request("."));
+        assert!(browser.needs_request("/var/log"));
     }
 
     #[test]

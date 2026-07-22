@@ -1,6 +1,6 @@
 use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client};
 
-use crate::{SshError, SshErrorKind};
+use crate::{SshError, SshErrorKind, shell_integration::ShellIntegration};
 
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
 
@@ -77,7 +77,11 @@ pub struct SshShell {
 }
 
 impl SshShell {
-    pub(crate) async fn open<H>(handle: &client::Handle<H>, size: PtySize) -> Result<Self, SshError>
+    pub(crate) async fn open<H>(
+        handle: &client::Handle<H>,
+        size: PtySize,
+        shell_integration: Option<&ShellIntegration>,
+    ) -> Result<Self, SshError>
     where
         H: client::Handler,
     {
@@ -101,7 +105,14 @@ impl SshShell {
 
         Self::wait_for_request_success(&mut channel, "PTY").await?;
 
-        channel.request_shell(true).await.map_err(SshError::from)?;
+        if let Some(shell_integration) = shell_integration {
+            channel
+                .exec(true, shell_integration.launch_command())
+                .await
+                .map_err(SshError::from)?;
+        } else {
+            channel.request_shell(true).await.map_err(SshError::from)?;
+        }
 
         Self::wait_for_request_success(&mut channel, "shell").await?;
 

@@ -7,7 +7,7 @@ use std::{
 use directories::BaseDirs;
 use remcmd_core::ConnectionProfile;
 use russh::{
-    client,
+    ChannelMsg, client,
     keys::{
         Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, check_known_hosts,
         check_known_hosts_path,
@@ -21,12 +21,18 @@ use russh::keys::agent::{AgentIdentity, client::AgentClient};
 use russh_sftp::client::SftpSession;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::{AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell};
+use crate::{
+    AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell,
+    shell_integration::ShellIntegration,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHELL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHELL_DETECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHELL_DETECTION_COMMAND: &str = "printf '%s' \"$SHELL\"";
+const MAX_SHELL_PATH_BYTES: usize = 256;
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -525,9 +531,43 @@ impl SshTransport {
     }
 
     pub async fn open_shell(&self, size: PtySize) -> Result<SshShell, SshError> {
-        tokio::time::timeout(SHELL_OPEN_TIMEOUT, SshShell::open(&self.handle, size))
-            .await
-            .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote shell timed out"))?
+        tokio::time::timeout(SHELL_OPEN_TIMEOUT, async {
+            let shell_integration = self.detect_shell_integration().await;
+            SshShell::open(&self.handle, size, shell_integration.as_ref()).await
+        })
+        .await
+        .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote shell timed out"))?
+    }
+
+    async fn detect_shell_integration(&self) -> Option<ShellIntegration> {
+        tokio::time::timeout(SHELL_DETECTION_TIMEOUT, async {
+            let mut channel = self.handle.channel_open_session().await.ok()?;
+            channel.exec(true, SHELL_DETECTION_COMMAND).await.ok()?;
+
+            let mut accepted = false;
+            let mut succeeded = true;
+            let mut output = Vec::new();
+            while let Some(message) = channel.wait().await {
+                match message {
+                    ChannelMsg::Success => accepted = true,
+                    ChannelMsg::Failure => return None,
+                    ChannelMsg::Data { data } => {
+                        let remaining = MAX_SHELL_PATH_BYTES.saturating_sub(output.len());
+                        output.extend_from_slice(&data[..data.len().min(remaining)]);
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => succeeded = exit_status == 0,
+                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+
+            (accepted && succeeded)
+                .then(|| ShellIntegration::detect(&output))
+                .flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub(crate) async fn open_sftp(&self) -> Result<SftpSession, SshError> {

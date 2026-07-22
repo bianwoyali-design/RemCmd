@@ -5,6 +5,7 @@ mod host_key;
 mod session;
 mod sftp;
 mod shell;
+mod shell_integration;
 mod transport;
 
 pub use auth::AuthMethod;

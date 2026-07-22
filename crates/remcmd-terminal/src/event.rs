@@ -84,6 +84,7 @@ impl Debug for TextAreaSizeRequest {
 pub enum TerminalEvent {
     MouseCursorDirty,
     TitleChanged(Option<String>),
+    WorkingDirectoryChanged(String),
     ClipboardStore {
         clipboard: Clipboard,
         contents: String,
@@ -101,19 +102,23 @@ pub enum TerminalEvent {
 
 #[derive(Clone, Default)]
 pub(crate) struct EventQueue {
-    events: Arc<Mutex<VecDeque<Event>>>,
+    events: Arc<Mutex<VecDeque<TerminalEvent>>>,
 }
 
 impl EventQueue {
     pub(crate) fn drain(&self) -> Vec<TerminalEvent> {
         let mut events = lock_unpoisoned(&self.events);
-        events.drain(..).map(TerminalEvent::from).collect()
+        events.drain(..).collect()
+    }
+
+    pub(crate) fn push(&self, event: TerminalEvent) {
+        lock_unpoisoned(&self.events).push_back(event);
     }
 }
 
 impl EventListener for EventQueue {
     fn send_event(&self, event: Event) {
-        lock_unpoisoned(&self.events).push_back(event);
+        self.push(TerminalEvent::from(event));
     }
 }
 

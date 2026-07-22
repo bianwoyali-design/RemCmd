@@ -10,12 +10,15 @@ use alacritty_terminal::vte::ansi::{
     NamedColor as AlacrittyNamedColor, Processor, Rgb as AlacrittyRgb,
 };
 
-use crate::event::{EventQueue, TerminalEvent};
 use crate::screen::{
     CellAttributes, CursorShape, DamageRange, Hyperlink, InvalidTerminalSize, NamedColor,
     Osc52Mode, PALETTE_SIZE, PaletteOverrides, Rgb, Scroll, TerminalCell, TerminalColor,
     TerminalConfig, TerminalCursor, TerminalDamage, TerminalModes, TerminalSize, TerminalSnapshot,
     UnderlineStyle,
+};
+use crate::{
+    cwd::Osc7Parser,
+    event::{EventQueue, TerminalEvent},
 };
 
 const MIN_RIGHT_ALIGNED_GAP: usize = 8;
@@ -24,6 +27,7 @@ const MAX_RIGHT_MARGIN: usize = 2;
 
 pub struct TerminalEngine {
     parser: Processor,
+    cwd_parser: Osc7Parser,
     terminal: Term<EventQueue>,
     events: EventQueue,
     size: TerminalSize,
@@ -45,6 +49,7 @@ impl TerminalEngine {
 
         Ok(Self {
             parser: Processor::new(),
+            cwd_parser: Osc7Parser::default(),
             terminal,
             events,
             size,
@@ -52,7 +57,17 @@ impl TerminalEngine {
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.terminal, bytes);
+        let cwd_events = self.cwd_parser.advance(bytes);
+        let mut start_offset = 0;
+        for event in cwd_events {
+            self.parser
+                .advance(&mut self.terminal, &bytes[start_offset..event.end_offset]);
+            self.events
+                .push(TerminalEvent::WorkingDirectoryChanged(event.path));
+            start_offset = event.end_offset;
+        }
+        self.parser
+            .advance(&mut self.terminal, &bytes[start_offset..]);
     }
 
     pub fn resize(&mut self, columns: usize, rows: usize) -> Result<(), InvalidTerminalSize> {
@@ -695,6 +710,33 @@ mod tests {
             .expect("cursor position response");
         assert!(title_index < response_index);
         assert!(terminal.drain_events().is_empty());
+    }
+
+    #[test]
+    fn preserves_cwd_order_with_other_terminal_events() {
+        let mut terminal = terminal(8, 2);
+        terminal.process(b"\x1b]2;Before\x07\x1b]7;file://server/home/test\x07\x1b]2;After\x07");
+
+        let events = terminal.drain_events();
+        let before = events
+            .iter()
+            .position(|event| {
+                matches!(event, TerminalEvent::TitleChanged(Some(title)) if title == "Before")
+            })
+            .expect("first title event");
+        let cwd = events
+            .iter()
+            .position(|event| {
+                matches!(event, TerminalEvent::WorkingDirectoryChanged(path) if path == "/home/test")
+            })
+            .expect("cwd event");
+        let after = events
+            .iter()
+            .position(|event| {
+                matches!(event, TerminalEvent::TitleChanged(Some(title)) if title == "After")
+            })
+            .expect("second title event");
+        assert!(before < cwd && cwd < after);
     }
 
     #[test]
