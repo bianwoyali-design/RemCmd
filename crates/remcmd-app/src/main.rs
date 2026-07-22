@@ -42,8 +42,9 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollHandle,
     ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowOptions, canvas,
-    div, ease_in_out, ease_out_quint, img, point, prelude::*, px, rgb, size,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowOptions, canvas, div, ease_in_out, ease_out_quint, img, point, prelude::*, px, rgb, size,
+    uniform_list,
 };
 use secrecy::SecretString;
 
@@ -412,6 +413,7 @@ struct SftpBrowserState {
     active_request_id: Option<u64>,
     active_request_path: Option<String>,
     resolved_source_path: Option<String>,
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl Default for SftpBrowserState {
@@ -427,6 +429,7 @@ impl Default for SftpBrowserState {
             active_request_id: None,
             active_request_path: None,
             resolved_source_path: None,
+            scroll_handle: UniformListScrollHandle::new(),
         }
     }
 }
@@ -447,6 +450,9 @@ impl SftpBrowserState {
     fn begin_request(&mut self, path: String) -> u64 {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
+        if !self.loaded || self.path != path {
+            self.scroll_handle = UniformListScrollHandle::new();
+        }
         self.active_request_id = Some(request_id);
         self.active_request_path = Some(path);
         self.loading = true;
@@ -5994,113 +6000,51 @@ impl RemCmdApp {
         }
         let browser_state = session.sftp_browser(placement);
         let path = browser_state.path.clone();
-        let entries = browser_state.entries.clone();
+        let entry_count = browser_state.entries.len();
+        let scroll_handle = browser_state.scroll_handle.clone();
         let loading = browser_state.loading;
         let loaded = browser_state.loaded;
         let error = browser_state.error.clone();
         let connected = session.connection_state == SessionState::Connected;
         let can_go_up = connected && remote_parent_path(&path).is_some() && !loading;
-        let list_hover = self.theme.list_hover_bg;
-        let pressed = self.theme.control_pressed_bg;
         let element_suffix = placement.element_suffix();
+        let list_id = SharedString::from(format!("sftp_directory_entries_{element_suffix}"));
 
-        let mut list = div()
-            .id(SharedString::from(format!(
-                "sftp_directory_entries_{element_suffix}"
-            )))
-            .flex()
-            .flex_col()
+        let list = if !loaded && loading {
+            div()
+                .id(list_id)
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(self.theme.text_muted)
+                .child("Loading remote files...")
+                .into_any_element()
+        } else if loaded && entry_count == 0 {
+            div()
+                .id(list_id)
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(self.theme.text_muted)
+                .child("This directory is empty")
+                .into_any_element()
+        } else {
+            uniform_list(
+                list_id,
+                entry_count,
+                cx.processor(move |this, range: Range<usize>, _, cx| {
+                    this.render_sftp_entry_rows(session_id, placement, range, cx)
+                }),
+            )
             .flex_1()
             .min_h(px(0.0))
-            .overflow_y_scroll();
-
-        if !loaded && loading {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(self.theme.text_muted)
-                    .child("Loading remote files..."),
-            );
-        } else if loaded && entries.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(self.theme.text_muted)
-                    .child("This directory is empty"),
-            );
-        } else {
-            for entry in entries {
-                let is_directory = entry.kind == RemoteFileKind::Directory;
-                let is_file = entry.kind == RemoteFileKind::File;
-                let entry_path = entry.path.clone();
-                let icon_name = if is_directory {
-                    IconName::Folder
-                } else {
-                    IconName::File
-                };
-                let size = if is_directory {
-                    "-".into()
-                } else {
-                    entry
-                        .size
-                        .map(format_remote_size)
-                        .unwrap_or_else(|| "-".into())
-                };
-                let mut row = div()
-                    .id(SharedString::from(format!(
-                        "sftp-entry-{element_suffix}-{}",
-                        entry.path
-                    )))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .h(px(36.0))
-                    .px_3()
-                    .border_b_1()
-                    .border_color(self.theme.border)
-                    .child(self.render_sidebar_icon(icon_name, 16.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_sm()
-                            .child(entry.name),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(88.0))
-                            .text_right()
-                            .text_sm()
-                            .text_color(self.theme.text_muted)
-                            .child(size),
-                    );
-                if (is_directory || is_file) && connected && !loading {
-                    row = row
-                        .cursor_pointer()
-                        .hover(move |this| this.bg(list_hover))
-                        .active(move |this| this.bg(pressed))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if is_directory {
-                                this.open_remote_directory(placement, entry_path.clone(), cx);
-                            } else {
-                                this.open_remote_file(entry_path.clone(), cx);
-                            }
-                        }));
-                }
-                list = list.child(row);
-            }
-        }
+            .track_scroll(scroll_handle)
+            .into_any_element()
+        };
 
         let mut parent_button = self.render_icon_button(
             SharedString::from(format!("sftp_parent_directory_{element_suffix}")),
@@ -6190,6 +6134,99 @@ impl RemCmdApp {
         }
 
         browser.child(list).into_any_element()
+    }
+
+    fn render_sftp_entry_rows(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some((entries, connected, loading)) = self.session(session_id).map(|session| {
+            let browser = session.sftp_browser(placement);
+            let entries = browser
+                .entries
+                .get(range)
+                .map_or_else(Vec::new, <[RemoteFileEntry]>::to_vec);
+            (
+                entries,
+                session.connection_state == SessionState::Connected,
+                browser.loading,
+            )
+        }) else {
+            return Vec::new();
+        };
+        let list_hover = self.theme.list_hover_bg;
+        let pressed = self.theme.control_pressed_bg;
+        let element_suffix = placement.element_suffix();
+        let mut rows = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            let is_directory = entry.kind == RemoteFileKind::Directory;
+            let is_file = entry.kind == RemoteFileKind::File;
+            let entry_path = entry.path.clone();
+            let icon_name = if is_directory {
+                IconName::Folder
+            } else {
+                IconName::File
+            };
+            let size = if is_directory {
+                "-".into()
+            } else {
+                entry
+                    .size
+                    .map(format_remote_size)
+                    .unwrap_or_else(|| "-".into())
+            };
+            let mut row = div()
+                .id(SharedString::from(format!(
+                    "sftp-entry-{element_suffix}-{}",
+                    entry.path
+                )))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .h(px(36.0))
+                .px_3()
+                .border_b_1()
+                .border_color(self.theme.border)
+                .child(self.render_sidebar_icon(icon_name, 16.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_sm()
+                        .child(entry.name),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(88.0))
+                        .text_right()
+                        .text_sm()
+                        .text_color(self.theme.text_muted)
+                        .child(size),
+                );
+            if (is_directory || is_file) && connected && !loading {
+                row = row
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(list_hover))
+                    .active(move |this| this.bg(pressed))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if is_directory {
+                            this.open_remote_directory(placement, entry_path.clone(), cx);
+                        } else {
+                            this.open_remote_file(entry_path.clone(), cx);
+                        }
+                    }));
+            }
+            rows.push(row.into_any_element());
+        }
+
+        rows
     }
 
     fn render_sftp_file(&self, session_id: SessionId, cx: &mut Context<Self>) -> AnyElement {
