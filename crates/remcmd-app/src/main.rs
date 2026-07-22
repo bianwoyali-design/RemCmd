@@ -6015,6 +6015,8 @@ impl RemCmdApp {
                 .id(list_id)
                 .flex()
                 .flex_1()
+                .min_h(px(0.0))
+                .w_full()
                 .items_center()
                 .justify_center()
                 .text_sm()
@@ -6026,6 +6028,8 @@ impl RemCmdApp {
                 .id(list_id)
                 .flex()
                 .flex_1()
+                .min_h(px(0.0))
+                .w_full()
                 .items_center()
                 .justify_center()
                 .text_sm()
@@ -6033,17 +6037,24 @@ impl RemCmdApp {
                 .child("This directory is empty")
                 .into_any_element()
         } else {
-            uniform_list(
-                list_id,
-                entry_count,
-                cx.processor(move |this, range: Range<usize>, _, cx| {
-                    this.render_sftp_entry_rows(session_id, placement, range, cx)
-                }),
-            )
-            .flex_1()
-            .min_h(px(0.0))
-            .track_scroll(scroll_handle)
-            .into_any_element()
+            div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_hidden()
+                .child(
+                    uniform_list(
+                        list_id,
+                        entry_count,
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            this.render_sftp_entry_rows(session_id, placement, range, cx)
+                        }),
+                    )
+                    .size_full()
+                    .track_scroll(scroll_handle),
+                )
+                .into_any_element()
         };
 
         let mut parent_button = self.render_icon_button(
@@ -6186,6 +6197,8 @@ impl RemCmdApp {
                 )))
                 .flex()
                 .flex_none()
+                .w_full()
+                .min_w(px(0.0))
                 .items_center()
                 .gap_2()
                 .h(px(36.0))
