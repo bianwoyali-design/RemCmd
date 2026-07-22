@@ -71,10 +71,19 @@ const TERMINAL_ROWS: u32 = 24;
 const TERMINAL_CELL_WIDTH: u16 = 8;
 const TERMINAL_CELL_HEIGHT: u16 = 19;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
-const SIDEBAR_WIDTH: f32 = 300.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 300.0;
+const SIDEBAR_MIN_WIDTH: f32 = 220.0;
+const SIDEBAR_MAX_WIDTH: f32 = 480.0;
+const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
+const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 340.0;
+const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 260.0;
+const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 520.0;
+const MIN_DETAIL_PANEL_WIDTH: f32 = 180.0;
+const COLLAPSED_TITLEBAR_LEADING_WIDTH: f32 = 132.0;
 const TITLEBAR_HEIGHT: f32 = 52.0;
 const TITLEBAR_TAB_HEIGHT: f32 = 30.0;
 const TITLEBAR_TAB_GROUP_HEIGHT: f32 = 36.0;
+const TITLEBAR_ACTION_GROUP_WIDTH: f32 = 67.0;
 const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
 const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
 const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
@@ -118,6 +127,14 @@ struct RemCmdApp {
     sidebar_search: Entity<TextField>,
     sidebar_search_visible: bool,
     connections_expanded: bool,
+    sidebar_width: f32,
+    left_sidebar_open: bool,
+    left_sidebar_transition_id: u64,
+    sidebar_resize: Option<SidebarResize>,
+    right_sidebar_open: bool,
+    right_sidebar_width: f32,
+    right_sidebar_resize: Option<SidebarResize>,
+    right_sidebar_transition_id: u64,
     credential_lookup_task: Option<Task<()>>,
     credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
@@ -343,6 +360,12 @@ enum TerminalTabView {
     #[default]
     Terminal,
     Files,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SidebarResize {
+    start_x: Pixels,
+    start_width: f32,
 }
 
 struct SftpBrowserState {
@@ -746,6 +769,14 @@ impl RemCmdApp {
             sidebar_search,
             sidebar_search_visible: false,
             connections_expanded: true,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            left_sidebar_open: true,
+            left_sidebar_transition_id: 0,
+            sidebar_resize: None,
+            right_sidebar_open: false,
+            right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
+            right_sidebar_resize: None,
+            right_sidebar_transition_id: 0,
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
@@ -829,6 +860,155 @@ impl RemCmdApp {
         self.active_tab().map(|tab| tab.view).unwrap_or_default()
     }
 
+    fn effective_sidebar_width(&self, window: &Window) -> f32 {
+        clamp_sidebar_width(
+            self.sidebar_width,
+            f32::from(window.viewport_size().width),
+            0.0,
+        )
+    }
+
+    fn effective_right_sidebar_width(&self, window: &Window) -> f32 {
+        let viewport_width = f32::from(window.viewport_size().width);
+        let left_sidebar_width = if self.left_sidebar_open {
+            clamp_sidebar_width(self.sidebar_width, viewport_width, 0.0)
+        } else {
+            0.0
+        };
+        clamp_right_sidebar_width(self.right_sidebar_width, viewport_width, left_sidebar_width)
+    }
+
+    fn titlebar_leading_width(&self, window: &Window) -> f32 {
+        if self.left_sidebar_open {
+            self.effective_sidebar_width(window)
+        } else {
+            COLLAPSED_TITLEBAR_LEADING_WIDTH
+        }
+    }
+
+    fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.left_sidebar_open = !self.left_sidebar_open;
+        self.left_sidebar_transition_id += 1;
+        self.sidebar_resize = None;
+        cx.notify();
+    }
+
+    fn begin_sidebar_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_resize = Some(SidebarResize {
+            start_x: event.position.x,
+            start_width: self.effective_sidebar_width(window),
+        });
+        cx.stop_propagation();
+    }
+
+    fn resize_sidebar(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.sidebar_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.sidebar_resize = None;
+            return;
+        }
+
+        let requested_width = resize.start_width + f32::from(event.position.x - resize.start_x);
+        let width = clamp_sidebar_width(
+            requested_width,
+            f32::from(window.viewport_size().width),
+            0.0,
+        );
+        if self.sidebar_width != width {
+            self.sidebar_width = width;
+            cx.notify();
+        }
+    }
+
+    fn finish_sidebar_resize(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn begin_right_sidebar_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_sidebar_resize = Some(SidebarResize {
+            start_x: event.position.x,
+            start_width: self.effective_right_sidebar_width(window),
+        });
+        cx.stop_propagation();
+    }
+
+    fn resize_right_sidebar(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.right_sidebar_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.right_sidebar_resize = None;
+            return;
+        }
+
+        let requested_width = resize.start_width + f32::from(resize.start_x - event.position.x);
+        let width = clamp_right_sidebar_width(
+            requested_width,
+            f32::from(window.viewport_size().width),
+            if self.left_sidebar_open {
+                self.effective_sidebar_width(window)
+            } else {
+                0.0
+            },
+        );
+        if self.right_sidebar_width != width {
+            self.right_sidebar_width = width;
+            cx.notify();
+        }
+    }
+
+    fn finish_right_sidebar_resize(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_sidebar_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.right_sidebar_open = !self.right_sidebar_open;
+        self.right_sidebar_transition_id += 1;
+        self.right_sidebar_resize = None;
+        if self.right_sidebar_open {
+            if let Some(tab_id) = self.active_tab_id
+                && let Some(tab) = self.tab_mut(tab_id)
+            {
+                tab.view = TerminalTabView::Terminal;
+            }
+            if let Some(session_id) = self.active_session_id {
+                self.ensure_sftp_directory(session_id, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn set_active_tab_view(
         &mut self,
         view: TerminalTabView,
@@ -843,6 +1023,13 @@ impl RemCmdApp {
         };
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.view = view;
+        }
+
+        if view == TerminalTabView::Files {
+            if self.right_sidebar_open {
+                self.right_sidebar_transition_id += 1;
+            }
+            self.right_sidebar_open = false;
         }
 
         match view {
@@ -1231,9 +1418,10 @@ impl RemCmdApp {
         if profile_changed {
             self.load_editor_for_selected_profile(cx);
         }
-        if self
-            .tab(tab_id)
-            .is_some_and(|tab| tab.view == TerminalTabView::Files)
+        if self.right_sidebar_open
+            || self
+                .tab(tab_id)
+                .is_some_and(|tab| tab.view == TerminalTabView::Files)
         {
             self.ensure_sftp_directory(session_id, cx);
         }
@@ -2013,7 +2201,9 @@ impl RemCmdApp {
             return;
         };
         if self.block_close_for_unsaved_file(session_id, cx) {
-            if let Some(tab) = self.tab_mut(tab_id) {
+            if !self.right_sidebar_open
+                && let Some(tab) = self.tab_mut(tab_id)
+            {
                 tab.view = TerminalTabView::Files;
             }
             return;
@@ -2942,7 +3132,7 @@ impl RemCmdApp {
                     terminal.remote_cwd = Some(path);
                 }
                 if self.active_session_id == Some(session_id)
-                    && self.active_tab_view() == TerminalTabView::Files
+                    && (self.right_sidebar_open || self.active_tab_view() == TerminalTabView::Files)
                 {
                     self.ensure_sftp_directory(session_id, cx);
                 }
@@ -3303,20 +3493,107 @@ impl RemCmdApp {
 impl Render for RemCmdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_profile = self.selected_profile().cloned();
+        let right_sidebar_width = self.effective_right_sidebar_width(window);
+        let sidebar_width = self.effective_sidebar_width(window);
         let should_focus_terminal = self.active_panel == ActivePanel::Connection
             && self.active_tab_view() == TerminalTabView::Terminal
+            && !self.right_sidebar_open
             && selected_profile
                 .as_ref()
                 .is_some_and(|profile| self.is_terminal_visible(&profile.id));
 
         let mut root = div()
+            .id("remcmd_root")
             .relative()
             .flex()
             .size_full()
             .text_color(self.theme.text_primary)
-            .child(self.render_sidebar(cx))
-            .child(self.render_detail_panel(selected_profile, cx))
-            .child(self.render_titlebar_tabs(window, cx));
+            .on_mouse_move(cx.listener(Self::resize_sidebar))
+            .on_mouse_move(cx.listener(Self::resize_right_sidebar))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_sidebar_resize))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::finish_right_sidebar_resize),
+            );
+
+        let left_sidebar_open = self.left_sidebar_open;
+        let left_transition_id = self.left_sidebar_transition_id;
+        let left_start_width = if left_transition_id == 0 || left_sidebar_open {
+            0.0
+        } else {
+            sidebar_width
+        };
+        let left_end_width = if left_sidebar_open {
+            sidebar_width
+        } else {
+            0.0
+        };
+        root = root.child(
+            div()
+                .flex()
+                .flex_none()
+                .h_full()
+                .overflow_hidden()
+                .child(self.render_sidebar(sidebar_width, cx))
+                .with_animation(
+                    SharedString::from(format!(
+                        "left-sidebar-layout-{left_transition_id}-{left_sidebar_open}"
+                    )),
+                    Animation::new(if left_transition_id == 0 {
+                        Duration::from_millis(1)
+                    } else {
+                        Duration::from_millis(180)
+                    })
+                    .with_easing(ease_in_out),
+                    move |this, delta| {
+                        this.w(px(
+                            left_start_width + (left_end_width - left_start_width) * delta
+                        ))
+                    },
+                ),
+        );
+        root = root.child(self.render_detail_panel(selected_profile, cx));
+        let right_sidebar_open = self.right_sidebar_open;
+        let right_transition_id = self.right_sidebar_transition_id;
+        let right_start_width = if right_transition_id == 0 || right_sidebar_open {
+            0.0
+        } else {
+            right_sidebar_width
+        };
+        let right_end_width = if right_sidebar_open {
+            right_sidebar_width
+        } else {
+            0.0
+        };
+        let mut right_sidebar = div().flex().flex_none().h_full().overflow_hidden();
+        if right_sidebar_open {
+            right_sidebar = right_sidebar.child(self.render_right_sidebar(right_sidebar_width, cx));
+        }
+        root = root.child(
+            right_sidebar.with_animation(
+                SharedString::from(format!(
+                    "right-sidebar-layout-{right_transition_id}-{right_sidebar_open}"
+                )),
+                Animation::new(if right_transition_id == 0 {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(180)
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| {
+                    this.w(px(
+                        right_start_width + (right_end_width - right_start_width) * delta
+                    ))
+                },
+            ),
+        );
+        root = root.child(self.render_titlebar_tabs(window, cx));
+        if self.left_sidebar_open {
+            root = root.child(self.render_sidebar_resize_handle(sidebar_width, cx));
+        }
+        if self.right_sidebar_open {
+            root = root.child(self.render_right_sidebar_resize_handle(right_sidebar_width, cx));
+        }
 
         if self
             .active_session()
@@ -3397,6 +3674,121 @@ impl RemCmdApp {
             .into_any_element()
     }
 
+    fn render_titlebar_sidebar_symbol(&self, left: bool) -> AnyElement {
+        icon(
+            if left {
+                IconName::SidebarLeft
+            } else {
+                IconName::SidebarRight
+            },
+            self.theme,
+            IconTone::Default,
+            17.0,
+        )
+    }
+
+    fn render_titlebar_sidebar_button(
+        &self,
+        id: &'static str,
+        left: bool,
+        tooltip: &'static str,
+        selected: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        icon_button(
+            id,
+            self.render_titlebar_sidebar_symbol(left),
+            IconTone::Default,
+            true,
+            &theme,
+        )
+        .size(px(TITLEBAR_TAB_HEIGHT))
+        .rounded_full()
+        .bg(if selected {
+            theme.control_bg
+        } else {
+            theme.transparent
+        })
+        .tooltip(move |_, cx| -> AnyView {
+            cx.new(|_| CommandTooltip {
+                label: tooltip.into(),
+                theme,
+            })
+            .into()
+        })
+    }
+
+    fn render_titlebar_action_group(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_create_terminal = self.active_panel == ActivePanel::Connection
+            && self.selected_profile_id.is_some()
+            && self.credential_lookup_task.is_none()
+            && self
+                .selected_profile_id
+                .as_deref()
+                .is_none_or(|profile_id| {
+                    !self
+                        .credential_mutations_in_progress
+                        .contains_key(profile_id)
+                });
+        let mut new_terminal = self.render_icon_button(
+            "new-titlebar-terminal",
+            IconName::Add,
+            "New terminal",
+            IconTone::Default,
+            can_create_terminal,
+        );
+        if can_create_terminal {
+            new_terminal = new_terminal.on_click(cx.listener(|this, _, window, cx| {
+                this.connect_selected_profile_in_new_session(window, cx);
+            }));
+        }
+
+        let right_sidebar = self
+            .render_titlebar_sidebar_button(
+                "toggle_right_sidebar",
+                false,
+                "Toggle SFTP sidebar",
+                self.right_sidebar_open,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)));
+
+        div()
+            .id("titlebar_action_group")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
+            .p(px(3.0))
+            .rounded_full()
+            .border_1()
+            .border_color(self.theme.titlebar_add_border)
+            .bg(self.theme.titlebar_tab_selected_bg)
+            .shadow(vec![
+                BoxShadow {
+                    color: self.theme.titlebar_add_shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(2.0),
+                    spread_radius: px(-0.5),
+                },
+                BoxShadow {
+                    color: self.theme.titlebar_add_shadow,
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(7.0),
+                    spread_radius: px(-2.5),
+                },
+            ])
+            .overflow_hidden()
+            .child(new_terminal.size(px(TITLEBAR_TAB_HEIGHT)).rounded_full())
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h(px(18.0))
+                    .bg(self.theme.titlebar_tab_separator),
+            )
+            .child(right_sidebar)
+    }
+
     fn terminal_tab_title(&self, tab: &TerminalTab) -> String {
         let terminal_number = self
             .tabs
@@ -3419,30 +3811,119 @@ impl RemCmdApp {
         workspace_tab_title(tab.view, terminal_number, sftp_path, remote_cwd)
     }
 
+    fn animate_titlebar_right_edge(
+        &self,
+        titlebar: gpui::Stateful<gpui::Div>,
+        expanded_width: f32,
+    ) -> impl IntoElement {
+        let transition_id = self.right_sidebar_transition_id;
+        let open = self.right_sidebar_open;
+        let start_width = if transition_id == 0 || open {
+            0.0
+        } else {
+            expanded_width
+        };
+        let end_width = if open { expanded_width } else { 0.0 };
+
+        titlebar.with_animation(
+            SharedString::from(format!("titlebar-right-edge-{transition_id}-{open}")),
+            Animation::new(if transition_id == 0 {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(180)
+            })
+            .with_easing(ease_in_out),
+            move |this, delta| this.right(px(start_width + (end_width - start_width) * delta)),
+        )
+    }
+
     fn render_titlebar_tabs(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> impl IntoElement {
         let drag_area = || {
             div()
                 .flex_none()
                 .h_full()
                 .window_control_area(WindowControlArea::Drag)
         };
+        let leading_width = self.titlebar_leading_width(window);
+        let expanded_right_sidebar_width = self.effective_right_sidebar_width(window);
+        let titlebar_right_inset = if self.right_sidebar_open {
+            expanded_right_sidebar_width
+        } else {
+            0.0
+        };
+        let leading_start_width = if self.left_sidebar_transition_id == 0 {
+            leading_width
+        } else if self.left_sidebar_open {
+            COLLAPSED_TITLEBAR_LEADING_WIDTH
+        } else {
+            self.effective_sidebar_width(window)
+        };
+        let leading_transition_id = self.left_sidebar_transition_id;
+        let left_sidebar_open = self.left_sidebar_open;
+        let left_sidebar_button = self
+            .render_titlebar_sidebar_button(
+                "toggle_left_sidebar",
+                true,
+                "Toggle sidebar",
+                self.left_sidebar_open,
+            )
+            .rounded_full()
+            .border_1()
+            .border_color(self.theme.titlebar_add_border)
+            .bg(self.theme.titlebar_tab_selected_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.titlebar_add_shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(5.0),
+                spread_radius: px(-2.0),
+            }])
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_left_sidebar(cx)));
+        let leading = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .w(px(leading_width))
+            .h_full()
+            .child(drag_area().flex_1())
+            .child(left_sidebar_button)
+            .child(drag_area().w(px(13.0)))
+            .with_animation(
+                SharedString::from(format!(
+                    "titlebar-leading-{leading_transition_id}-{left_sidebar_open}"
+                )),
+                Animation::new(if leading_transition_id == 0 {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(180)
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| {
+                    this.w(px(
+                        leading_start_width + (leading_width - leading_start_width) * delta
+                    ))
+                },
+            );
         let titlebar = div()
             .id("window_titlebar")
             .absolute()
-            .top_0()
+            .top(px(-1.0))
             .left_0()
             .right_0()
             .h(px(TITLEBAR_HEIGHT))
             .flex()
             .items_center()
-            .child(drag_area().w(px(SIDEBAR_WIDTH)));
+            .child(leading);
 
         if self.tab_layout == TabLayout::Vertical {
-            return titlebar.child(drag_area().flex_1());
+            let titlebar = titlebar
+                .child(drag_area().flex_1())
+                .child(self.render_titlebar_action_group(cx))
+                .child(drag_area().w(px(12.0)));
+            return self.animate_titlebar_right_edge(titlebar, expanded_right_sidebar_width);
         }
 
         let tab_labels = self
@@ -3455,10 +3936,11 @@ impl RemCmdApp {
             .map(|label| estimated_titlebar_label_width(label) + 68.0)
             .fold(TITLEBAR_TAB_ICON_ONLY_WIDTH, f32::max);
         let track_width = (f32::from(window.viewport_size().width)
-            - SIDEBAR_WIDTH
+            - leading_width
+            - titlebar_right_inset
             - 24.0
             - 8.0
-            - TITLEBAR_TAB_HEIGHT)
+            - TITLEBAR_ACTION_GROUP_WIDTH)
             .max(0.0);
         let tab_count = self.tabs.len();
         let inactive_count = self.tabs.len().saturating_sub(1);
@@ -3787,51 +4269,6 @@ impl RemCmdApp {
             tabs = tabs.child(tab_slot);
         }
 
-        let can_create_terminal = self.active_panel == ActivePanel::Connection
-            && self.selected_profile_id.is_some()
-            && self.credential_lookup_task.is_none()
-            && self
-                .selected_profile_id
-                .as_deref()
-                .is_none_or(|profile_id| {
-                    !self
-                        .credential_mutations_in_progress
-                        .contains_key(profile_id)
-                });
-        let mut new_terminal = self.render_icon_button(
-            "new-titlebar-terminal",
-            IconName::Add,
-            "New terminal",
-            IconTone::Default,
-            can_create_terminal,
-        );
-        if can_create_terminal {
-            new_terminal = new_terminal.on_click(cx.listener(|this, _, window, cx| {
-                this.connect_selected_profile_in_new_session(window, cx);
-            }));
-        }
-
-        new_terminal = new_terminal
-            .size(px(TITLEBAR_TAB_HEIGHT))
-            .rounded_full()
-            .border_1()
-            .border_color(self.theme.titlebar_add_border)
-            .bg(self.theme.titlebar_tab_selected_bg)
-            .shadow(vec![
-                BoxShadow {
-                    color: self.theme.titlebar_add_shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(2.0),
-                    spread_radius: px(-0.5),
-                },
-                BoxShadow {
-                    color: self.theme.titlebar_add_shadow,
-                    offset: point(px(0.0), px(2.0)),
-                    blur_radius: px(7.0),
-                    spread_radius: px(-2.5),
-                },
-            ]);
-
         let mut controls = div()
             .flex()
             .flex_1()
@@ -3846,7 +4283,8 @@ impl RemCmdApp {
             controls = controls.child(drag_area().flex_1());
         }
 
-        titlebar.child(controls.child(new_terminal))
+        let titlebar = titlebar.child(controls.child(self.render_titlebar_action_group(cx)));
+        self.animate_titlebar_right_edge(titlebar, expanded_right_sidebar_width)
     }
 
     fn is_terminal_visible(&self, profile_id: &str) -> bool {
@@ -3899,7 +4337,9 @@ impl RemCmdApp {
             });
         if let Some((pane_id, session_id)) = unsaved {
             self.set_active_pane(pane_id, cx);
-            if let Some(tab) = self.tab_mut(tab_id) {
+            if !self.right_sidebar_open
+                && let Some(tab) = self.tab_mut(tab_id)
+            {
                 tab.view = TerminalTabView::Files;
             }
             self.block_close_for_unsaved_file(session_id, cx);
@@ -4513,7 +4953,7 @@ impl RemCmdApp {
             .child(modal)
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.sidebar_search.read(cx).text().trim().to_lowercase();
         let list_hover_background = self.theme.list_hover_bg;
         let pressed_background = self.theme.control_pressed_bg;
@@ -4609,7 +5049,8 @@ impl RemCmdApp {
                         .items_center()
                         .gap(px(10.0))
                         .h(px(34.0))
-                        .px_2()
+                        .pl_2()
+                        .pr_1()
                         .rounded_md()
                         .bg(background)
                         .cursor_pointer()
@@ -4655,7 +5096,8 @@ impl RemCmdApp {
                                 .gap_2()
                                 .h(px(32.0))
                                 .ml(px(20.0))
-                                .px_2()
+                                .pl_2()
+                                .pr_1()
                                 .rounded_md()
                                 .bg(background)
                                 .cursor_pointer()
@@ -4754,7 +5196,7 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(width))
             .h_full()
             .bg(self.theme.sidebar_bg)
             .px_3()
@@ -4767,9 +5209,9 @@ impl RemCmdApp {
                     .justify_between()
                     .flex_none()
                     .h(px(34.0))
-                    .px_2()
                     .child(
                         div()
+                            .ml_2()
                             .text_size(px(18.0))
                             .font_weight(FontWeight::BOLD)
                             .child("RemCmd"),
@@ -4819,6 +5261,144 @@ impl RemCmdApp {
             )
             .child(connection_tree)
             .child(settings_footer)
+    }
+
+    fn render_sidebar_resize_handle(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = self.theme.border_strong;
+        let transition_id = self.left_sidebar_transition_id;
+        let start_width = if transition_id == 0 { width } else { 0.0 };
+        let resting = if self.sidebar_resize.is_some() {
+            self.theme.border_strong
+        } else {
+            self.theme.transparent
+        };
+
+        div()
+            .id("sidebar_resize_handle")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
+            .bg(self.theme.transparent)
+            .cursor(CursorStyle::ResizeLeftRight)
+            .hover(move |this| this.bg(hover))
+            .child(div().w(px(1.0)).h_full().bg(resting))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_sidebar_resize))
+            .with_animation(
+                SharedString::from(format!("sidebar-resize-handle-{transition_id}")),
+                Animation::new(if transition_id == 0 {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(180)
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| {
+                    let animated_width = start_width + (width - start_width) * delta;
+                    this.left(px(animated_width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
+                },
+            )
+    }
+
+    fn render_right_sidebar_resize_handle(
+        &self,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let hover = self.theme.border_strong;
+        let transition_id = self.right_sidebar_transition_id;
+        let start_width = if transition_id == 0 { width } else { 0.0 };
+        let resting = if self.right_sidebar_resize.is_some() {
+            self.theme.border_strong
+        } else {
+            self.theme.transparent
+        };
+
+        div()
+            .id("right_sidebar_resize_handle")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
+            .bg(self.theme.transparent)
+            .cursor(CursorStyle::ResizeLeftRight)
+            .hover(move |this| this.bg(hover))
+            .child(div().w(px(1.0)).h_full().bg(resting))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::begin_right_sidebar_resize),
+            )
+            .with_animation(
+                SharedString::from(format!("right-sidebar-resize-handle-{transition_id}")),
+                Animation::new(if transition_id == 0 {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(180)
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| {
+                    let animated_width = start_width + (width - start_width) * delta;
+                    this.right(px(animated_width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
+                },
+            )
+    }
+
+    fn render_right_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = if let Some(session_id) = self.active_session_id {
+            self.render_sftp_browser(session_id, cx)
+        } else {
+            div()
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_sm()
+                .text_color(self.theme.text_muted)
+                .child(self.render_sidebar_icon(IconName::Folder, 20.0))
+                .child("No active terminal")
+                .into_any_element()
+        };
+
+        div()
+            .id("right_sidebar")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(width))
+            .min_w(px(0.0))
+            .h_full()
+            .pt(px(TITLEBAR_HEIGHT))
+            .px_3()
+            .pb_3()
+            .border_l_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.sidebar_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(-1.0), px(0.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(36.0))
+                    .px_1()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.render_sidebar_icon(IconName::Folder, 17.0))
+                    .child("SFTP"),
+            )
+            .child(content)
     }
 
     fn render_detail_panel(
@@ -6197,6 +6777,34 @@ fn credentials_invalidated_by_edit(
         || profile.auth != *auth
 }
 
+fn clamp_sidebar_width(requested: f32, viewport_width: f32, right_sidebar_width: f32) -> f32 {
+    let available_width = (viewport_width
+        - right_sidebar_width
+        - MIN_DETAIL_PANEL_WIDTH
+        - SIDEBAR_RESIZE_HANDLE_WIDTH)
+        .clamp(0.0, SIDEBAR_MAX_WIDTH);
+
+    if available_width < SIDEBAR_MIN_WIDTH {
+        available_width
+    } else {
+        requested.clamp(SIDEBAR_MIN_WIDTH, available_width)
+    }
+}
+
+fn clamp_right_sidebar_width(requested: f32, viewport_width: f32, left_sidebar_width: f32) -> f32 {
+    let available_width = (viewport_width
+        - left_sidebar_width
+        - MIN_DETAIL_PANEL_WIDTH
+        - SIDEBAR_RESIZE_HANDLE_WIDTH)
+        .clamp(0.0, RIGHT_SIDEBAR_MAX_WIDTH);
+
+    if available_width < RIGHT_SIDEBAR_MIN_WIDTH {
+        available_width
+    } else {
+        requested.clamp(RIGHT_SIDEBAR_MIN_WIDTH, available_width)
+    }
+}
+
 fn estimated_titlebar_label_width(label: &str) -> f32 {
     label
         .chars()
@@ -6447,6 +7055,33 @@ mod tests {
             estimated_titlebar_label_width("标题测试") > estimated_titlebar_label_width("test")
         );
         assert_eq!(estimated_titlebar_label_width(""), 20.0);
+    }
+
+    #[test]
+    fn sidebar_width_stays_within_layout_limits() {
+        assert_eq!(clamp_sidebar_width(120.0, 1200.0, 0.0), 220.0);
+        assert_eq!(clamp_sidebar_width(600.0, 1200.0, 0.0), 480.0);
+        assert_eq!(clamp_sidebar_width(300.0, 720.0, 0.0), 300.0);
+    }
+
+    #[test]
+    fn opening_right_sidebar_does_not_move_the_left_sidebar() {
+        let left_width = clamp_sidebar_width(300.0, 720.0, 0.0);
+        let right_width = clamp_right_sidebar_width(340.0, 720.0, left_width);
+
+        assert_eq!(left_width, 300.0);
+        assert_eq!(right_width, 234.0);
+        assert!(
+            left_width + right_width + MIN_DETAIL_PANEL_WIDTH + SIDEBAR_RESIZE_HANDLE_WIDTH
+                <= 720.0
+        );
+    }
+
+    #[test]
+    fn right_sidebar_width_stays_within_layout_limits() {
+        assert_eq!(clamp_right_sidebar_width(100.0, 1200.0, 300.0), 260.0);
+        assert_eq!(clamp_right_sidebar_width(700.0, 1200.0, 300.0), 520.0);
+        assert_eq!(clamp_right_sidebar_width(340.0, 720.0, 0.0), 340.0);
     }
 
     #[test]

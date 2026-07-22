@@ -26,6 +26,8 @@ pub(crate) enum IconName {
     Search,
     Server,
     Settings,
+    SidebarLeft,
+    SidebarRight,
     SplitDown,
     SplitRight,
     Terminal,
@@ -52,6 +54,8 @@ impl IconName {
             Self::Search => "icons/search.svg",
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
+            Self::SidebarLeft => "icons/sidebar-left.svg",
+            Self::SidebarRight => "icons/sidebar-right.svg",
             Self::SplitDown => "icons/split-down.svg",
             Self::SplitRight => "icons/split-right.svg",
             Self::Terminal => "icons/terminal.svg",
@@ -78,6 +82,8 @@ impl IconName {
             "icons/search.svg" => Self::Search,
             "icons/server.svg" => Self::Server,
             "icons/settings.svg" => Self::Settings,
+            "icons/sidebar-left.svg" => Self::SidebarLeft,
+            "icons/sidebar-right.svg" => Self::SidebarRight,
             "icons/split-down.svg" => Self::SplitDown,
             "icons/split-right.svg" => Self::SplitRight,
             "icons/terminal.svg" => Self::Terminal,
@@ -126,6 +132,12 @@ impl IconName {
             }
             Self::Settings => {
                 r#"<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>"#
+            }
+            Self::SidebarLeft => {
+                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>"#
+            }
+            Self::SidebarRight => {
+                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>"#
             }
             Self::SplitDown => {
                 r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/>"#
