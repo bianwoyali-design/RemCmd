@@ -74,6 +74,8 @@ struct EditorLineLayout {
 pub struct FileEditor {
     focus_handle: FocusHandle,
     content: String,
+    line_count: usize,
+    content_width: f32,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -89,9 +91,12 @@ pub struct FileEditor {
 
 impl FileEditor {
     pub fn new(cx: &mut Context<Self>, content: String) -> Self {
+        let (line_count, content_width) = content_metrics(&content);
         Self {
             focus_handle: cx.focus_handle(),
             content,
+            line_count,
+            content_width,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -112,6 +117,7 @@ impl FileEditor {
 
     pub fn replace_all(&mut self, content: String, cx: &mut Context<Self>) {
         self.content = content;
+        (self.line_count, self.content_width) = content_metrics(&self.content);
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -402,7 +408,8 @@ impl FileEditor {
 
     fn cursor_position(&self) -> Option<Point<Pixels>> {
         let cursor = self.cursor_offset();
-        self.last_layouts
+        if let Some(position) = self
+            .last_layouts
             .iter()
             .find(|line| cursor >= line.range.start && cursor <= line.range.end)
             .map(|line| {
@@ -411,6 +418,21 @@ impl FileEditor {
                     line.origin.y,
                 )
             })
+        {
+            return Some(position);
+        }
+
+        let bounds = self.last_bounds?;
+        let line_start = self.line_start(cursor);
+        let line_index = self.content[..line_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        Some(point(
+            bounds.left()
+                + px(PADDING_X + approximate_text_width(&self.content[line_start..cursor])),
+            bounds.top() + px(PADDING_Y + line_index as f32 * LINE_HEIGHT),
+        ))
     }
 
     fn reveal_cursor_if_needed(&mut self) {
@@ -483,26 +505,6 @@ impl FileEditor {
             .find_map(|(index, _)| (index > offset).then_some(index))
             .unwrap_or(self.content.len())
     }
-
-    fn line_ranges(&self) -> Vec<Range<usize>> {
-        line_ranges(&self.content)
-    }
-
-    fn content_width(&self) -> f32 {
-        self.content
-            .split('\n')
-            .map(|line| {
-                line.graphemes(true)
-                    .map(|grapheme| match grapheme {
-                        "\t" => APPROXIMATE_CELL_WIDTH * 4.0,
-                        _ if grapheme.is_ascii() => APPROXIMATE_CELL_WIDTH,
-                        _ => FONT_SIZE,
-                    })
-                    .sum::<f32>()
-            })
-            .fold(0.0, f32::max)
-            + PADDING_X * 2.0
-    }
 }
 
 impl EventEmitter<FileEditorEvent> for FileEditor {}
@@ -560,6 +562,7 @@ impl EntityInputHandler for FileEditor {
 
         self.push_undo();
         self.content.replace_range(range.clone(), new_text);
+        (self.line_count, self.content_width) = content_metrics(&self.content);
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
@@ -584,6 +587,7 @@ impl EntityInputHandler for FileEditor {
             .unwrap_or(self.selected_range.clone());
         self.push_undo();
         self.content.replace_range(range.clone(), new_text);
+        (self.line_count, self.content_width) = content_metrics(&self.content);
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_selected_range_utf16
@@ -666,8 +670,7 @@ impl Element for FileEditorElement {
         let editor = self.editor.read(cx);
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height =
-            px(editor.line_ranges().len() as f32 * LINE_HEIGHT + PADDING_Y * 2.0).into();
+        style.size.height = px(editor.line_count as f32 * LINE_HEIGHT + PADDING_Y * 2.0).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -690,7 +693,18 @@ impl Element for FileEditorElement {
         let mut cursor = None;
         let mut lines = Vec::new();
 
-        for (index, range) in editor.line_ranges().into_iter().enumerate() {
+        let viewport = editor.scroll_handle.bounds();
+        let scroll_y = (-editor.scroll_handle.offset().y / px(LINE_HEIGHT)).max(0.0);
+        let first_visible_line = scroll_y.floor() as usize;
+        let first_line = first_visible_line.saturating_sub(3);
+        let visible_line_count = if viewport.size.height > px(0.0) {
+            (viewport.size.height / px(LINE_HEIGHT)).ceil() as usize + 6
+        } else {
+            64
+        };
+        let last_line = (first_line + visible_line_count).min(editor.line_count);
+
+        for (index, range) in visible_line_ranges(&editor.content, first_line..last_line) {
             let text: SharedString = editor.content[range.clone()].to_owned().into();
             let runs = text_runs_for_line(
                 &style,
@@ -769,7 +783,7 @@ impl Element for FileEditorElement {
 
 impl Render for FileEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let width = self.content_width().max(1.0);
+        let width = self.content_width.max(1.0);
         div()
             .id("remote_file_editor")
             .key_context("FileEditor")
@@ -818,6 +832,7 @@ impl Focusable for FileEditor {
     }
 }
 
+#[cfg(test)]
 fn line_ranges(content: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -829,6 +844,60 @@ fn line_ranges(content: &str) -> Vec<Range<usize>> {
     }
     ranges.push(start..content.len());
     ranges
+}
+
+fn visible_line_ranges(content: &str, requested_lines: Range<usize>) -> Vec<(usize, Range<usize>)> {
+    let mut ranges = Vec::with_capacity(requested_lines.len());
+    let mut line_index = 0;
+    let mut line_start = 0;
+
+    for (index, byte) in content.bytes().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+        if requested_lines.contains(&line_index) {
+            ranges.push((line_index, line_start..index));
+        }
+        line_index += 1;
+        line_start = index + 1;
+        if line_index >= requested_lines.end {
+            return ranges;
+        }
+    }
+
+    if requested_lines.contains(&line_index) {
+        ranges.push((line_index, line_start..content.len()));
+    }
+    ranges
+}
+
+fn content_metrics(content: &str) -> (usize, f32) {
+    let mut line_count = 1;
+    let mut widest_line = 0.0_f32;
+    let mut line_width = 0.0_f32;
+    for grapheme in content.graphemes(true) {
+        if grapheme == "\n" {
+            line_count += 1;
+            widest_line = widest_line.max(line_width);
+            line_width = 0.0;
+        } else {
+            line_width += approximate_grapheme_width(grapheme);
+        }
+    }
+    widest_line = widest_line.max(line_width);
+    (line_count, widest_line + PADDING_X * 2.0)
+}
+
+fn approximate_text_width(text: &str) -> f32 {
+    text.graphemes(true).map(approximate_grapheme_width).sum()
+}
+
+fn approximate_grapheme_width(grapheme: &str) -> f32 {
+    match grapheme {
+        "\t" => APPROXIMATE_CELL_WIDTH * 4.0,
+        _ if grapheme.is_ascii() => APPROXIMATE_CELL_WIDTH,
+        _ => FONT_SIZE,
+    }
 }
 
 fn text_runs_for_line(
@@ -919,5 +988,21 @@ mod tests {
     fn overlap_excludes_touching_ranges() {
         assert!(ranges_overlap(&(1..3), &(2..4)));
         assert!(!ranges_overlap(&(1..3), &(3..5)));
+    }
+
+    #[test]
+    fn visible_ranges_only_materialize_the_requested_lines() {
+        assert_eq!(
+            visible_line_ranges("zero\none\ntwo\nthree", 1..3),
+            vec![(1, 5..8), (2, 9..12)]
+        );
+    }
+
+    #[test]
+    fn content_metrics_count_lines_and_wide_text_without_layouts() {
+        let (lines, width) = content_metrics("short\n中文\n");
+
+        assert_eq!(lines, 3);
+        assert!(width >= PADDING_X * 2.0 + FONT_SIZE * 2.0);
     }
 }
