@@ -18,6 +18,15 @@ fn connection_handle_forwards_commands() {
         .expect("input should be sent");
     handle.resize(size).expect("resize should be sent");
     handle
+        .read_directory(7, "/home/test")
+        .expect("directory request should be sent");
+    handle
+        .read_file(8, "/home/test/notes.txt")
+        .expect("file request should be sent");
+    handle
+        .write_file(9, "/home/test/notes.txt", b"old".to_vec(), b"new".to_vec())
+        .expect("file write should be sent");
+    handle
         .trust_host_key()
         .expect("host key trust should be sent");
     handle
@@ -35,6 +44,29 @@ fn connection_handle_forwards_commands() {
     assert_eq!(
         command_rx.try_recv().expect("resize command"),
         ConnectionCommand::Resize(size)
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("directory command"),
+        ConnectionCommand::ReadDirectory {
+            request_id: 7,
+            path: "/home/test".into(),
+        }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("file command"),
+        ConnectionCommand::ReadFile {
+            request_id: 8,
+            path: "/home/test/notes.txt".into(),
+        }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("file write command"),
+        ConnectionCommand::WriteFile {
+            request_id: 9,
+            path: "/home/test/notes.txt".into(),
+            expected_contents: b"old".to_vec(),
+            contents: b"new".to_vec(),
+        }
     );
     assert_eq!(
         host_key_decision_rx.try_recv().expect("trust decision"),

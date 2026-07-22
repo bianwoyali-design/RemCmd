@@ -1,8 +1,10 @@
-use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client};
+use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty, client};
 
-use crate::{SshError, SshErrorKind};
+use crate::{SshError, SshErrorKind, shell_integration};
 
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
+const INTEGRATION_READY_MARKER: &[u8] = b"\x1b]777;remcmd-shell-ready\x07";
+const INTEGRATION_READY_COMMAND: &str = "stty echo; printf '\\033]777;remcmd-shell-ready\\007'; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
 
 /// Dimensions reported to the remote pseudo-terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +76,15 @@ pub enum ShellEvent {
 
 pub struct SshShell {
     channel: Channel<client::Msg>,
+    filter_integration_startup: bool,
 }
 
 impl SshShell {
-    pub(crate) async fn open<H>(handle: &client::Handle<H>, size: PtySize) -> Result<Self, SshError>
+    pub(crate) async fn open<H>(
+        handle: &client::Handle<H>,
+        size: PtySize,
+        install_cwd_hook: bool,
+    ) -> Result<Self, SshError>
     where
         H: client::Handler,
     {
@@ -85,6 +92,12 @@ impl SshShell {
             .channel_open_session()
             .await
             .map_err(SshError::from)?;
+
+        let terminal_modes = if install_cwd_hook {
+            vec![(Pty::ECHO, 0)]
+        } else {
+            Vec::new()
+        };
 
         channel
             .request_pty(
@@ -94,7 +107,7 @@ impl SshShell {
                 size.rows,
                 size.pixel_width,
                 size.pixel_height,
-                &[],
+                &terminal_modes,
             )
             .await
             .map_err(SshError::from)?;
@@ -105,7 +118,19 @@ impl SshShell {
 
         Self::wait_for_request_success(&mut channel, "shell").await?;
 
-        Ok(Self { channel })
+        if install_cwd_hook {
+            channel
+                .data_bytes(shell_integration::install_command(
+                    INTEGRATION_READY_COMMAND,
+                ))
+                .await
+                .map_err(SshError::from)?;
+        }
+
+        Ok(Self {
+            channel,
+            filter_integration_startup: install_cwd_hook,
+        })
     }
 
     async fn wait_for_request_success(
@@ -149,12 +174,19 @@ impl SshShell {
     pub fn split(self) -> (SshShellReader, SshShellWriter) {
         let (read_half, write_half) = self.channel.split();
 
-        (SshShellReader { read_half }, SshShellWriter { write_half })
+        (
+            SshShellReader {
+                read_half,
+                startup_output: self.filter_integration_startup.then(Vec::new),
+            },
+            SshShellWriter { write_half },
+        )
     }
 }
 
 pub struct SshShellReader {
     read_half: ChannelReadHalf,
+    startup_output: Option<Vec<u8>>,
 }
 
 pub struct SshShellWriter {
@@ -166,10 +198,26 @@ impl SshShellReader {
         loop {
             match self.read_half.wait().await {
                 Some(ChannelMsg::Data { data }) => {
+                    if let Some(output) = self.startup_output.as_mut() {
+                        output.extend_from_slice(&data);
+                        let Some(index) = find_bytes(output, INTEGRATION_READY_MARKER) else {
+                            continue;
+                        };
+                        let visible = output.split_off(index + INTEGRATION_READY_MARKER.len());
+                        self.startup_output = None;
+                        if visible.is_empty() {
+                            continue;
+                        }
+                        return ShellEvent::Output(visible);
+                    }
                     return ShellEvent::Output(data.to_vec());
                 }
 
                 Some(ChannelMsg::ExtendedData { data, ext }) => {
+                    if let Some(output) = self.startup_output.as_mut() {
+                        output.extend_from_slice(&data);
+                        continue;
+                    }
                     return ShellEvent::ExtendedOutput {
                         code: ext,
                         data: data.to_vec(),
@@ -208,6 +256,12 @@ impl SshShellReader {
             }
         }
     }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 impl SshShellWriter {
