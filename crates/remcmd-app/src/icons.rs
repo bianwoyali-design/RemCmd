@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use gpui::{AnyElement, AssetSource, IntoElement, Result, SharedString, prelude::*, px, svg};
+use gpui::{AnyElement, AssetSource, Hsla, IntoElement, Result, SharedString, prelude::*, px, svg};
 
 use crate::theme::{IconTone, Theme};
 
@@ -148,6 +148,10 @@ pub(crate) fn icon(name: IconName, theme: Theme, tone: IconTone, size: f32) -> A
         IconTone::Danger => theme.danger,
     };
 
+    icon_with_color(name, color, size)
+}
+
+pub(crate) fn icon_with_color(name: IconName, color: Hsla, size: f32) -> AnyElement {
     svg()
         .path(name.asset_path())
         .size(px(size))

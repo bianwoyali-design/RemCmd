@@ -54,6 +54,15 @@ pub enum ThemeMode {
     Dark,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabLayout {
+    Horizontal,
+
+    #[default]
+    Vertical,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
@@ -111,6 +120,18 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ThemeMode>(r#""light""#).unwrap(),
             ThemeMode::Light
+        );
+    }
+
+    #[test]
+    fn tab_layout_serializes_as_a_stable_lowercase_value() {
+        assert_eq!(
+            serde_json::to_string(&TabLayout::Horizontal).unwrap(),
+            r#""horizontal""#
+        );
+        assert_eq!(
+            serde_json::from_str::<TabLayout>(r#""vertical""#).unwrap(),
+            TabLayout::Vertical
         );
     }
 }

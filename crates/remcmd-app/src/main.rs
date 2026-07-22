@@ -5,7 +5,7 @@ mod pane_layout;
 use pane_layout::{PaneId, PaneLayout, SplitAxis};
 
 mod icons;
-use icons::{IconName, RemCmdAssets, icon};
+use icons::{IconName, RemCmdAssets, icon, icon_with_color};
 
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
@@ -28,22 +28,26 @@ use terminal_view::{TerminalPalette, TerminalViewModel, palette_color};
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
+#[cfg(target_os = "macos")]
+mod macos_symbols;
+
 use std::{collections::HashMap, ops::Range, path::PathBuf, time::Duration};
 
 use gpui::{
-    AnyElement, AnyView, App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, Subscription, Task, Timer,
-    TitlebarOptions, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
+    ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollHandle,
+    ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowOptions, canvas,
+    div, ease_in_out, ease_out_quint, img, point, prelude::*, px, rgb, size,
 };
 use secrecy::SecretString;
 
 #[cfg(not(target_os = "macos"))]
 use gpui::PathPromptOptions;
 
-use remcmd_core::{AuthConfig, ConnectionProfile, ThemeMode};
+use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, PtySize, SessionState, ShellEvent,
     SshConnection, SshErrorKind,
@@ -63,6 +67,16 @@ const TERMINAL_ROWS: u32 = 24;
 const TERMINAL_CELL_WIDTH: u16 = 8;
 const TERMINAL_CELL_HEIGHT: u16 = 19;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+const SIDEBAR_WIDTH: f32 = 300.0;
+const TITLEBAR_HEIGHT: f32 = 52.0;
+const TITLEBAR_TAB_HEIGHT: f32 = 30.0;
+const TITLEBAR_TAB_GROUP_HEIGHT: f32 = 36.0;
+const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
+const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
+const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
+const TITLEBAR_CLOSE_SYMBOL_SIZE: f32 = 12.0;
+const TRAFFIC_LIGHT_INSET_X: f32 = 20.0;
+const TRAFFIC_LIGHT_INSET_Y: f32 = 18.0;
 
 #[cfg(target_os = "macos")]
 const TERMINAL_FONT_FAMILY: &str = "SF Mono";
@@ -87,6 +101,12 @@ struct RemCmdApp {
     next_session_id: u64,
     tabs: Vec<TerminalTab>,
     active_tab_id: Option<TabId>,
+    previous_active_tab_id: Option<TabId>,
+    titlebar_tab_transition_id: u64,
+    hovered_titlebar_tab_id: Option<TabId>,
+    hovered_titlebar_close_id: Option<TabId>,
+    titlebar_tabs_scroll_handle: ScrollHandle,
+    titlebar_tabs_scroll_task: Option<Task<()>>,
     next_tab_id: u64,
     panes: Vec<TerminalPane>,
     active_pane_id: Option<PaneId>,
@@ -99,6 +119,7 @@ struct RemCmdApp {
     credential_mutations_in_progress: HashMap<String, usize>,
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
+    tab_layout: TabLayout,
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
@@ -446,6 +467,7 @@ impl RemCmdApp {
             ),
         };
         let theme_mode = settings.theme_mode;
+        let tab_layout = settings.tab_layout;
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
 
@@ -468,6 +490,12 @@ impl RemCmdApp {
             next_session_id: 1,
             tabs: Vec::new(),
             active_tab_id: None,
+            previous_active_tab_id: None,
+            titlebar_tab_transition_id: 0,
+            hovered_titlebar_tab_id: None,
+            hovered_titlebar_close_id: None,
+            titlebar_tabs_scroll_handle: ScrollHandle::new(),
+            titlebar_tabs_scroll_task: None,
             next_tab_id: 1,
             panes: Vec::new(),
             active_pane_id: None,
@@ -480,6 +508,7 @@ impl RemCmdApp {
             credential_mutations_in_progress: HashMap::new(),
             active_panel: ActivePanel::Connection,
             theme_mode,
+            tab_layout,
             theme,
             settings_path,
             settings_error,
@@ -569,7 +598,30 @@ impl RemCmdApp {
             layout: PaneLayout::Pane(pane_id),
             active_pane_id: pane_id,
         });
+        self.animate_titlebar_tabs_to_end(cx);
         tab_id
+    }
+
+    fn animate_titlebar_tabs_to_end(&mut self, cx: &mut Context<Self>) {
+        if self.tab_layout != TabLayout::Horizontal {
+            return;
+        }
+
+        let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
+        self.titlebar_tabs_scroll_task = Some(cx.spawn(async move |this, cx| {
+            // Let GPUI lay out the new tab before reading the track's final overflow.
+            Timer::after(Duration::from_millis(16)).await;
+
+            let start = scroll_handle.offset();
+            let easing = ease_out_quint();
+            for frame in 1..=10 {
+                let progress = easing(frame as f32 / 10.0);
+                let target_x = -scroll_handle.max_offset().width;
+                scroll_handle.set_offset(point(start.x + (target_x - start.x) * progress, start.y));
+                let _ = this.update(cx, |_, cx| cx.notify());
+                Timer::after(Duration::from_millis(16)).await;
+            }
+        }));
     }
 
     fn pane(&self, pane_id: PaneId) -> Option<&TerminalPane> {
@@ -629,6 +681,10 @@ impl RemCmdApp {
         let profile_changed = self.selected_profile_id.as_deref() != Some(profile_id.as_str());
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.active_pane_id = pane_id;
+        }
+        if self.active_tab_id != Some(tab_id) {
+            self.previous_active_tab_id = self.active_tab_id;
+            self.titlebar_tab_transition_id += 1;
         }
         self.active_tab_id = Some(tab_id);
         self.active_pane_id = Some(pane_id);
@@ -842,11 +898,24 @@ impl RemCmdApp {
         self.theme = Theme::resolve(theme_mode, window);
         set_global_theme(self.theme, cx);
 
-        let settings = AppSettings { theme_mode };
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_tab_layout(&mut self, tab_layout: TabLayout, cx: &mut Context<Self>) {
+        self.tab_layout = tab_layout;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn persist_settings(&mut self) {
+        let settings = AppSettings {
+            theme_mode: self.theme_mode,
+            tab_layout: self.tab_layout,
+        };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
             .map(|error| format!("Failed to save settings: {error}"));
-        cx.notify();
     }
 
     fn load_editor_for_selected_profile(&mut self, cx: &mut Context<Self>) {
@@ -2629,7 +2698,8 @@ impl Render for RemCmdApp {
             .size_full()
             .text_color(self.theme.text_primary)
             .child(self.render_sidebar(cx))
-            .child(self.render_detail_panel(selected_profile, cx));
+            .child(self.render_detail_panel(selected_profile, cx))
+            .child(self.render_titlebar_tabs(window, cx));
 
         if self
             .active_session()
@@ -2691,6 +2761,467 @@ impl RemCmdApp {
             .child(icon(icon_name, self.theme, IconTone::Default, size))
     }
 
+    fn render_titlebar_close_symbol(&self) -> AnyElement {
+        #[cfg(target_os = "macos")]
+        if let Some(symbol) = macos_symbols::close_circle(self.theme.panel_bg.l < 0.5) {
+            return img(symbol)
+                .size(px(TITLEBAR_CLOSE_SYMBOL_SIZE))
+                .into_any_element();
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(TITLEBAR_CLOSE_SYMBOL_SIZE))
+            .rounded_full()
+            .bg(self.theme.text_primary)
+            .child(icon_with_color(IconName::Cancel, self.theme.panel_bg, 7.0))
+            .into_any_element()
+    }
+
+    fn terminal_tab_title(&self, tab: &TerminalTab) -> String {
+        // Keep both tab layouts on this placeholder until SSH exposes reliable cwd events.
+        let terminal_number = self
+            .tabs
+            .iter()
+            .take_while(|candidate| candidate.id != tab.id)
+            .filter(|candidate| candidate.profile_id == tab.profile_id)
+            .count()
+            + 1;
+        format!("Terminal {terminal_number}")
+    }
+
+    fn render_titlebar_tabs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let drag_area = || {
+            div()
+                .flex_none()
+                .h_full()
+                .window_control_area(WindowControlArea::Drag)
+        };
+        let titlebar = div()
+            .id("window_titlebar")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TITLEBAR_HEIGHT))
+            .flex()
+            .items_center()
+            .child(drag_area().w(px(SIDEBAR_WIDTH)));
+
+        if self.tab_layout == TabLayout::Vertical {
+            return titlebar.child(drag_area().flex_1());
+        }
+
+        let tab_labels = self
+            .tabs
+            .iter()
+            .map(|tab| self.terminal_tab_title(tab))
+            .collect::<Vec<_>>();
+        let selected_tab_min_width = tab_labels
+            .iter()
+            .map(|label| estimated_titlebar_label_width(label) + 68.0)
+            .fold(TITLEBAR_TAB_ICON_ONLY_WIDTH, f32::max);
+        let track_width = (f32::from(window.viewport_size().width)
+            - SIDEBAR_WIDTH
+            - 24.0
+            - 8.0
+            - TITLEBAR_TAB_HEIGHT)
+            .max(0.0);
+        let tab_count = self.tabs.len();
+        let inactive_count = self.tabs.len().saturating_sub(1);
+        let separator_width = self.tabs.len().saturating_sub(1) as f32;
+        let inactive_width = if inactive_count == 0 {
+            track_width
+        } else {
+            ((track_width - 6.0 - separator_width - selected_tab_min_width).max(0.0)
+                / inactive_count as f32)
+                .max(TITLEBAR_TAB_ICON_ONLY_WIDTH)
+        };
+        let hide_inactive_labels = inactive_width < TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH;
+        let selected_tab_basis =
+            titlebar_active_tab_basis(track_width, tab_count, selected_tab_min_width);
+        let mut tabs = div()
+            .id("titlebar_terminal_tabs")
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
+            .items_center()
+            .p(px(3.0))
+            .rounded_full()
+            .border_1()
+            .border_color(self.theme.titlebar_tab_group_border)
+            .bg(self.theme.transparent)
+            .shadow(vec![BoxShadow {
+                color: self.theme.titlebar_tab_group_shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(8.0),
+                spread_radius: px(-4.0),
+            }])
+            .overflow_x_scroll()
+            .track_scroll(&self.titlebar_tabs_scroll_handle);
+
+        for (tab_index, (tab, label)) in self.tabs.iter().zip(tab_labels).enumerate() {
+            let tab_id = tab.id;
+            let is_active =
+                self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
+            let is_deactivating = self.active_panel == ActivePanel::Connection
+                && self.previous_active_tab_id == Some(tab_id)
+                && self.active_tab_id != Some(tab_id);
+            let is_hovered = self.hovered_titlebar_tab_id == Some(tab_id);
+            let is_close_hovered = self.hovered_titlebar_close_id == Some(tab_id);
+            let show_close = is_active || is_hovered;
+            let icon_only = !is_active && hide_inactive_labels;
+            let hover_background = if is_active {
+                self.theme.titlebar_tab_selected_hover_bg
+            } else {
+                self.theme.titlebar_tab_hover_bg
+            };
+            let status = self
+                .pane(tab.active_pane_id)
+                .and_then(|pane| self.session(pane.session_id))
+                .map(|session| session.connection_state)
+                .unwrap_or(SessionState::Disconnected);
+            let status_color = match status {
+                SessionState::Connected => self.theme.status_ok,
+                SessionState::Failed => self.theme.error_text,
+                SessionState::Connecting
+                | SessionState::Authenticating
+                | SessionState::Disconnecting => self.theme.status_warn,
+                SessionState::Disconnected => self.theme.text_faint,
+            };
+            let pressed_background = self.theme.titlebar_tab_pressed_bg;
+            let selected_background = self.theme.titlebar_tab_selected_bg;
+            let tab_border = self.theme.titlebar_tab_border;
+            let tab_shadow = self.theme.titlebar_tab_shadow;
+            let (start_tab_basis, end_tab_basis, start_tab_min_width, end_tab_min_width) =
+                if is_active {
+                    (
+                        0.0,
+                        selected_tab_basis,
+                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
+                        selected_tab_min_width,
+                    )
+                } else if is_deactivating {
+                    (
+                        selected_tab_basis,
+                        0.0,
+                        selected_tab_min_width,
+                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
+                    )
+                } else {
+                    (
+                        0.0,
+                        0.0,
+                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
+                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
+                    )
+                };
+
+            if tab_index > 0 {
+                let previous_is_active = self.active_panel == ActivePanel::Connection
+                    && self.active_tab_id == Some(self.tabs[tab_index - 1].id);
+                let separator = if is_active || previous_is_active {
+                    self.theme.transparent
+                } else {
+                    self.theme.titlebar_tab_separator
+                };
+                tabs = tabs.child(div().flex_none().w(px(1.0)).h(px(18.0)).bg(separator));
+            }
+
+            let terminal_icon = div()
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(20.0))
+                .child(icon(
+                    IconName::Terminal,
+                    self.theme,
+                    IconTone::Default,
+                    15.0,
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .bottom_0()
+                        .size(px(5.0))
+                        .rounded_full()
+                        .bg(status_color),
+                )
+                .with_animation(
+                    SharedString::from(format!("titlebar-tab-terminal-{}-{show_close}", tab_id.0)),
+                    Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                    move |this, delta| this.opacity(if show_close { 1.0 - delta } else { delta }),
+                );
+            let tab_content = if is_active {
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .px(px(34.0))
+                    .text_center()
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .child(label)
+            } else if icon_only {
+                div()
+                    .flex()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .child(terminal_icon)
+            } else {
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .child(terminal_icon)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .child(label),
+                    )
+            };
+            let content_start_opacity = if is_active {
+                0.5
+            } else if is_deactivating {
+                0.68
+            } else {
+                1.0
+            };
+            let content_animation_id = if is_active || is_deactivating {
+                format!(
+                    "titlebar-tab-content-{}-{}",
+                    tab_id.0, self.titlebar_tab_transition_id
+                )
+            } else {
+                format!("titlebar-tab-content-{}-stable", tab_id.0)
+            };
+            let tab_content = tab_content.with_animation(
+                SharedString::from(content_animation_id),
+                Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
+                move |this, delta| {
+                    this.opacity(content_start_opacity + (1.0 - content_start_opacity) * delta)
+                },
+            );
+
+            let tooltip_theme = self.theme;
+            let close_hover_background = self.theme.titlebar_tab_hover_bg;
+            let close_pressed_background = self.theme.titlebar_tab_pressed_bg;
+            let mut close_control = div()
+                .id(SharedString::from(format!(
+                    "close-titlebar-tab-{}",
+                    tab_id.0
+                )))
+                .absolute()
+                .top(px(6.0))
+                .left(px(9.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(18.0))
+                .rounded_full()
+                .bg(if is_close_hovered {
+                    close_hover_background
+                } else {
+                    self.theme.transparent
+                })
+                .cursor_pointer()
+                .hover(move |this| this.bg(close_hover_background))
+                .active(move |this| this.bg(close_pressed_background))
+                .child(self.render_titlebar_close_symbol())
+                .tooltip(move |_, cx| -> AnyView {
+                    cx.new(|_| CommandTooltip {
+                        label: "Close terminal".into(),
+                        theme: tooltip_theme,
+                    })
+                    .into()
+                })
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let hovered_close_id = if *hovered { Some(tab_id) } else { None };
+                    if this.hovered_titlebar_close_id != hovered_close_id {
+                        this.hovered_titlebar_close_id = hovered_close_id;
+                        cx.notify();
+                    }
+                }));
+            if show_close {
+                close_control = close_control.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_tab(tab_id, cx);
+                }));
+            }
+            let close_control = close_control.with_animation(
+                SharedString::from(format!("titlebar-tab-close-{}-{show_close}", tab_id.0)),
+                Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                move |this, delta| this.opacity(if show_close { delta } else { 1.0 - delta }),
+            );
+
+            let tab_element = div()
+                .id(SharedString::from(format!("titlebar-tab-{}", tab_id.0)))
+                .relative()
+                .flex()
+                .w_full()
+                .min_w(px(0.0))
+                .items_center()
+                .justify_center()
+                .h(px(TITLEBAR_TAB_HEIGHT))
+                .rounded_full()
+                .bg(self.theme.transparent)
+                .cursor_pointer()
+                .hover(move |this| this.bg(hover_background))
+                .active(move |this| this.bg(pressed_background))
+                .when(is_active, move |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(tab_border)
+                            .bg(selected_background)
+                            .shadow(vec![BoxShadow {
+                                color: tab_shadow,
+                                offset: point(px(0.0), px(1.0)),
+                                blur_radius: px(3.0),
+                                spread_radius: px(-1.0),
+                            }])
+                            .with_animation(
+                                SharedString::from(format!("titlebar-tab-selection-{}", tab_id.0)),
+                                Animation::new(Duration::from_millis(280)).with_easing(ease_in_out),
+                                |this, delta| this.opacity(0.72 + 0.28 * delta),
+                            ),
+                    )
+                })
+                .child(close_control)
+                .child(tab_content)
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let hovered_tab_id = if *hovered { Some(tab_id) } else { None };
+                    if this.hovered_titlebar_tab_id != hovered_tab_id {
+                        this.hovered_titlebar_tab_id = hovered_tab_id;
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.activate_tab_in_window(tab_id, window, cx) {
+                        cx.notify();
+                    }
+                }));
+
+            let tab_element = tab_element.with_animation(
+                SharedString::from(format!("titlebar-tab-entry-{}", tab_id.0)),
+                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                |this, delta| {
+                    this.left(px((1.0 - delta) * 10.0))
+                        .opacity(0.72 + 0.28 * delta)
+                },
+            );
+            let layout_animation_id = if is_active || is_deactivating {
+                format!(
+                    "titlebar-tab-layout-{}-{}",
+                    tab_id.0, self.titlebar_tab_transition_id
+                )
+            } else {
+                format!("titlebar-tab-layout-{}-stable", tab_id.0)
+            };
+            let tab_slot = div()
+                .flex()
+                .flex_1()
+                .min_w(px(TITLEBAR_TAB_ICON_ONLY_WIDTH))
+                .h(px(TITLEBAR_TAB_HEIGHT))
+                .child(tab_element)
+                .with_animation(
+                    SharedString::from(layout_animation_id),
+                    Animation::new(Duration::from_millis(300)).with_easing(ease_in_out),
+                    move |this, delta| {
+                        let basis = start_tab_basis + (end_tab_basis - start_tab_basis) * delta;
+                        let min_width =
+                            start_tab_min_width + (end_tab_min_width - start_tab_min_width) * delta;
+                        this.flex_basis(px(basis)).min_w(px(min_width))
+                    },
+                );
+            tabs = tabs.child(tab_slot);
+        }
+
+        let can_create_terminal = self.active_panel == ActivePanel::Connection
+            && self.selected_profile_id.is_some()
+            && self.credential_lookup_task.is_none()
+            && self
+                .selected_profile_id
+                .as_deref()
+                .is_none_or(|profile_id| {
+                    !self
+                        .credential_mutations_in_progress
+                        .contains_key(profile_id)
+                });
+        let mut new_terminal = self.render_icon_button(
+            "new-titlebar-terminal",
+            IconName::Add,
+            "New terminal",
+            IconTone::Default,
+            can_create_terminal,
+        );
+        if can_create_terminal {
+            new_terminal = new_terminal.on_click(cx.listener(|this, _, window, cx| {
+                this.connect_selected_profile_in_new_session(window, cx);
+            }));
+        }
+
+        new_terminal = new_terminal
+            .size(px(TITLEBAR_TAB_HEIGHT))
+            .rounded_full()
+            .border_1()
+            .border_color(self.theme.titlebar_add_border)
+            .bg(self.theme.titlebar_tab_selected_bg)
+            .shadow(vec![
+                BoxShadow {
+                    color: self.theme.titlebar_add_shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(2.0),
+                    spread_radius: px(-0.5),
+                },
+                BoxShadow {
+                    color: self.theme.titlebar_add_shadow,
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(7.0),
+                    spread_radius: px(-2.5),
+                },
+            ]);
+
+        let mut controls = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0));
+        if !self.tabs.is_empty() {
+            controls = controls.child(tabs);
+        } else {
+            controls = controls.child(drag_area().flex_1());
+        }
+
+        titlebar.child(controls.child(new_terminal))
+    }
+
     fn is_terminal_visible(&self, profile_id: &str) -> bool {
         self.active_session()
             .filter(|session| session.profile_id == profile_id)
@@ -2729,6 +3260,12 @@ impl RemCmdApp {
     }
 
     fn close_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if self.hovered_titlebar_tab_id == Some(tab_id) {
+            self.hovered_titlebar_tab_id = None;
+        }
+        if self.hovered_titlebar_close_id == Some(tab_id) {
+            self.hovered_titlebar_close_id = None;
+        }
         let pane_ids = self
             .panes
             .iter()
@@ -3332,6 +3869,7 @@ impl RemCmdApp {
             div()
                 .id("toggle_connections")
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap(px(10.0))
                 .h(px(32.0))
@@ -3403,6 +3941,7 @@ impl RemCmdApp {
                     div()
                         .id(SharedString::from(format!("profile-{}", profile.id)))
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap(px(10.0))
                         .h(px(34.0))
@@ -3427,71 +3966,73 @@ impl RemCmdApp {
                         })),
                 );
 
-                for (terminal_index, tab) in self
-                    .tabs
-                    .iter()
-                    .filter(|tab| tab.profile_id == profile.id)
-                    .enumerate()
-                {
-                    let tab_id = tab.id;
-                    let is_active = self.active_panel == ActivePanel::Connection
-                        && self.active_tab_id == Some(tab_id);
-                    let background = if is_active {
-                        self.theme.list_selected_bg
-                    } else {
-                        self.theme.transparent
-                    };
-                    let hover = if is_active {
-                        self.theme.list_selected_hover_bg
-                    } else {
-                        self.theme.list_hover_bg
-                    };
-                    connection_tree = connection_tree.child(
-                        div()
-                            .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .h(px(32.0))
-                            .ml(px(20.0))
-                            .px_2()
-                            .rounded_md()
-                            .bg(background)
-                            .cursor_pointer()
-                            .hover(move |this| this.bg(hover))
-                            .active(move |this| this.bg(pressed_background))
-                            .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(self.theme.text_muted)
-                                    .child(format!("Terminal {}", terminal_index + 1)),
-                            )
-                            .child(
-                                self.render_icon_button(
-                                    SharedString::from(format!("close-sidebar-tab-{}", tab_id.0)),
-                                    IconName::Cancel,
-                                    "Close terminal",
-                                    IconTone::Default,
-                                    true,
+                if self.tab_layout == TabLayout::Vertical {
+                    for tab in self.tabs.iter().filter(|tab| tab.profile_id == profile.id) {
+                        let tab_id = tab.id;
+                        let terminal_title = self.terminal_tab_title(tab);
+                        let is_active = self.active_panel == ActivePanel::Connection
+                            && self.active_tab_id == Some(tab_id);
+                        let background = if is_active {
+                            self.theme.list_selected_bg
+                        } else {
+                            self.theme.transparent
+                        };
+                        let hover = if is_active {
+                            self.theme.list_selected_hover_bg
+                        } else {
+                            self.theme.list_hover_bg
+                        };
+                        connection_tree = connection_tree.child(
+                            div()
+                                .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .h(px(32.0))
+                                .ml(px(20.0))
+                                .px_2()
+                                .rounded_md()
+                                .bg(background)
+                                .cursor_pointer()
+                                .hover(move |this| this.bg(hover))
+                                .active(move |this| this.bg(pressed_background))
+                                .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(self.theme.text_muted)
+                                        .child(terminal_title),
                                 )
-                                .size(px(24.0))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.close_tab(tab_id, cx);
-                                    },
-                                )),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if this.activate_tab_in_window(tab_id, window, cx) {
-                                    cx.notify();
-                                }
-                            })),
-                    );
+                                .child(
+                                    self.render_icon_button(
+                                        SharedString::from(format!(
+                                            "close-sidebar-tab-{}",
+                                            tab_id.0
+                                        )),
+                                        IconName::Cancel,
+                                        "Close terminal",
+                                        IconTone::Default,
+                                        true,
+                                    )
+                                    .size(px(24.0))
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.close_tab(tab_id, cx);
+                                        },
+                                    )),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if this.activate_tab_in_window(tab_id, window, cx) {
+                                        cx.notify();
+                                    }
+                                })),
+                        );
+                    }
                 }
             }
         }
@@ -3549,12 +4090,12 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(300.0))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .bg(self.theme.sidebar_bg)
             .px_3()
             .pb_4()
-            .pt(px(52.0))
+            .pt(px(TITLEBAR_HEIGHT))
             .child(
                 div()
                     .flex()
@@ -3809,7 +4350,7 @@ impl RemCmdApp {
             .h_full()
             .px_4()
             .pb_4()
-            .pt(px(52.0))
+            .pt(px(TITLEBAR_HEIGHT))
             .bg(self.theme.panel_bg)
             .border_l_1()
             .border_color(self.theme.border_strong)
@@ -3835,6 +4376,28 @@ impl RemCmdApp {
             .child(self.render_theme_mode_option("theme_system", "System", ThemeMode::System, cx))
             .child(self.render_theme_mode_option("theme_light", "Light", ThemeMode::Light, cx))
             .child(self.render_theme_mode_option("theme_dark", "Dark", ThemeMode::Dark, cx));
+        let tab_layout_control = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .p(px(2.0))
+            .gap(px(2.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.control_bg)
+            .child(self.render_tab_layout_option(
+                "tabs_horizontal",
+                "Horizontal",
+                TabLayout::Horizontal,
+                cx,
+            ))
+            .child(self.render_tab_layout_option(
+                "tabs_vertical",
+                "Vertical",
+                TabLayout::Vertical,
+                cx,
+            ));
 
         let content = div()
             .id("settings_content")
@@ -3861,6 +4424,21 @@ impl RemCmdApp {
                     .gap_3()
                     .child(div().flex_none().w(px(112.0)).truncate().child("Theme"))
                     .child(appearance_control),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .mt_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .truncate()
+                            .child("Tab layout"),
+                    )
+                    .child(tab_layout_control),
             )
             .when_some(self.settings_error.as_ref(), |this, error| {
                 this.child(
@@ -3932,6 +4510,62 @@ impl RemCmdApp {
             .child(div().truncate().child(label))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.set_theme_mode(mode, window, cx);
+            }))
+    }
+
+    fn render_tab_layout_option(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        tab_layout: TabLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.tab_layout == tab_layout;
+        let background = if is_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let border = if is_selected {
+            self.theme.border_strong
+        } else {
+            self.theme.transparent
+        };
+        let hover_background = if is_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.control_hover_bg
+        };
+        let pressed_background = self.theme.control_pressed_bg;
+
+        div()
+            .id(id)
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py(px(6.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover_background))
+            .active(move |this| this.bg(pressed_background))
+            .when(is_selected, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(3.0),
+                    spread_radius: px(-1.0),
+                }])
+            })
+            .child(div().truncate().child(label))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_tab_layout(tab_layout, cx);
             }))
     }
 
@@ -4481,6 +5115,27 @@ fn credentials_invalidated_by_edit(
         || profile.auth != *auth
 }
 
+fn estimated_titlebar_label_width(label: &str) -> f32 {
+    label
+        .chars()
+        .map(|character| if character.is_ascii() { 8.5 } else { 14.5 })
+        .sum::<f32>()
+        .max(20.0)
+}
+
+fn titlebar_active_tab_basis(track_width: f32, tab_count: usize, expanded_width: f32) -> f32 {
+    if tab_count <= 1 {
+        return 0.0;
+    }
+
+    let separator_width = tab_count.saturating_sub(1) as f32;
+    let available_width = (track_width - 6.0 - separator_width).max(0.0);
+    let equal_width = available_width / tab_count as f32;
+    let required_growth = (expanded_width - equal_width).max(0.0) * tab_count as f32
+        / tab_count.saturating_sub(1) as f32;
+    required_growth.max(TITLEBAR_ACTIVE_TAB_GROWTH)
+}
+
 fn terminal_layout_for_pixels(
     viewport_width: f32,
     viewport_height: f32,
@@ -4607,6 +5262,10 @@ fn main_window_options(cx: &App) -> WindowOptions {
         window_background: WindowBackgroundAppearance::Blurred,
         titlebar: Some(TitlebarOptions {
             appears_transparent: true,
+            traffic_light_position: Some(point(
+                px(TRAFFIC_LIGHT_INSET_X),
+                px(TRAFFIC_LIGHT_INSET_Y),
+            )),
             ..Default::default()
         }),
         ..Default::default()
@@ -4654,6 +5313,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titlebar_width_estimate_reserves_more_space_for_wide_characters() {
+        assert!(
+            estimated_titlebar_label_width("标题测试") > estimated_titlebar_label_width("test")
+        );
+        assert_eq!(estimated_titlebar_label_width(""), 20.0);
+    }
 
     #[test]
     fn profile_auth_kind_reflects_saved_configuration() {

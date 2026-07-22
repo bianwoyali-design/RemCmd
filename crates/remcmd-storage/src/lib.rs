@@ -4,7 +4,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use remcmd_core::{ConnectionProfile, ThemeMode};
+use remcmd_core::{ConnectionProfile, TabLayout, ThemeMode};
 
 mod credentials;
 pub use credentials::{
@@ -30,6 +30,8 @@ pub fn default_settings_path() -> io::Result<PathBuf> {
 pub struct AppSettings {
     #[serde(default)]
     pub theme_mode: ThemeMode,
+    #[serde(default)]
+    pub tab_layout: TabLayout,
 }
 
 pub fn ensure_profiles_file(path: &Path) -> io::Result<()> {
@@ -99,6 +101,7 @@ mod tests {
         let settings = load_settings(&directory.path().join("settings.json")).unwrap();
 
         assert_eq!(settings.theme_mode, ThemeMode::System);
+        assert_eq!(settings.tab_layout, TabLayout::Vertical);
     }
 
     #[test]
@@ -107,11 +110,24 @@ mod tests {
         let path = directory.path().join("nested/settings.json");
         let settings = AppSettings {
             theme_mode: ThemeMode::Dark,
+            tab_layout: TabLayout::Horizontal,
         };
 
         save_settings(&path, &settings).unwrap();
 
         assert_eq!(load_settings(&path).unwrap(), settings);
+    }
+
+    #[test]
+    fn old_settings_default_to_vertical_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"theme_mode":"light"}"#).unwrap();
+
+        let settings = load_settings(&path).unwrap();
+
+        assert_eq!(settings.theme_mode, ThemeMode::Light);
+        assert_eq!(settings.tab_layout, TabLayout::Vertical);
     }
 
     #[test]
