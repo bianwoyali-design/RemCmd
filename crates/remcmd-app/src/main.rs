@@ -3871,17 +3871,34 @@ impl RemCmdApp {
                 "Toggle sidebar",
                 self.left_sidebar_open,
             )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_left_sidebar(cx)));
+        let left_sidebar_group = div()
+            .id("titlebar_left_sidebar_group")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
+            .p(px(3.0))
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_add_border)
             .bg(self.theme.titlebar_tab_selected_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.titlebar_add_shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(5.0),
-                spread_radius: px(-2.0),
-            }])
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_left_sidebar(cx)));
+            .shadow(vec![
+                BoxShadow {
+                    color: self.theme.titlebar_add_shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(2.0),
+                    spread_radius: px(-0.5),
+                },
+                BoxShadow {
+                    color: self.theme.titlebar_add_shadow,
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(7.0),
+                    spread_radius: px(-2.5),
+                },
+            ])
+            .overflow_hidden()
+            .child(left_sidebar_button);
         let leading = div()
             .flex()
             .flex_none()
@@ -3889,8 +3906,8 @@ impl RemCmdApp {
             .w(px(leading_width))
             .h_full()
             .child(drag_area().flex_1())
-            .child(left_sidebar_button)
-            .child(drag_area().w(px(13.0)))
+            .child(left_sidebar_group)
+            .child(drag_area().w(px(10.0)))
             .with_animation(
                 SharedString::from(format!(
                     "titlebar-leading-{leading_transition_id}-{left_sidebar_open}"
