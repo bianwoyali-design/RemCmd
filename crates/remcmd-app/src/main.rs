@@ -2991,7 +2991,6 @@ impl RemCmdApp {
     }
 
     fn terminal_tab_title(&self, tab: &TerminalTab) -> String {
-        // Keep both tab layouts on this placeholder until SSH exposes reliable cwd events.
         let terminal_number = self
             .tabs
             .iter()
@@ -2999,7 +2998,13 @@ impl RemCmdApp {
             .filter(|candidate| candidate.profile_id == tab.profile_id)
             .count()
             + 1;
-        format!("Terminal {terminal_number}")
+        let sftp_path = self
+            .pane(tab.active_pane_id)
+            .and_then(|pane| self.session(pane.session_id))
+            .filter(|session| session.sftp.loaded)
+            .map(|session| session.sftp.path.as_str());
+
+        workspace_tab_title(tab.view, terminal_number, sftp_path)
     }
 
     fn render_titlebar_tabs(
@@ -5594,6 +5599,17 @@ fn estimated_titlebar_label_width(label: &str) -> f32 {
         .max(20.0)
 }
 
+fn workspace_tab_title(
+    view: TerminalTabView,
+    terminal_number: usize,
+    sftp_path: Option<&str>,
+) -> String {
+    match view {
+        TerminalTabView::Terminal => format!("Terminal {terminal_number}"),
+        TerminalTabView::Files => sftp_path.unwrap_or("Files").to_owned(),
+    }
+}
+
 fn remote_parent_path(path: &str) -> Option<String> {
     let path = path.trim_end_matches('/');
     if path.is_empty() || path == "." {
@@ -5829,6 +5845,22 @@ mod tests {
         assert_eq!(remote_parent_path("/home"), Some("/".into()));
         assert_eq!(remote_parent_path("/home/test/"), Some("/home".into()));
         assert_eq!(remote_parent_path("relative"), Some(".".into()));
+    }
+
+    #[test]
+    fn file_tab_title_uses_only_a_loaded_canonical_path() {
+        assert_eq!(
+            workspace_tab_title(TerminalTabView::Files, 1, Some("/home/test")),
+            "/home/test"
+        );
+        assert_eq!(
+            workspace_tab_title(TerminalTabView::Files, 1, None),
+            "Files"
+        );
+        assert_eq!(
+            workspace_tab_title(TerminalTabView::Terminal, 2, Some("/ignored")),
+            "Terminal 2"
+        );
     }
 
     #[test]
