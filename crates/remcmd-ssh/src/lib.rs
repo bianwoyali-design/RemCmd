@@ -15,6 +15,9 @@ pub use connection::{
 pub use error::{SshError, SshErrorKind};
 pub use host_key::HostKeyInfo;
 pub use session::{SessionState, SshSession};
-pub use sftp::{RemoteDirectory, RemoteFileEntry, RemoteFileKind};
+pub use sftp::{
+    MAX_REMOTE_FILE_BYTES, RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind,
+    SftpOperation,
+};
 pub use shell::{PtySize, ShellEvent, SshShell, SshShellReader, SshShellWriter};
 pub use transport::SshTransport;

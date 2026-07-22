@@ -1,6 +1,9 @@
 mod text_field;
 use text_field::{TextField, bind_text_field_keys};
 
+mod file_editor;
+use file_editor::{FileEditor, FileEditorEvent, bind_file_editor_keys};
+
 mod pane_layout;
 use pane_layout::{PaneId, PaneLayout, SplitAxis};
 
@@ -49,8 +52,9 @@ use gpui::PathPromptOptions;
 
 use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode};
 use remcmd_ssh::{
-    AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, PtySize, RemoteDirectory,
-    RemoteFileEntry, RemoteFileKind, SessionState, ShellEvent, SshConnection, SshErrorKind,
+    AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
+    RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, SessionState, SftpOperation,
+    ShellEvent, SshConnection, SshErrorKind,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -344,6 +348,7 @@ enum TerminalTabView {
 struct SftpBrowserState {
     path: String,
     entries: Vec<RemoteFileEntry>,
+    file: Option<SftpFileState>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -358,6 +363,7 @@ impl Default for SftpBrowserState {
         Self {
             path: ".".into(),
             entries: Vec::new(),
+            file: None,
             loading: false,
             loaded: false,
             error: None,
@@ -382,6 +388,7 @@ impl SftpBrowserState {
         self.active_request_path = Some(path);
         self.loading = true;
         self.error = None;
+        self.file = None;
         request_id
     }
 
@@ -416,6 +423,152 @@ impl SftpBrowserState {
         self.loading = false;
         self.active_request_id = None;
         self.active_request_path = None;
+        if let Some(file) = self.file.as_mut() {
+            file.loading = false;
+            file.saving = false;
+            file.read_request_id = None;
+            file.write_request_id = None;
+        }
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        request_id
+    }
+
+    fn begin_file_request(&mut self, path: String) -> u64 {
+        let request_id = self.next_request_id();
+        self.file = Some(SftpFileState {
+            path,
+            original_contents: Vec::new(),
+            editor: None,
+            text_format: None,
+            loading: true,
+            saving: false,
+            error: None,
+            read_request_id: Some(request_id),
+            write_request_id: None,
+        });
+        request_id
+    }
+
+    fn begin_file_save(&mut self) -> Option<u64> {
+        let request_id = self.next_request_id();
+        let file = self.file.as_mut()?;
+        file.saving = true;
+        file.error = None;
+        file.write_request_id = Some(request_id);
+        Some(request_id)
+    }
+
+    fn fail_file_request(&mut self, request_id: u64, operation: SftpOperation, error: String) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        match operation {
+            SftpOperation::ReadFile if file.read_request_id == Some(request_id) => {
+                file.loading = false;
+                file.read_request_id = None;
+                file.error = Some(error);
+            }
+            SftpOperation::WriteFile if file.write_request_id == Some(request_id) => {
+                file.saving = false;
+                file.write_request_id = None;
+                file.error = Some(error);
+            }
+            SftpOperation::ReadDirectory | SftpOperation::ReadFile | SftpOperation::WriteFile => {}
+        }
+    }
+
+    fn display_path(&self) -> &str {
+        self.file
+            .as_ref()
+            .map(|file| file.path.as_str())
+            .unwrap_or(&self.path)
+    }
+}
+
+struct SftpFileState {
+    path: String,
+    original_contents: Vec<u8>,
+    editor: Option<Entity<FileEditor>>,
+    text_format: Option<RemoteTextFormat>,
+    loading: bool,
+    saving: bool,
+    error: Option<String>,
+    read_request_id: Option<u64>,
+    write_request_id: Option<u64>,
+}
+
+impl SftpFileState {
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.editor
+            .as_ref()
+            .zip(self.text_format)
+            .is_some_and(|(editor, format)| {
+                format.encode(editor.read(cx).text()).as_slice() != self.original_contents
+            })
+    }
+
+    fn edited_contents(&self, cx: &App) -> Option<Vec<u8>> {
+        self.editor
+            .as_ref()
+            .zip(self.text_format)
+            .map(|(editor, format)| format.encode(editor.read(cx).text()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteTextFormat {
+    utf8_bom: bool,
+    line_ending: RemoteLineEnding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteLineEnding {
+    Lf,
+    CrLf,
+}
+
+impl RemoteTextFormat {
+    fn decode(contents: &[u8]) -> Option<(Self, String)> {
+        if contents.contains(&0) {
+            return None;
+        }
+        let (utf8_bom, text_bytes) = contents
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .map_or((false, contents), |contents| (true, contents));
+        let text = std::str::from_utf8(text_bytes).ok()?;
+        let line_ending = if text.contains("\r\n") {
+            RemoteLineEnding::CrLf
+        } else {
+            RemoteLineEnding::Lf
+        };
+        let text = match line_ending {
+            RemoteLineEnding::Lf => text.to_owned(),
+            RemoteLineEnding::CrLf => text.replace("\r\n", "\n"),
+        };
+        Some((
+            Self {
+                utf8_bom,
+                line_ending,
+            },
+            text,
+        ))
+    }
+
+    fn encode(self, text: &str) -> Vec<u8> {
+        let text = match self.line_ending {
+            RemoteLineEnding::Lf => text.to_owned(),
+            RemoteLineEnding::CrLf => text.replace('\n', "\r\n"),
+        };
+        let mut contents = Vec::with_capacity(text.len() + usize::from(self.utf8_bom) * 3);
+        if self.utf8_bom {
+            contents.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        }
+        contents.extend_from_slice(text.as_bytes());
+        contents
     }
 }
 
@@ -711,7 +864,7 @@ impl RemCmdApp {
                 .as_ref()
                 .and_then(|terminal| terminal.remote_cwd.clone())
                 .unwrap_or_else(|| ".".into());
-            let needs_load = session.sftp.needs_request(&path);
+            let needs_load = session.sftp.file.is_none() && session.sftp.needs_request(&path);
             (path, needs_load)
         }) else {
             return;
@@ -783,6 +936,186 @@ impl RemCmdApp {
             return;
         };
         self.request_sftp_directory(session_id, parent, cx);
+    }
+
+    fn open_remote_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        let handle = self.session(session_id).and_then(|session| {
+            (session.connection_state == SessionState::Connected)
+                .then(|| session.connection_handle.clone())
+                .flatten()
+        });
+        let Some(handle) = handle else {
+            return;
+        };
+
+        let request_id = self
+            .session_mut(session_id)
+            .expect("SFTP session should still exist")
+            .sftp
+            .begin_file_request(path.clone());
+        if let Err(error) = handle.read_file(request_id, path)
+            && let Some(session) = self.session_mut(session_id)
+        {
+            session
+                .sftp
+                .fail_file_request(request_id, SftpOperation::ReadFile, error.to_string());
+        }
+        cx.notify();
+    }
+
+    fn complete_remote_file_read(
+        &mut self,
+        session_id: SessionId,
+        request_id: u64,
+        file: RemoteFile,
+        cx: &mut Context<Self>,
+    ) {
+        let is_current = self
+            .session(session_id)
+            .and_then(|session| session.sftp.file.as_ref())
+            .is_some_and(|state| state.read_request_id == Some(request_id));
+        if !is_current {
+            return;
+        }
+
+        let decoded = RemoteTextFormat::decode(&file.contents);
+        let editor = decoded.as_ref().map(|(_, text)| {
+            let editor = cx.new(|cx| FileEditor::new(cx, text.clone()));
+            cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+            cx.subscribe(&editor, move |this, _, event, cx| match event {
+                FileEditorEvent::SaveRequested => this.save_remote_file(session_id, cx),
+            })
+            .detach();
+            editor
+        });
+
+        if let Some(state) = self
+            .session_mut(session_id)
+            .and_then(|session| session.sftp.file.as_mut())
+            .filter(|state| state.read_request_id == Some(request_id))
+        {
+            state.path = file.path;
+            state.original_contents = file.contents;
+            state.text_format = decoded.map(|(format, _)| format);
+            state.editor = editor;
+            state.loading = false;
+            state.error = None;
+            state.read_request_id = None;
+        }
+    }
+
+    fn save_remote_file(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let Some((handle, path, expected_contents, contents)) =
+            self.session(session_id).and_then(|session| {
+                let handle = (session.connection_state == SessionState::Connected)
+                    .then(|| session.connection_handle.clone())
+                    .flatten()?;
+                let file = session.sftp.file.as_ref()?;
+                let contents = file.edited_contents(cx)?;
+                (!file.loading && !file.saving && contents != file.original_contents).then(|| {
+                    (
+                        handle,
+                        file.path.clone(),
+                        file.original_contents.clone(),
+                        contents,
+                    )
+                })
+            })
+        else {
+            return;
+        };
+
+        if contents.len() > MAX_REMOTE_FILE_BYTES {
+            if let Some(file) = self
+                .session_mut(session_id)
+                .and_then(|session| session.sftp.file.as_mut())
+            {
+                file.error = Some(format!(
+                    "File exceeds the {} MB editor limit",
+                    MAX_REMOTE_FILE_BYTES / 1024 / 1024
+                ));
+            }
+            cx.notify();
+            return;
+        }
+
+        let Some(request_id) = self
+            .session_mut(session_id)
+            .and_then(|session| session.sftp.begin_file_save())
+        else {
+            return;
+        };
+        if let Err(error) = handle.write_file(request_id, path, expected_contents, contents)
+            && let Some(session) = self.session_mut(session_id)
+        {
+            session
+                .sftp
+                .fail_file_request(request_id, SftpOperation::WriteFile, error.to_string());
+        }
+        cx.notify();
+    }
+
+    fn complete_remote_file_write(
+        &mut self,
+        session_id: SessionId,
+        request_id: u64,
+        file: RemoteFile,
+    ) {
+        let Some(state) = self
+            .session_mut(session_id)
+            .and_then(|session| session.sftp.file.as_mut())
+            .filter(|state| state.write_request_id == Some(request_id))
+        else {
+            return;
+        };
+        state.path = file.path;
+        state.original_contents = file.contents;
+        state.saving = false;
+        state.error = None;
+        state.write_request_id = None;
+    }
+
+    fn revert_remote_file(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let replacement = self
+            .session(session_id)
+            .and_then(|session| session.sftp.file.as_ref())
+            .and_then(|file| {
+                Some((
+                    file.editor.clone()?,
+                    RemoteTextFormat::decode(&file.original_contents)?.1,
+                ))
+            });
+        if let Some((editor, text)) = replacement {
+            editor.update(cx, |editor, cx| editor.replace_all(text, cx));
+        }
+        if let Some(file) = self
+            .session_mut(session_id)
+            .and_then(|session| session.sftp.file.as_mut())
+        {
+            file.error = None;
+        }
+        cx.notify();
+    }
+
+    fn close_remote_file(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let dirty = self
+            .session(session_id)
+            .and_then(|session| session.sftp.file.as_ref())
+            .is_some_and(|file| file.is_dirty(cx));
+        if dirty {
+            if let Some(file) = self
+                .session_mut(session_id)
+                .and_then(|session| session.sftp.file.as_mut())
+            {
+                file.error = Some("Save or revert your changes before closing this file".into());
+            }
+        } else if let Some(session) = self.session_mut(session_id) {
+            session.sftp.file = None;
+        }
+        cx.notify();
     }
 
     fn create_tab_for_session(
@@ -1679,6 +2012,12 @@ impl RemCmdApp {
         let Some(session_id) = self.pane(pane_id).map(|pane| pane.session_id) else {
             return;
         };
+        if self.block_close_for_unsaved_file(session_id, cx) {
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.view = TerminalTabView::Files;
+            }
+            return;
+        }
 
         if self.remove_pane(pane_id, cx) {
             self.close_session(session_id, cx);
@@ -2865,13 +3204,33 @@ impl RemCmdApp {
                 }
                 true
             }
+            ConnectionEvent::FileRead { request_id, file } => {
+                self.complete_remote_file_read(session_id, request_id, file, cx);
+                true
+            }
+            ConnectionEvent::FileWritten { request_id, file } => {
+                self.complete_remote_file_write(session_id, request_id, file);
+                true
+            }
             ConnectionEvent::SftpFailed {
                 request_id,
                 path: _,
+                operation,
                 error,
             } => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.sftp.fail_request(request_id, error.to_string());
+                    match operation {
+                        SftpOperation::ReadDirectory => {
+                            session.sftp.fail_request(request_id, error.to_string());
+                        }
+                        SftpOperation::ReadFile | SftpOperation::WriteFile => {
+                            session.sftp.fail_file_request(
+                                request_id,
+                                operation,
+                                error.to_string(),
+                            );
+                        }
+                    }
                 }
                 true
             }
@@ -3050,7 +3409,7 @@ impl RemCmdApp {
             .pane(tab.active_pane_id)
             .and_then(|pane| self.session(pane.session_id))
             .filter(|session| session.sftp.loaded)
-            .map(|session| session.sftp.path.as_str());
+            .map(|session| session.sftp.display_path());
         let remote_cwd = self
             .pane(tab.active_pane_id)
             .and_then(|pane| self.session(pane.session_id))
@@ -3528,6 +3887,25 @@ impl RemCmdApp {
     }
 
     fn close_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let unsaved = self
+            .panes
+            .iter()
+            .filter(|pane| pane.tab_id == tab_id)
+            .find_map(|pane| {
+                self.session(pane.session_id)
+                    .and_then(|session| session.sftp.file.as_ref())
+                    .filter(|file| file.is_dirty(cx))
+                    .map(|_| (pane.id, pane.session_id))
+            });
+        if let Some((pane_id, session_id)) = unsaved {
+            self.set_active_pane(pane_id, cx);
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.view = TerminalTabView::Files;
+            }
+            self.block_close_for_unsaved_file(session_id, cx);
+            return;
+        }
+
         if self.hovered_titlebar_tab_id == Some(tab_id) {
             self.hovered_titlebar_tab_id = None;
         }
@@ -3552,6 +3930,28 @@ impl RemCmdApp {
             self.close_session(session_id, cx);
         }
         cx.notify();
+    }
+
+    fn block_close_for_unsaved_file(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let dirty = self
+            .session(session_id)
+            .and_then(|session| session.sftp.file.as_ref())
+            .is_some_and(|file| file.is_dirty(cx));
+        if dirty {
+            if let Some(file) = self
+                .session_mut(session_id)
+                .and_then(|session| session.sftp.file.as_mut())
+            {
+                file.error =
+                    Some("Save or revert your changes before closing this terminal".into());
+            }
+            cx.notify();
+        }
+        dirty
     }
 
     fn reconnect_session(
@@ -4975,6 +5375,9 @@ impl RemCmdApp {
         let Some(session) = self.session(session_id) else {
             return div().into_any_element();
         };
+        if session.sftp.file.is_some() {
+            return self.render_sftp_file(session_id, cx);
+        }
         let path = session.sftp.path.clone();
         let entries = session.sftp.entries.clone();
         let loading = session.sftp.loading;
@@ -5018,6 +5421,7 @@ impl RemCmdApp {
         } else {
             for entry in entries {
                 let is_directory = entry.kind == RemoteFileKind::Directory;
+                let is_file = entry.kind == RemoteFileKind::File;
                 let entry_path = entry.path.clone();
                 let icon_name = if is_directory {
                     IconName::Folder
@@ -5060,13 +5464,17 @@ impl RemCmdApp {
                             .text_color(self.theme.text_muted)
                             .child(size),
                     );
-                if is_directory && connected && !loading {
+                if (is_directory || is_file) && connected && !loading {
                     row = row
                         .cursor_pointer()
                         .hover(move |this| this.bg(list_hover))
                         .active(move |this| this.bg(pressed))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_remote_directory(entry_path.clone(), cx);
+                            if is_directory {
+                                this.open_remote_directory(entry_path.clone(), cx);
+                            } else {
+                                this.open_remote_file(entry_path.clone(), cx);
+                            }
                         }));
                 }
                 list = list.child(row);
@@ -5161,6 +5569,155 @@ impl RemCmdApp {
         }
 
         browser.child(list).into_any_element()
+    }
+
+    fn render_sftp_file(&self, session_id: SessionId, cx: &mut Context<Self>) -> AnyElement {
+        let Some(session) = self.session(session_id) else {
+            return div().into_any_element();
+        };
+        let Some(file) = session.sftp.file.as_ref() else {
+            return div().into_any_element();
+        };
+        let path = file.path.clone();
+        let editor = file.editor.clone();
+        let loading = file.loading;
+        let saving = file.saving;
+        let error = file.error.clone();
+        let binary = !loading && error.is_none() && file.text_format.is_none();
+        let dirty = file.is_dirty(cx);
+        let connected = session.connection_state == SessionState::Connected;
+        let size = file.original_contents.len() as u64;
+
+        let mut back_button = self.render_icon_button(
+            "sftp_close_file",
+            IconName::ArrowLeft,
+            "Back to directory",
+            IconTone::Default,
+            !saving,
+        );
+        if !saving {
+            back_button = back_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.close_remote_file(session_id, cx);
+            }));
+        }
+
+        let mut revert_button = text_button(
+            "sftp_revert_file",
+            "Revert",
+            TextButtonTone::Secondary,
+            dirty && !saving,
+            &self.theme,
+        );
+        if dirty && !saving {
+            revert_button = revert_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.revert_remote_file(session_id, cx);
+            }));
+        }
+
+        let can_save = dirty && !saving && connected;
+        let mut save_button = text_button(
+            "sftp_save_file",
+            if saving { "Saving" } else { "Save" },
+            TextButtonTone::Primary,
+            can_save,
+            &self.theme,
+        );
+        if can_save {
+            save_button = save_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.save_remote_file(session_id, cx);
+            }));
+        }
+
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0));
+        if loading {
+            content = content
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(self.theme.text_muted)
+                .child("Loading remote file...");
+        } else if binary {
+            content = content
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_sm()
+                .text_color(self.theme.text_muted)
+                .child(self.render_sidebar_icon(IconName::File, 20.0))
+                .child("Binary or non-UTF-8 files cannot be edited")
+                .child(format_remote_size(size));
+        } else if let Some(editor) = editor {
+            content = content.child(editor);
+        }
+
+        div()
+            .id("sftp_file")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .mt_4()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.panel_bg)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .h(px(40.0))
+                    .px_2()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(back_button)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .ml_2()
+                            .truncate()
+                            .font_family(TERMINAL_FONT_FAMILY)
+                            .text_sm()
+                            .child(path),
+                    )
+                    .when(dirty, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .mr_2()
+                                .text_sm()
+                                .text_color(self.theme.text_muted)
+                                .child("Modified"),
+                        )
+                    })
+                    .child(revert_button)
+                    .child(save_button),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(self.theme.border)
+                        .bg(self.theme.control_bg)
+                        .text_sm()
+                        .text_color(self.theme.error_text)
+                        .child(error),
+                )
+            })
+            .child(content)
+            .into_any_element()
     }
 
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5869,6 +6426,7 @@ fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
 
     bind_text_field_keys(cx);
+    bind_file_editor_keys(cx);
     bind_credential_prompt_keys(cx);
     bind_host_key_prompt_keys(cx);
     open_main_window(cx);
@@ -5973,6 +6531,23 @@ mod tests {
 
         assert!(!browser.needs_request("."));
         assert!(browser.needs_request("/var/log"));
+    }
+
+    #[test]
+    fn remote_text_format_preserves_utf8_bom_and_crlf() {
+        let contents = b"\xef\xbb\xbffirst\r\nsecond\r\n";
+        let (format, text) = RemoteTextFormat::decode(contents).expect("UTF-8 text");
+
+        assert_eq!(text, "first\nsecond\n");
+        assert_eq!(format.line_ending, RemoteLineEnding::CrLf);
+        assert!(format.utf8_bom);
+        assert_eq!(format.encode(&text), contents);
+    }
+
+    #[test]
+    fn remote_text_format_rejects_binary_and_invalid_utf8() {
+        assert!(RemoteTextFormat::decode(b"text\0data").is_none());
+        assert!(RemoteTextFormat::decode(&[0xff, 0xfe]).is_none());
     }
 
     #[test]

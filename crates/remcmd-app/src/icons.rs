@@ -9,6 +9,7 @@ use crate::theme::{IconTone, Theme};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum IconName {
     Add,
+    ArrowLeft,
     ArrowUp,
     Cancel,
     ClosePane,
@@ -34,6 +35,7 @@ impl IconName {
     const fn asset_path(self) -> &'static str {
         match self {
             Self::Add => "icons/add.svg",
+            Self::ArrowLeft => "icons/arrow-left.svg",
             Self::ArrowUp => "icons/arrow-up.svg",
             Self::Cancel => "icons/cancel.svg",
             Self::ClosePane => "icons/close-pane.svg",
@@ -59,6 +61,7 @@ impl IconName {
     fn from_asset_path(path: &str) -> Option<Self> {
         Some(match path {
             "icons/add.svg" => Self::Add,
+            "icons/arrow-left.svg" => Self::ArrowLeft,
             "icons/arrow-up.svg" => Self::ArrowUp,
             "icons/cancel.svg" => Self::Cancel,
             "icons/close-pane.svg" => Self::ClosePane,
@@ -85,6 +88,7 @@ impl IconName {
     const fn body(self) -> &'static str {
         match self {
             Self::Add => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
+            Self::ArrowLeft => r#"<path d="m15 18-6-6 6-6"/>"#,
             Self::ArrowUp => r#"<path d="m18 15-6-6-6 6"/>"#,
             Self::Cancel => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
             Self::ClosePane => {

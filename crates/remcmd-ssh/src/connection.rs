@@ -10,9 +10,9 @@ use remcmd_core::ConnectionProfile;
 use tokio::{runtime::Handle, sync::mpsc};
 
 use crate::{
-    AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, SessionState, ShellEvent, SshError,
-    SshErrorKind, SshSession, SshShellWriter, SshTransport, host_key::HostKeyDecision,
-    sftp::SftpWorkerHandle, transport::TransportOpen,
+    AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteFile, SessionState, SftpOperation,
+    ShellEvent, SshError, SshErrorKind, SshSession, SshShellWriter, SshTransport,
+    host_key::HostKeyDecision, sftp::SftpWorkerHandle, transport::TransportOpen,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -31,6 +31,17 @@ pub enum ConnectionCommand {
 
     /// Reads one remote directory through an SFTP subsystem channel.
     ReadDirectory { request_id: u64, path: String },
+
+    /// Reads one remote file through an SFTP subsystem channel.
+    ReadFile { request_id: u64, path: String },
+
+    /// Replaces a remote file if its contents have not changed since it was read.
+    WriteFile {
+        request_id: u64,
+        path: String,
+        expected_contents: Vec<u8>,
+        contents: Vec<u8>,
+    },
 
     /// Requests an orderly shell and transport shutdown.
     Disconnect,
@@ -57,10 +68,17 @@ pub enum ConnectionEvent {
         directory: RemoteDirectory,
     },
 
+    /// Returns one canonical remote path and its file contents.
+    FileRead { request_id: u64, file: RemoteFile },
+
+    /// Confirms that a remote file was replaced and returns its saved contents.
+    FileWritten { request_id: u64, file: RemoteFile },
+
     /// Reports an SFTP operation failure without failing the SSH shell.
     SftpFailed {
         request_id: u64,
         path: String,
+        operation: SftpOperation,
         error: SshError,
     },
 
@@ -95,6 +113,30 @@ impl ConnectionHandle {
         self.send(ConnectionCommand::ReadDirectory {
             request_id,
             path: path.into(),
+        })
+    }
+
+    /// Requests one remote file through this SSH connection.
+    pub fn read_file(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
+        self.send(ConnectionCommand::ReadFile {
+            request_id,
+            path: path.into(),
+        })
+    }
+
+    /// Replaces one remote file if it still matches the supplied original contents.
+    pub fn write_file(
+        &self,
+        request_id: u64,
+        path: impl Into<String>,
+        expected_contents: Vec<u8>,
+        contents: Vec<u8>,
+    ) -> Result<(), SshError> {
+        self.send(ConnectionCommand::WriteFile {
+            request_id,
+            path: path.into(),
+            expected_contents,
+            contents,
         })
     }
 
@@ -230,7 +272,11 @@ where
                     Some(ConnectionCommand::Input(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
-                    Some(ConnectionCommand::ReadDirectory { .. }) => {
+                    Some(
+                        ConnectionCommand::ReadDirectory { .. }
+                        | ConnectionCommand::ReadFile { .. }
+                        | ConnectionCommand::WriteFile { .. },
+                    ) => {
                         // SFTP requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
@@ -266,7 +312,11 @@ async fn wait_for_host_key_decision(
                     Some(ConnectionCommand::Input(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
-                    Some(ConnectionCommand::ReadDirectory { .. }) => {
+                    Some(
+                        ConnectionCommand::ReadDirectory { .. }
+                        | ConnectionCommand::ReadFile { .. }
+                        | ConnectionCommand::WriteFile { .. },
+                    ) => {
                         // SFTP requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
@@ -540,6 +590,7 @@ async fn run_connection(
                                 .send(ConnectionEvent::SftpFailed {
                                     request_id,
                                     path,
+                                    operation: SftpOperation::ReadDirectory,
                                     error,
                                 })
                                 .await
@@ -559,6 +610,95 @@ async fn run_connection(
                         .send(ConnectionEvent::SftpFailed {
                             request_id,
                             path,
+                            operation: SftpOperation::ReadDirectory,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::ReadFile { request_id, path }) => {
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn(session, events.clone()));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path,
+                                    operation: SftpOperation::ReadFile,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) = worker.read_file(request_id, path.clone())
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path,
+                            operation: SftpOperation::ReadFile,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::WriteFile {
+                request_id,
+                path,
+                expected_contents,
+                contents,
+            }) => {
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn(session, events.clone()));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path,
+                                    operation: SftpOperation::WriteFile,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) =
+                        worker.write_file(request_id, path.clone(), expected_contents, contents)
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path,
+                            operation: SftpOperation::WriteFile,
                             error,
                         })
                         .await
