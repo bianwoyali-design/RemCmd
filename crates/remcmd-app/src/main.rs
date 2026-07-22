@@ -129,7 +129,8 @@ struct RemCmdApp {
     connections_expanded: bool,
     sidebar_width: f32,
     left_sidebar_open: bool,
-    left_sidebar_transition_id: u64,
+    left_sidebar_progress: f32,
+    left_sidebar_animation_task: Option<Task<()>>,
     sidebar_resize: Option<SidebarResize>,
     right_sidebar_open: bool,
     right_sidebar_width: f32,
@@ -771,7 +772,8 @@ impl RemCmdApp {
             connections_expanded: true,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             left_sidebar_open: true,
-            left_sidebar_transition_id: 0,
+            left_sidebar_progress: 1.0,
+            left_sidebar_animation_task: None,
             sidebar_resize: None,
             right_sidebar_open: false,
             right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
@@ -861,35 +863,38 @@ impl RemCmdApp {
     }
 
     fn effective_sidebar_width(&self, window: &Window) -> f32 {
-        clamp_sidebar_width(
-            self.sidebar_width,
-            f32::from(window.viewport_size().width),
-            0.0,
-        )
+        clamp_sidebar_width(self.sidebar_width, f32::from(window.viewport_size().width))
     }
 
     fn effective_right_sidebar_width(&self, window: &Window) -> f32 {
         let viewport_width = f32::from(window.viewport_size().width);
-        let left_sidebar_width = if self.left_sidebar_open {
-            clamp_sidebar_width(self.sidebar_width, viewport_width, 0.0)
-        } else {
-            0.0
-        };
+        let left_sidebar_width =
+            clamp_sidebar_width(self.sidebar_width, viewport_width) * self.left_sidebar_progress;
         clamp_right_sidebar_width(self.right_sidebar_width, viewport_width, left_sidebar_width)
     }
 
     fn titlebar_leading_width(&self, window: &Window) -> f32 {
-        if self.left_sidebar_open {
-            self.effective_sidebar_width(window)
-        } else {
-            COLLAPSED_TITLEBAR_LEADING_WIDTH
-        }
+        COLLAPSED_TITLEBAR_LEADING_WIDTH
+            + (self.effective_sidebar_width(window) - COLLAPSED_TITLEBAR_LEADING_WIDTH)
+                * self.left_sidebar_progress
     }
 
     fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
         self.left_sidebar_open = !self.left_sidebar_open;
-        self.left_sidebar_transition_id += 1;
         self.sidebar_resize = None;
+        let start = self.left_sidebar_progress;
+        let end = if self.left_sidebar_open { 1.0 } else { 0.0 };
+        self.left_sidebar_animation_task = Some(cx.spawn(async move |this, cx| {
+            for frame in 1..=12 {
+                Timer::after(Duration::from_millis(15)).await;
+                let progress = ease_in_out(frame as f32 / 12.0);
+                let value = start + (end - start) * progress;
+                let _ = this.update(cx, |this, cx| {
+                    this.left_sidebar_progress = value;
+                    cx.notify();
+                });
+            }
+        }));
         cx.notify();
     }
 
@@ -899,6 +904,10 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.left_sidebar_progress < 1.0 {
+            cx.stop_propagation();
+            return;
+        }
         self.sidebar_resize = Some(SidebarResize {
             start_x: event.position.x,
             start_width: self.effective_sidebar_width(window),
@@ -921,11 +930,7 @@ impl RemCmdApp {
         }
 
         let requested_width = resize.start_width + f32::from(event.position.x - resize.start_x);
-        let width = clamp_sidebar_width(
-            requested_width,
-            f32::from(window.viewport_size().width),
-            0.0,
-        );
+        let width = clamp_sidebar_width(requested_width, f32::from(window.viewport_size().width));
         if self.sidebar_width != width {
             self.sidebar_width = width;
             cx.notify();
@@ -969,11 +974,7 @@ impl RemCmdApp {
         let width = clamp_right_sidebar_width(
             requested_width,
             f32::from(window.viewport_size().width),
-            if self.left_sidebar_open {
-                self.effective_sidebar_width(window)
-            } else {
-                0.0
-            },
+            self.effective_sidebar_width(window) * self.left_sidebar_progress,
         );
         if self.right_sidebar_width != width {
             self.right_sidebar_width = width;
@@ -3516,41 +3517,15 @@ impl Render for RemCmdApp {
                 cx.listener(Self::finish_right_sidebar_resize),
             );
 
-        let left_sidebar_open = self.left_sidebar_open;
-        let left_transition_id = self.left_sidebar_transition_id;
-        let left_start_width = if left_transition_id == 0 || left_sidebar_open {
-            0.0
-        } else {
-            sidebar_width
-        };
-        let left_end_width = if left_sidebar_open {
-            sidebar_width
-        } else {
-            0.0
-        };
+        let rendered_left_sidebar_width = sidebar_width * self.left_sidebar_progress;
         root = root.child(
             div()
                 .flex()
                 .flex_none()
+                .w(px(rendered_left_sidebar_width))
                 .h_full()
                 .overflow_hidden()
-                .child(self.render_sidebar(sidebar_width, cx))
-                .with_animation(
-                    SharedString::from(format!(
-                        "left-sidebar-layout-{left_transition_id}-{left_sidebar_open}"
-                    )),
-                    Animation::new(if left_transition_id == 0 {
-                        Duration::from_millis(1)
-                    } else {
-                        Duration::from_millis(180)
-                    })
-                    .with_easing(ease_in_out),
-                    move |this, delta| {
-                        this.w(px(
-                            left_start_width + (left_end_width - left_start_width) * delta
-                        ))
-                    },
-                ),
+                .child(self.render_sidebar(sidebar_width, cx)),
         );
         root = root.child(self.render_detail_panel(selected_profile, cx));
         let right_sidebar_open = self.right_sidebar_open;
@@ -3588,8 +3563,8 @@ impl Render for RemCmdApp {
             ),
         );
         root = root.child(self.render_titlebar_tabs(window, cx));
-        if self.left_sidebar_open {
-            root = root.child(self.render_sidebar_resize_handle(sidebar_width, cx));
+        if self.left_sidebar_progress > 0.0 {
+            root = root.child(self.render_sidebar_resize_handle(rendered_left_sidebar_width, cx));
         }
         if self.right_sidebar_open {
             root = root.child(self.render_right_sidebar_resize_handle(right_sidebar_width, cx));
@@ -3855,15 +3830,6 @@ impl RemCmdApp {
         } else {
             0.0
         };
-        let leading_start_width = if self.left_sidebar_transition_id == 0 {
-            leading_width
-        } else if self.left_sidebar_open {
-            COLLAPSED_TITLEBAR_LEADING_WIDTH
-        } else {
-            self.effective_sidebar_width(window)
-        };
-        let leading_transition_id = self.left_sidebar_transition_id;
-        let left_sidebar_open = self.left_sidebar_open;
         let left_sidebar_button = self
             .render_titlebar_sidebar_button(
                 "toggle_left_sidebar",
@@ -3907,23 +3873,7 @@ impl RemCmdApp {
             .h_full()
             .child(drag_area().flex_1())
             .child(left_sidebar_group)
-            .child(drag_area().w(px(10.0)))
-            .with_animation(
-                SharedString::from(format!(
-                    "titlebar-leading-{leading_transition_id}-{left_sidebar_open}"
-                )),
-                Animation::new(if leading_transition_id == 0 {
-                    Duration::from_millis(1)
-                } else {
-                    Duration::from_millis(180)
-                })
-                .with_easing(ease_in_out),
-                move |this, delta| {
-                    this.w(px(
-                        leading_start_width + (leading_width - leading_start_width) * delta
-                    ))
-                },
-            );
+            .child(drag_area().w(px(10.0)));
         let titlebar = div()
             .id("window_titlebar")
             .absolute()
@@ -5282,8 +5232,6 @@ impl RemCmdApp {
 
     fn render_sidebar_resize_handle(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = self.theme.border_strong;
-        let transition_id = self.left_sidebar_transition_id;
-        let start_width = if transition_id == 0 { width } else { 0.0 };
         let resting = if self.sidebar_resize.is_some() {
             self.theme.border_strong
         } else {
@@ -5295,6 +5243,7 @@ impl RemCmdApp {
             .absolute()
             .top_0()
             .bottom_0()
+            .left(px(width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
             .flex()
             .items_center()
             .justify_center()
@@ -5304,19 +5253,6 @@ impl RemCmdApp {
             .hover(move |this| this.bg(hover))
             .child(div().w(px(1.0)).h_full().bg(resting))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_sidebar_resize))
-            .with_animation(
-                SharedString::from(format!("sidebar-resize-handle-{transition_id}")),
-                Animation::new(if transition_id == 0 {
-                    Duration::from_millis(1)
-                } else {
-                    Duration::from_millis(180)
-                })
-                .with_easing(ease_in_out),
-                move |this, delta| {
-                    let animated_width = start_width + (width - start_width) * delta;
-                    this.left(px(animated_width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
-                },
-            )
     }
 
     fn render_right_sidebar_resize_handle(
@@ -6794,11 +6730,8 @@ fn credentials_invalidated_by_edit(
         || profile.auth != *auth
 }
 
-fn clamp_sidebar_width(requested: f32, viewport_width: f32, right_sidebar_width: f32) -> f32 {
-    let available_width = (viewport_width
-        - right_sidebar_width
-        - MIN_DETAIL_PANEL_WIDTH
-        - SIDEBAR_RESIZE_HANDLE_WIDTH)
+fn clamp_sidebar_width(requested: f32, viewport_width: f32) -> f32 {
+    let available_width = (viewport_width - MIN_DETAIL_PANEL_WIDTH - SIDEBAR_RESIZE_HANDLE_WIDTH)
         .clamp(0.0, SIDEBAR_MAX_WIDTH);
 
     if available_width < SIDEBAR_MIN_WIDTH {
@@ -7076,14 +7009,14 @@ mod tests {
 
     #[test]
     fn sidebar_width_stays_within_layout_limits() {
-        assert_eq!(clamp_sidebar_width(120.0, 1200.0, 0.0), 220.0);
-        assert_eq!(clamp_sidebar_width(600.0, 1200.0, 0.0), 480.0);
-        assert_eq!(clamp_sidebar_width(300.0, 720.0, 0.0), 300.0);
+        assert_eq!(clamp_sidebar_width(120.0, 1200.0), 220.0);
+        assert_eq!(clamp_sidebar_width(600.0, 1200.0), 480.0);
+        assert_eq!(clamp_sidebar_width(300.0, 720.0), 300.0);
     }
 
     #[test]
     fn opening_right_sidebar_does_not_move_the_left_sidebar() {
-        let left_width = clamp_sidebar_width(300.0, 720.0, 0.0);
+        let left_width = clamp_sidebar_width(300.0, 720.0);
         let right_width = clamp_right_sidebar_width(340.0, 720.0, left_width);
 
         assert_eq!(left_width, 300.0);
