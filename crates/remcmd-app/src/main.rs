@@ -4177,12 +4177,8 @@ impl RemCmdApp {
                             this.connect_selected_profile_in_new_session(window, cx);
                         }));
                 }
-                let active_tab_matches = self
-                    .active_tab()
-                    .is_some_and(|tab| tab.profile_id == profile.id);
                 let is_selected = self.active_panel == ActivePanel::Connection
-                    && self.selected_profile_id.as_ref() == Some(&profile.id)
-                    && !active_tab_matches;
+                    && self.selected_profile_id.as_ref() == Some(&profile.id);
                 let background = if is_selected {
                     self.theme.list_selected_bg
                 } else {

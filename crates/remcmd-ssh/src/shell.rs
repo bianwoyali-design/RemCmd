@@ -146,14 +146,12 @@ impl SshShell {
             .await
             .map_err(SshError::from)?;
 
-        let (startup_output, ready_output) =
-            Self::read_until_marker(channel, INTEGRATION_READY_MARKER).await?;
+        let (_, ready_output) = Self::read_until_marker(channel, INTEGRATION_READY_MARKER).await?;
         let mut initial_events = VecDeque::new();
 
-        let startup_output = complete_startup_lines(&startup_output);
-        if !startup_output.is_empty() {
-            initial_events.push_back(ShellEvent::Output(startup_output));
-        }
+        // The first prompt can span multiple lines, and there is no protocol
+        // boundary that reliably separates it from MOTD output. Drop all
+        // pre-marker output so installing the hook cannot duplicate a prompt.
         if !ready_output.is_empty() {
             initial_events.push_back(ShellEvent::Output(ready_output));
         }
@@ -325,17 +323,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
-}
-
-fn complete_startup_lines(output: &[u8]) -> Vec<u8> {
-    let before_injection = find_bytes(output, INTEGRATION_COMMAND_PREFIX.as_bytes())
-        .map_or(output, |index| &output[..index]);
-    let complete_line_end = before_injection
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-
-    before_injection[..complete_line_end].to_vec()
 }
 
 impl SshShellWriter {

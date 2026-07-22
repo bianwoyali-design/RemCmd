@@ -376,10 +376,6 @@ async fn shell_integration_preserves_native_shell_and_stays_hidden() {
 
     assert_eq!(
         reader.next_event().await,
-        ShellEvent::Output(b"welcome\r\n".to_vec())
-    );
-    assert_eq!(
-        reader.next_event().await,
         ShellEvent::Output(b"\r\x1b[2K\x1b]7;file:///home/tester\x07starship-prompt".to_vec())
     );
     {
