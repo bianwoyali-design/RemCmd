@@ -74,6 +74,7 @@ const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 const SIDEBAR_DEFAULT_WIDTH: f32 = 300.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
+const SIDEBAR_SFTP_REQUEST_ID_START: u64 = 1 << 63;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
 const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 340.0;
 const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 260.0;
@@ -188,6 +189,7 @@ struct TerminalSession {
     terminal_resize_task: Option<Task<()>>,
     connection_credential: Option<ConnectionCredential>,
     sftp: SftpBrowserState,
+    sidebar_sftp: SftpBrowserState,
 }
 
 impl TerminalSession {
@@ -210,6 +212,21 @@ impl TerminalSession {
             terminal_resize_task: None,
             connection_credential: None,
             sftp: SftpBrowserState::default(),
+            sidebar_sftp: SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START),
+        }
+    }
+
+    fn sftp_browser(&self, placement: SftpBrowserPlacement) -> &SftpBrowserState {
+        match placement {
+            SftpBrowserPlacement::Center => &self.sftp,
+            SftpBrowserPlacement::Sidebar => &self.sidebar_sftp,
+        }
+    }
+
+    fn sftp_browser_mut(&mut self, placement: SftpBrowserPlacement) -> &mut SftpBrowserState {
+        match placement {
+            SftpBrowserPlacement::Center => &mut self.sftp,
+            SftpBrowserPlacement::Sidebar => &mut self.sidebar_sftp,
         }
     }
 
@@ -363,6 +380,21 @@ enum TerminalTabView {
     Files,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SftpBrowserPlacement {
+    Center,
+    Sidebar,
+}
+
+impl SftpBrowserPlacement {
+    fn element_suffix(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Sidebar => "sidebar",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SidebarResize {
     start_x: Pixels,
@@ -400,6 +432,13 @@ impl Default for SftpBrowserState {
 }
 
 impl SftpBrowserState {
+    fn with_request_id_start(next_request_id: u64) -> Self {
+        Self {
+            next_request_id,
+            ..Self::default()
+        }
+    }
+
     fn needs_request(&self, path: &str) -> bool {
         self.active_request_path.as_deref() != Some(path)
             && self.resolved_source_path.as_deref() != Some(path)
@@ -997,15 +1036,10 @@ impl RemCmdApp {
         self.right_sidebar_open = !self.right_sidebar_open;
         self.right_sidebar_transition_id += 1;
         self.right_sidebar_resize = None;
-        if self.right_sidebar_open {
-            if let Some(tab_id) = self.active_tab_id
-                && let Some(tab) = self.tab_mut(tab_id)
-            {
-                tab.view = TerminalTabView::Terminal;
-            }
-            if let Some(session_id) = self.active_session_id {
-                self.ensure_sftp_directory(session_id, cx);
-            }
+        if self.right_sidebar_open
+            && let Some(session_id) = self.active_session_id
+        {
+            self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
         }
         cx.notify();
     }
@@ -1026,13 +1060,6 @@ impl RemCmdApp {
             tab.view = view;
         }
 
-        if view == TerminalTabView::Files {
-            if self.right_sidebar_open {
-                self.right_sidebar_transition_id += 1;
-            }
-            self.right_sidebar_open = false;
-        }
-
         match view {
             TerminalTabView::Terminal => {
                 if let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
@@ -1040,31 +1067,42 @@ impl RemCmdApp {
                     focus_handle.focus(window);
                 }
             }
-            TerminalTabView::Files => self.ensure_sftp_directory(session_id, cx),
+            TerminalTabView::Files => {
+                self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Center, cx)
+            }
         }
         cx.notify();
     }
 
-    fn ensure_sftp_directory(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+    fn ensure_sftp_directory(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
         let Some((path, needs_load)) = self.session(session_id).map(|session| {
             let path = session
                 .terminal
                 .as_ref()
                 .and_then(|terminal| terminal.remote_cwd.clone())
                 .unwrap_or_else(|| ".".into());
-            let needs_load = session.sftp.file.is_none() && session.sftp.needs_request(&path);
+            let browser = session.sftp_browser(placement);
+            let editor_closed =
+                placement == SftpBrowserPlacement::Sidebar || session.sftp.file.is_none();
+            let needs_load = editor_closed && browser.needs_request(&path);
             (path, needs_load)
         }) else {
             return;
         };
         if needs_load {
-            self.request_sftp_directory(session_id, path, cx);
+            self.request_sftp_directory(session_id, placement, path, cx);
         }
     }
 
     fn request_sftp_directory(
         &mut self,
         session_id: SessionId,
+        placement: SftpBrowserPlacement,
         path: String,
         cx: &mut Context<Self>,
     ) {
@@ -1075,8 +1113,9 @@ impl RemCmdApp {
         });
         let Some(handle) = handle else {
             if let Some(session) = self.session_mut(session_id) {
-                session.sftp.error = Some("Connect this terminal to browse remote files".into());
-                session.sftp.loading = false;
+                let browser = session.sftp_browser_mut(placement);
+                browser.error = Some("Connect this terminal to browse remote files".into());
+                browser.loading = false;
             }
             cx.notify();
             return;
@@ -1086,44 +1125,61 @@ impl RemCmdApp {
             let session = self
                 .session_mut(session_id)
                 .expect("SFTP session should still exist");
-            let request_id = session.sftp.begin_request(path.clone());
+            let request_id = session
+                .sftp_browser_mut(placement)
+                .begin_request(path.clone());
             (request_id, path)
         };
 
         if let Err(error) = handle.read_directory(request_id, request_path)
             && let Some(session) = self.session_mut(session_id)
         {
-            session.sftp.fail_request(request_id, error.to_string());
+            session
+                .sftp_browser_mut(placement)
+                .fail_request(request_id, error.to_string());
         }
         cx.notify();
     }
 
-    fn refresh_active_sftp_directory(&mut self, cx: &mut Context<Self>) {
+    fn refresh_active_sftp_directory(
+        &mut self,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session_id) = self.active_session_id else {
             return;
         };
         let path = self
             .session(session_id)
-            .map(|session| session.sftp.path.clone())
+            .map(|session| session.sftp_browser(placement).path.clone())
             .unwrap_or_else(|| ".".into());
-        self.request_sftp_directory(session_id, path, cx);
+        self.request_sftp_directory(session_id, placement, path, cx);
     }
 
-    fn open_remote_directory(&mut self, path: String, cx: &mut Context<Self>) {
+    fn open_remote_directory(
+        &mut self,
+        placement: SftpBrowserPlacement,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(session_id) = self.active_session_id {
-            self.request_sftp_directory(session_id, path, cx);
+            self.request_sftp_directory(session_id, placement, path, cx);
         }
     }
 
-    fn open_parent_remote_directory(&mut self, cx: &mut Context<Self>) {
+    fn open_parent_remote_directory(
+        &mut self,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
         let Some((session_id, parent)) = self.active_session_id.and_then(|session_id| {
             self.session(session_id)
-                .and_then(|session| remote_parent_path(&session.sftp.path))
+                .and_then(|session| remote_parent_path(&session.sftp_browser(placement).path))
                 .map(|parent| (session_id, parent))
         }) else {
             return;
         };
-        self.request_sftp_directory(session_id, parent, cx);
+        self.request_sftp_directory(session_id, placement, parent, cx);
     }
 
     fn open_remote_file(&mut self, path: String, cx: &mut Context<Self>) {
@@ -1144,6 +1200,11 @@ impl RemCmdApp {
             .expect("SFTP session should still exist")
             .sftp
             .begin_file_request(path.clone());
+        if let Some(tab_id) = self.active_tab_id
+            && let Some(tab) = self.tab_mut(tab_id)
+        {
+            tab.view = TerminalTabView::Files;
+        }
         if let Err(error) = handle.read_file(request_id, path)
             && let Some(session) = self.session_mut(session_id)
         {
@@ -1419,12 +1480,14 @@ impl RemCmdApp {
         if profile_changed {
             self.load_editor_for_selected_profile(cx);
         }
-        if self.right_sidebar_open
-            || self
-                .tab(tab_id)
-                .is_some_and(|tab| tab.view == TerminalTabView::Files)
+        if self.right_sidebar_open {
+            self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
+        }
+        if self
+            .tab(tab_id)
+            .is_some_and(|tab| tab.view == TerminalTabView::Files)
         {
-            self.ensure_sftp_directory(session_id, cx);
+            self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Center, cx);
         }
         true
     }
@@ -2202,9 +2265,7 @@ impl RemCmdApp {
             return;
         };
         if self.block_close_for_unsaved_file(session_id, cx) {
-            if !self.right_sidebar_open
-                && let Some(tab) = self.tab_mut(tab_id)
-            {
+            if let Some(tab) = self.tab_mut(tab_id) {
                 tab.view = TerminalTabView::Files;
             }
             return;
@@ -2408,6 +2469,8 @@ impl RemCmdApp {
         session.terminal_scroll_accumulator = 0.0;
         session.terminal_resize_task = None;
         session.sftp = SftpBrowserState::default();
+        session.sidebar_sftp =
+            SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -3132,10 +3195,13 @@ impl RemCmdApp {
                 {
                     terminal.remote_cwd = Some(path);
                 }
-                if self.active_session_id == Some(session_id)
-                    && (self.right_sidebar_open || self.active_tab_view() == TerminalTabView::Files)
-                {
-                    self.ensure_sftp_directory(session_id, cx);
+                if self.active_session_id == Some(session_id) {
+                    if self.right_sidebar_open {
+                        self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
+                    }
+                    if self.active_tab_view() == TerminalTabView::Files {
+                        self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Center, cx);
+                    }
                 }
             }
             TerminalEvent::ClipboardStore {
@@ -3289,6 +3355,7 @@ impl RemCmdApp {
                         session.connection_handle = None;
                         session.connection_credential = None;
                         session.sftp.stop_loading();
+                        session.sidebar_sftp.stop_loading();
                         if previous_state == SessionState::Disconnecting
                             && session.terminal_end_reason.is_none()
                         {
@@ -3328,6 +3395,7 @@ impl RemCmdApp {
                     session.connection_handle = None;
                     session.host_key_prompt = None;
                     session.sftp.stop_loading();
+                    session.sidebar_sftp.stop_loading();
                     (profile_id, credential, session.close_when_disconnected)
                 };
 
@@ -3391,7 +3459,10 @@ impl RemCmdApp {
                 directory,
             } => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.sftp.complete_request(request_id, directory);
+                    let placement = sftp_browser_placement_for_request(request_id);
+                    session
+                        .sftp_browser_mut(placement)
+                        .complete_request(request_id, directory);
                 }
                 true
             }
@@ -3412,7 +3483,10 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     match operation {
                         SftpOperation::ReadDirectory => {
-                            session.sftp.fail_request(request_id, error.to_string());
+                            let placement = sftp_browser_placement_for_request(request_id);
+                            session
+                                .sftp_browser_mut(placement)
+                                .fail_request(request_id, error.to_string());
                         }
                         SftpOperation::ReadFile | SftpOperation::WriteFile => {
                             session.sftp.fail_file_request(
@@ -4304,9 +4378,7 @@ impl RemCmdApp {
             });
         if let Some((pane_id, session_id)) = unsaved {
             self.set_active_pane(pane_id, cx);
-            if !self.right_sidebar_open
-                && let Some(tab) = self.tab_mut(tab_id)
-            {
+            if let Some(tab) = self.tab_mut(tab_id) {
                 tab.view = TerminalTabView::Files;
             }
             self.block_close_for_unsaved_file(session_id, cx);
@@ -5303,7 +5375,7 @@ impl RemCmdApp {
 
     fn render_right_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let content = if let Some(session_id) = self.active_session_id {
-            self.render_sftp_browser(session_id, cx)
+            self.render_sftp_browser(session_id, SftpBrowserPlacement::Sidebar, cx)
         } else {
             div()
                 .flex()
@@ -5433,7 +5505,11 @@ impl RemCmdApp {
                         }
                         TerminalTabView::Files => {
                             if let Some(session_id) = self.active_session_id {
-                                panel = panel.child(self.render_sftp_browser(session_id, cx));
+                                panel = panel.child(self.render_sftp_browser(
+                                    session_id,
+                                    SftpBrowserPlacement::Center,
+                                    cx,
+                                ));
                             }
                         }
                     }
@@ -5904,25 +5980,34 @@ impl RemCmdApp {
             .child(files_button)
     }
 
-    fn render_sftp_browser(&self, session_id: SessionId, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sftp_browser(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(session) = self.session(session_id) else {
             return div().into_any_element();
         };
-        if session.sftp.file.is_some() {
+        if placement == SftpBrowserPlacement::Center && session.sftp.file.is_some() {
             return self.render_sftp_file(session_id, cx);
         }
-        let path = session.sftp.path.clone();
-        let entries = session.sftp.entries.clone();
-        let loading = session.sftp.loading;
-        let loaded = session.sftp.loaded;
-        let error = session.sftp.error.clone();
+        let browser_state = session.sftp_browser(placement);
+        let path = browser_state.path.clone();
+        let entries = browser_state.entries.clone();
+        let loading = browser_state.loading;
+        let loaded = browser_state.loaded;
+        let error = browser_state.error.clone();
         let connected = session.connection_state == SessionState::Connected;
         let can_go_up = connected && remote_parent_path(&path).is_some() && !loading;
         let list_hover = self.theme.list_hover_bg;
         let pressed = self.theme.control_pressed_bg;
+        let element_suffix = placement.element_suffix();
 
         let mut list = div()
-            .id("sftp_directory_entries")
+            .id(SharedString::from(format!(
+                "sftp_directory_entries_{element_suffix}"
+            )))
             .flex()
             .flex_col()
             .flex_1()
@@ -5970,7 +6055,10 @@ impl RemCmdApp {
                         .unwrap_or_else(|| "-".into())
                 };
                 let mut row = div()
-                    .id(SharedString::from(format!("sftp-entry-{}", entry.path)))
+                    .id(SharedString::from(format!(
+                        "sftp-entry-{element_suffix}-{}",
+                        entry.path
+                    )))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -6004,7 +6092,7 @@ impl RemCmdApp {
                         .active(move |this| this.bg(pressed))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if is_directory {
-                                this.open_remote_directory(entry_path.clone(), cx);
+                                this.open_remote_directory(placement, entry_path.clone(), cx);
                             } else {
                                 this.open_remote_file(entry_path.clone(), cx);
                             }
@@ -6015,33 +6103,33 @@ impl RemCmdApp {
         }
 
         let mut parent_button = self.render_icon_button(
-            "sftp_parent_directory",
+            SharedString::from(format!("sftp_parent_directory_{element_suffix}")),
             IconName::ArrowUp,
             "Parent directory",
             IconTone::Default,
             can_go_up,
         );
         if can_go_up {
-            parent_button = parent_button.on_click(cx.listener(|this, _, _, cx| {
-                this.open_parent_remote_directory(cx);
+            parent_button = parent_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.open_parent_remote_directory(placement, cx);
             }));
         }
         let can_refresh = connected && !loading;
         let mut refresh_button = self.render_icon_button(
-            "sftp_refresh_directory",
+            SharedString::from(format!("sftp_refresh_directory_{element_suffix}")),
             IconName::Reconnect,
             "Refresh",
             IconTone::Default,
             can_refresh,
         );
         if can_refresh {
-            refresh_button = refresh_button.on_click(cx.listener(|this, _, _, cx| {
-                this.refresh_active_sftp_directory(cx);
+            refresh_button = refresh_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.refresh_active_sftp_directory(placement, cx);
             }));
         }
 
         let mut browser = div()
-            .id("sftp_browser")
+            .id(SharedString::from(format!("sftp_browser_{element_suffix}")))
             .flex()
             .flex_col()
             .flex_1()
@@ -6755,6 +6843,14 @@ fn clamp_right_sidebar_width(requested: f32, viewport_width: f32, left_sidebar_w
     }
 }
 
+fn sftp_browser_placement_for_request(request_id: u64) -> SftpBrowserPlacement {
+    if request_id >= SIDEBAR_SFTP_REQUEST_ID_START {
+        SftpBrowserPlacement::Sidebar
+    } else {
+        SftpBrowserPlacement::Center
+    }
+}
+
 fn estimated_titlebar_label_width(label: &str) -> f32 {
     label
         .chars()
@@ -7032,6 +7128,27 @@ mod tests {
         assert_eq!(clamp_right_sidebar_width(100.0, 1200.0, 300.0), 260.0);
         assert_eq!(clamp_right_sidebar_width(700.0, 1200.0, 300.0), 520.0);
         assert_eq!(clamp_right_sidebar_width(340.0, 720.0, 0.0), 340.0);
+    }
+
+    #[test]
+    fn center_and_sidebar_sftp_requests_are_isolated() {
+        let mut center = SftpBrowserState::default();
+        let mut sidebar = SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
+        let center_request = center.begin_request("/center".into());
+        let sidebar_request = sidebar.begin_request("/sidebar".into());
+
+        assert_eq!(
+            sftp_browser_placement_for_request(center_request),
+            SftpBrowserPlacement::Center
+        );
+        assert_eq!(
+            sftp_browser_placement_for_request(sidebar_request),
+            SftpBrowserPlacement::Sidebar
+        );
+        assert!(!center.fail_request(sidebar_request, "wrong browser".into()));
+        assert!(center.loading);
+        assert!(sidebar.fail_request(sidebar_request, "expected".into()));
+        assert!(!sidebar.loading);
     }
 
     #[test]
