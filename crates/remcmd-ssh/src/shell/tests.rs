@@ -15,9 +15,11 @@ use super::{PtySize, ShellEvent, SshShell};
 struct TestServerState {
     terminal_type: Option<String>,
     initial_size: Option<PtySize>,
+    pty_modes: Vec<(Pty, u32)>,
+    shell_requested: bool,
     resized_size: Option<PtySize>,
     input: Vec<u8>,
-    integration_command: Option<String>,
+    integration_input: Vec<u8>,
 }
 
 /// Test server handler for one SSH connection.
@@ -52,7 +54,7 @@ impl server::Handler for TestServer {
         row_height: u32,
         pix_width: u32,
         pix_height: u32,
-        _modes: &[(Pty, u32)],
+        modes: &[(Pty, u32)],
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         {
@@ -66,6 +68,7 @@ impl server::Handler for TestServer {
                 pixel_width: pix_width,
                 pixel_height: pix_height,
             });
+            state.pty_modes = modes.to_vec();
         }
 
         // SshShell requested want_reply=true, so a reply is required.
@@ -78,25 +81,20 @@ impl server::Handler for TestServer {
         channel: ChannelId,
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        let integrated = {
+            let mut state = self.state.lock().expect("test state lock");
+            state.shell_requested = true;
+            state.pty_modes.contains(&(Pty::ECHO, 0))
+        };
         session.channel_success(channel)?;
 
         // Initial output will prove that ShellEvent::Output works.
-        session.data(channel, b"ready\r\n".to_vec())?;
-        Ok(())
-    }
-
-    async fn exec_request(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut server::Session,
-    ) -> Result<(), Self::Error> {
-        self.state
-            .lock()
-            .expect("test state lock")
-            .integration_command = Some(String::from_utf8_lossy(data).into_owned());
-        session.channel_success(channel)?;
-        session.data(channel, b"ready\r\n".to_vec())?;
+        let output = if integrated {
+            b"welcome\r\ninitial-starship-prompt".to_vec()
+        } else {
+            b"ready\r\n".to_vec()
+        };
+        session.data(channel, output)?;
         Ok(())
     }
 
@@ -106,18 +104,49 @@ impl server::Handler for TestServer {
         data: &[u8],
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        self.state
-            .lock()
-            .expect("test state lock")
-            .input
-            .extend_from_slice(data);
-
-        if data == b"exit\r" {
+        if data
+            .windows(b"remcmd-shell-start".len())
+            .any(|window| window == b"remcmd-shell-start")
+        {
+            self.state
+                .lock()
+                .expect("test state lock")
+                .integration_input
+                .extend_from_slice(data);
+            let (start, end) = super::INTEGRATION_START_MARKER.split_at(9);
+            session.data(channel, start.to_vec())?;
+            session.data(channel, end.to_vec())?;
+        } else if data
+            .windows(b"remcmd-shell-ready".len())
+            .any(|window| window == b"remcmd-shell-ready")
+        {
+            self.state
+                .lock()
+                .expect("test state lock")
+                .integration_input
+                .extend_from_slice(data);
+            let (start, end) = super::INTEGRATION_READY_MARKER.split_at(11);
+            session.data(channel, start.to_vec())?;
+            let mut final_output = end.to_vec();
+            final_output
+                .extend_from_slice(b"\r\x1b[2K\x1b]7;file:///home/tester\x07starship-prompt");
+            session.data(channel, final_output)?;
+        } else if data == b"exit\r" {
+            self.state
+                .lock()
+                .expect("test state lock")
+                .input
+                .extend_from_slice(data);
             // Simulate a normal shell process exiting.
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
             session.close(channel)?;
         } else {
+            self.state
+                .lock()
+                .expect("test state lock")
+                .input
+                .extend_from_slice(data);
             // Echo ordinary input back as terminal output.
             session.data(channel, data.to_vec())?;
         }
@@ -285,6 +314,8 @@ async fn interactive_shell_supports_pty_io_resize_and_exit() {
 
         assert_eq!(state.terminal_type.as_deref(), Some("xterm-256color"));
         assert_eq!(state.initial_size, Some(initial_size));
+        assert!(state.pty_modes.is_empty());
+        assert!(state.shell_requested);
     }
 
     writer
@@ -334,7 +365,7 @@ async fn interactive_shell_supports_pty_io_resize_and_exit() {
 }
 
 #[tokio::test]
-async fn interactive_shell_can_start_through_shell_integration() {
+async fn shell_integration_preserves_native_shell_and_stays_hidden() {
     let (address, server_task, state) = start_test_server().await;
     let mut handle = client::connect(Arc::new(client::Config::default()), address, TestClient)
         .await
@@ -355,16 +386,21 @@ async fn interactive_shell_can_start_through_shell_integration() {
 
     assert_eq!(
         reader.next_event().await,
-        ShellEvent::Output(b"ready\r\n".to_vec())
+        ShellEvent::Output(b"welcome\r\n".to_vec())
     );
-    assert!(
-        state
-            .lock()
-            .expect("test state lock")
-            .integration_command
-            .as_deref()
-            .is_some_and(|command| command.contains("7;file://%s"))
+    assert_eq!(
+        reader.next_event().await,
+        ShellEvent::Output(b"\r\x1b[2K\x1b]7;file:///home/tester\x07starship-prompt".to_vec())
     );
+    {
+        let state = state.lock().expect("test state lock");
+        assert!(state.shell_requested);
+        assert_eq!(state.pty_modes, vec![(Pty::ECHO, 0)]);
+        let integration_input = String::from_utf8_lossy(&state.integration_input);
+        assert!(integration_input.contains("7;file://%s"));
+        assert!(!integration_input.contains("PS1"));
+        assert!(!integration_input.contains("PROMPT="));
+    }
 
     writer
         .send_input(b"exit\r".to_vec())

@@ -1,8 +1,14 @@
-use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client};
+use std::collections::VecDeque;
+
+use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty, client};
 
 use crate::{SshError, SshErrorKind, shell_integration::ShellIntegration};
 
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
+const INTEGRATION_START_MARKER: &[u8] = b"\x1b]777;remcmd-shell-start\x07";
+const INTEGRATION_READY_MARKER: &[u8] = b"\x1b]777;remcmd-shell-ready\x07";
+const INTEGRATION_START_COMMAND: &str = "printf '\\033]777;remcmd-shell-start\\007'\r";
+const INTEGRATION_READY_COMMAND: &str = "stty echo; printf '\\033]777;remcmd-shell-ready\\007'; __remcmd_last_cwd=$PWD; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
 
 /// Dimensions reported to the remote pseudo-terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +80,7 @@ pub enum ShellEvent {
 
 pub struct SshShell {
     channel: Channel<client::Msg>,
+    initial_events: VecDeque<ShellEvent>,
 }
 
 impl SshShell {
@@ -90,6 +97,12 @@ impl SshShell {
             .await
             .map_err(SshError::from)?;
 
+        let terminal_modes = if shell_integration.is_some() {
+            vec![(Pty::ECHO, 0)]
+        } else {
+            Vec::new()
+        };
+
         channel
             .request_pty(
                 true,
@@ -98,25 +111,116 @@ impl SshShell {
                 size.rows,
                 size.pixel_width,
                 size.pixel_height,
-                &[],
+                &terminal_modes,
             )
             .await
             .map_err(SshError::from)?;
 
         Self::wait_for_request_success(&mut channel, "PTY").await?;
 
-        if let Some(shell_integration) = shell_integration {
-            channel
-                .exec(true, shell_integration.launch_command())
-                .await
-                .map_err(SshError::from)?;
-        } else {
-            channel.request_shell(true).await.map_err(SshError::from)?;
-        }
+        channel.request_shell(true).await.map_err(SshError::from)?;
 
         Self::wait_for_request_success(&mut channel, "shell").await?;
 
-        Ok(Self { channel })
+        let initial_events = if let Some(shell_integration) = shell_integration {
+            Self::install_shell_integration(&mut channel, shell_integration).await?
+        } else {
+            VecDeque::new()
+        };
+
+        Ok(Self {
+            channel,
+            initial_events,
+        })
+    }
+
+    async fn install_shell_integration(
+        channel: &mut Channel<client::Msg>,
+        shell_integration: &ShellIntegration,
+    ) -> Result<VecDeque<ShellEvent>, SshError> {
+        channel
+            .data_bytes(INTEGRATION_START_COMMAND.as_bytes().to_vec())
+            .await
+            .map_err(SshError::from)?;
+
+        let (startup_output, _) =
+            Self::read_until_marker(channel, INTEGRATION_START_MARKER).await?;
+
+        let install_commands = format!(
+            " {}\r {INTEGRATION_READY_COMMAND}",
+            shell_integration.install_command()
+        );
+        channel
+            .data_bytes(install_commands.into_bytes())
+            .await
+            .map_err(SshError::from)?;
+
+        let (_, ready_output) = Self::read_until_marker(channel, INTEGRATION_READY_MARKER).await?;
+        let mut initial_events = VecDeque::new();
+
+        // Preserve complete startup lines such as a remote MOTD, but discard the
+        // first prompt that was on screen while the hidden hook was installed.
+        let startup_line_end = startup_output
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        if startup_line_end > 0 {
+            initial_events.push_back(ShellEvent::Output(
+                startup_output[..startup_line_end].to_vec(),
+            ));
+        }
+        if !ready_output.is_empty() {
+            initial_events.push_back(ShellEvent::Output(ready_output));
+        }
+
+        Ok(initial_events)
+    }
+
+    async fn read_until_marker(
+        channel: &mut Channel<client::Msg>,
+        marker: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), SshError> {
+        let mut output = Vec::new();
+
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    output.extend_from_slice(&data);
+                    if let Some(index) = find_bytes(&output, marker) {
+                        let after_marker = output.split_off(index + marker.len());
+                        output.truncate(index);
+                        return Ok((output, after_marker));
+                    }
+                }
+
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    output.extend_from_slice(&data);
+                }
+
+                Some(ChannelMsg::Failure) => {
+                    return Err(SshError::new(
+                        SshErrorKind::Protocol,
+                        "server rejected shell integration input",
+                    ));
+                }
+
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    return Err(SshError::new(
+                        SshErrorKind::Protocol,
+                        format!("remote shell exited with status {exit_status} during startup"),
+                    ));
+                }
+
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    return Err(SshError::new(
+                        SshErrorKind::Network,
+                        "channel closed while installing shell integration",
+                    ));
+                }
+
+                Some(_) => {}
+            }
+        }
     }
 
     async fn wait_for_request_success(
@@ -160,12 +264,19 @@ impl SshShell {
     pub fn split(self) -> (SshShellReader, SshShellWriter) {
         let (read_half, write_half) = self.channel.split();
 
-        (SshShellReader { read_half }, SshShellWriter { write_half })
+        (
+            SshShellReader {
+                read_half,
+                pending_events: self.initial_events,
+            },
+            SshShellWriter { write_half },
+        )
     }
 }
 
 pub struct SshShellReader {
     read_half: ChannelReadHalf,
+    pending_events: VecDeque<ShellEvent>,
 }
 
 pub struct SshShellWriter {
@@ -174,6 +285,10 @@ pub struct SshShellWriter {
 
 impl SshShellReader {
     pub async fn next_event(&mut self) -> ShellEvent {
+        if let Some(event) = self.pending_events.pop_front() {
+            return event;
+        }
+
         loop {
             match self.read_half.wait().await {
                 Some(ChannelMsg::Data { data }) => {
@@ -219,6 +334,12 @@ impl SshShellReader {
             }
         }
     }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 impl SshShellWriter {
