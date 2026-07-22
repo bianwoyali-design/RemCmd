@@ -41,6 +41,7 @@ russh = { version = "0.62.2", default-features = false, features = [
     "ring",
     "rsa",
 ]}
+russh-sftp = "2.3.0"
 
 remcmd-core = { path = "crates/remcmd-core"}
 remcmd-ssh = { path = "crates/remcmd-ssh" }

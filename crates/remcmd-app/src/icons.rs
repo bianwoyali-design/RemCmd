@@ -9,6 +9,7 @@ use crate::theme::{IconTone, Theme};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum IconName {
     Add,
+    ArrowUp,
     Cancel,
     ClosePane,
     Collapse,
@@ -16,6 +17,7 @@ pub(crate) enum IconName {
     Delete,
     Disconnect,
     Expand,
+    File,
     Folder,
     ForgetCredential,
     NewConnection,
@@ -32,6 +34,7 @@ impl IconName {
     const fn asset_path(self) -> &'static str {
         match self {
             Self::Add => "icons/add.svg",
+            Self::ArrowUp => "icons/arrow-up.svg",
             Self::Cancel => "icons/cancel.svg",
             Self::ClosePane => "icons/close-pane.svg",
             Self::Collapse => "icons/collapse.svg",
@@ -39,6 +42,7 @@ impl IconName {
             Self::Delete => "icons/delete.svg",
             Self::Disconnect => "icons/disconnect.svg",
             Self::Expand => "icons/expand.svg",
+            Self::File => "icons/file.svg",
             Self::Folder => "icons/folder.svg",
             Self::ForgetCredential => "icons/forget-credential.svg",
             Self::NewConnection => "icons/new-connection.svg",
@@ -55,6 +59,7 @@ impl IconName {
     fn from_asset_path(path: &str) -> Option<Self> {
         Some(match path {
             "icons/add.svg" => Self::Add,
+            "icons/arrow-up.svg" => Self::ArrowUp,
             "icons/cancel.svg" => Self::Cancel,
             "icons/close-pane.svg" => Self::ClosePane,
             "icons/collapse.svg" => Self::Collapse,
@@ -62,6 +67,7 @@ impl IconName {
             "icons/delete.svg" => Self::Delete,
             "icons/disconnect.svg" => Self::Disconnect,
             "icons/expand.svg" => Self::Expand,
+            "icons/file.svg" => Self::File,
             "icons/folder.svg" => Self::Folder,
             "icons/forget-credential.svg" => Self::ForgetCredential,
             "icons/new-connection.svg" => Self::NewConnection,
@@ -79,6 +85,7 @@ impl IconName {
     const fn body(self) -> &'static str {
         match self {
             Self::Add => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
+            Self::ArrowUp => r#"<path d="m18 15-6-6-6 6"/>"#,
             Self::Cancel => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
             Self::ClosePane => {
                 r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/><path d="m8 9 3 3-3 3"/>"#
@@ -94,6 +101,9 @@ impl IconName {
                 r#"<path d="m19 5 3-3"/><path d="m2 22 3-3"/><path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z"/><path d="M7.5 13.5 10 11"/><path d="M10.5 16.5 13 14"/><path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z"/>"#
             }
             Self::Expand => r#"<path d="m9 18 6-6-6-6"/>"#,
+            Self::File => {
+                r#"<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/>"#
+            }
             Self::Folder => {
                 r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#
             }

@@ -13,6 +13,7 @@ pub enum SshErrorKind {
     PrivateKeyPassphrase,
     Timeout,
     Protocol,
+    Sftp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,20 @@ impl From<russh::Error> for SshError {
             | RusshError::Keys(russh::keys::Error::NoHomeDir) => SshErrorKind::Configuration,
 
             _ => SshErrorKind::Protocol,
+        };
+
+        Self::new(kind, error.to_string())
+    }
+}
+
+impl From<russh_sftp::client::error::Error> for SshError {
+    fn from(error: russh_sftp::client::error::Error) -> Self {
+        use russh_sftp::client::error::Error as SftpError;
+
+        let kind = match &error {
+            SftpError::IO(_) => SshErrorKind::Network,
+            SftpError::Timeout => SshErrorKind::Timeout,
+            _ => SshErrorKind::Sftp,
         };
 
         Self::new(kind, error.to_string())

@@ -10,8 +10,9 @@ use remcmd_core::ConnectionProfile;
 use tokio::{runtime::Handle, sync::mpsc};
 
 use crate::{
-    AuthMethod, HostKeyInfo, PtySize, SessionState, ShellEvent, SshError, SshErrorKind, SshSession,
-    SshShellWriter, SshTransport, host_key::HostKeyDecision, transport::TransportOpen,
+    AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, SessionState, ShellEvent, SshError,
+    SshErrorKind, SshSession, SshShellWriter, SshTransport, host_key::HostKeyDecision,
+    sftp::SftpWorkerHandle, transport::TransportOpen,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -27,6 +28,9 @@ pub enum ConnectionCommand {
 
     /// Reports a new terminal size to the remote PTY.
     Resize(PtySize),
+
+    /// Reads one remote directory through an SFTP subsystem channel.
+    ReadDirectory { request_id: u64, path: String },
 
     /// Requests an orderly shell and transport shutdown.
     Disconnect,
@@ -46,6 +50,19 @@ pub enum ConnectionEvent {
 
     /// Carries output or lifecycle information from the remote shell.
     Shell(ShellEvent),
+
+    /// Returns one canonical remote path and its directory entries.
+    DirectoryRead {
+        request_id: u64,
+        directory: RemoteDirectory,
+    },
+
+    /// Reports an SFTP operation failure without failing the SSH shell.
+    SftpFailed {
+        request_id: u64,
+        path: String,
+        error: SshError,
+    },
 
     /// Reports an operational failure and implies SessionState::Failed.
     Failed(SshError),
@@ -71,6 +88,14 @@ impl ConnectionHandle {
     /// Requests a remote PTY resize.
     pub fn resize(&self, size: PtySize) -> Result<(), SshError> {
         self.send(ConnectionCommand::Resize(size))
+    }
+
+    /// Requests one remote directory listing through this SSH connection.
+    pub fn read_directory(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
+        self.send(ConnectionCommand::ReadDirectory {
+            request_id,
+            path: path.into(),
+        })
     }
 
     /// Requests an orderly disconnection.
@@ -205,6 +230,9 @@ where
                     Some(ConnectionCommand::Input(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
+                    Some(ConnectionCommand::ReadDirectory { .. }) => {
+                        // SFTP requests are ignored until authentication completes.
+                    }
                     Some(ConnectionCommand::Disconnect) | None => {
                         return PendingResult::Disconnect;
                     }
@@ -237,6 +265,9 @@ async fn wait_for_host_key_decision(
                     }
                     Some(ConnectionCommand::Input(_)) => {
                         // Keyboard input is ignored until the shell is ready.
+                    }
+                    Some(ConnectionCommand::ReadDirectory { .. }) => {
+                        // SFTP requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
                         return PendingResult::Disconnect;
@@ -435,6 +466,7 @@ async fn run_connection(
     }
 
     let mut pending_command = None;
+    let mut sftp_worker = None;
 
     loop {
         let command = if let Some(command) = pending_command.take() {
@@ -492,6 +524,45 @@ async fn run_connection(
                     .send(ConnectionEvent::Resized(latest_size))
                     .await
                     .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::ReadDirectory { request_id, path }) => {
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn(session, events.clone()));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) = worker.read_directory(request_id, path.clone())
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path,
+                            error,
+                        })
+                        .await
+                        .is_err()
                 {
                     close_resources(&transport, Some(&writer)).await;
                     return;

@@ -18,6 +18,7 @@ use russh::{
 #[cfg(unix)]
 use russh::keys::agent::{AgentIdentity, client::AgentClient};
 
+use russh_sftp::client::SftpSession;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell};
@@ -25,6 +26,7 @@ use crate::{AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHELL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -526,6 +528,25 @@ impl SshTransport {
         tokio::time::timeout(SHELL_OPEN_TIMEOUT, SshShell::open(&self.handle, size))
             .await
             .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote shell timed out"))?
+    }
+
+    pub(crate) async fn open_sftp(&self) -> Result<SftpSession, SshError> {
+        tokio::time::timeout(SFTP_OPEN_TIMEOUT, async {
+            let channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(SshError::from)?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(SshError::from)?;
+            SftpSession::new(channel.into_stream())
+                .await
+                .map_err(SshError::from)
+        })
+        .await
+        .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening SFTP timed out"))?
     }
 
     /// Sends a protocol-level disconnect request to the server.

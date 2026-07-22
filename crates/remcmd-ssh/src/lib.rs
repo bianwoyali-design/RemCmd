@@ -3,6 +3,7 @@ mod connection;
 mod error;
 mod host_key;
 mod session;
+mod sftp;
 mod shell;
 mod transport;
 
@@ -13,5 +14,6 @@ pub use connection::{
 pub use error::{SshError, SshErrorKind};
 pub use host_key::HostKeyInfo;
 pub use session::{SessionState, SshSession};
+pub use sftp::{RemoteDirectory, RemoteFileEntry, RemoteFileKind};
 pub use shell::{PtySize, ShellEvent, SshShell, SshShellReader, SshShellWriter};
 pub use transport::SshTransport;

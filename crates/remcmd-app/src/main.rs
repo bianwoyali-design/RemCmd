@@ -49,8 +49,8 @@ use gpui::PathPromptOptions;
 
 use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode};
 use remcmd_ssh::{
-    AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, PtySize, SessionState, ShellEvent,
-    SshConnection, SshErrorKind,
+    AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, PtySize, RemoteDirectory,
+    RemoteFileEntry, RemoteFileKind, SessionState, ShellEvent, SshConnection, SshErrorKind,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -137,6 +137,7 @@ struct TerminalTab {
     profile_id: String,
     layout: PaneLayout,
     active_pane_id: PaneId,
+    view: TerminalTabView,
 }
 
 struct TerminalPane {
@@ -164,6 +165,7 @@ struct TerminalSession {
     terminal_scroll_accumulator: f32,
     terminal_resize_task: Option<Task<()>>,
     connection_credential: Option<ConnectionCredential>,
+    sftp: SftpBrowserState,
 }
 
 impl TerminalSession {
@@ -185,6 +187,7 @@ impl TerminalSession {
             terminal_scroll_accumulator: 0.0,
             terminal_resize_task: None,
             connection_credential: None,
+            sftp: SftpBrowserState::default(),
         }
     }
 
@@ -327,6 +330,78 @@ enum ActivePanel {
     #[default]
     Connection,
     Settings,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TerminalTabView {
+    #[default]
+    Terminal,
+    Files,
+}
+
+struct SftpBrowserState {
+    path: String,
+    entries: Vec<RemoteFileEntry>,
+    loading: bool,
+    loaded: bool,
+    error: Option<String>,
+    next_request_id: u64,
+    active_request_id: Option<u64>,
+}
+
+impl Default for SftpBrowserState {
+    fn default() -> Self {
+        Self {
+            path: ".".into(),
+            entries: Vec::new(),
+            loading: false,
+            loaded: false,
+            error: None,
+            next_request_id: 1,
+            active_request_id: None,
+        }
+    }
+}
+
+impl SftpBrowserState {
+    fn begin_request(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.active_request_id = Some(request_id);
+        self.loading = true;
+        self.error = None;
+        request_id
+    }
+
+    fn complete_request(&mut self, request_id: u64, directory: RemoteDirectory) -> bool {
+        if self.active_request_id != Some(request_id) {
+            return false;
+        }
+
+        self.path = directory.path;
+        self.entries = directory.entries;
+        self.loading = false;
+        self.loaded = true;
+        self.error = None;
+        self.active_request_id = None;
+        true
+    }
+
+    fn fail_request(&mut self, request_id: u64, error: String) -> bool {
+        if self.active_request_id != Some(request_id) {
+            return false;
+        }
+
+        self.loading = false;
+        self.error = Some(error);
+        self.active_request_id = None;
+        true
+    }
+
+    fn stop_loading(&mut self) {
+        self.loading = false;
+        self.active_request_id = None;
+    }
 }
 
 #[derive(Clone)]
@@ -582,6 +657,111 @@ impl RemCmdApp {
         self.active_tab_id.and_then(|tab_id| self.tab(tab_id))
     }
 
+    fn active_tab_view(&self) -> TerminalTabView {
+        self.active_tab().map(|tab| tab.view).unwrap_or_default()
+    }
+
+    fn set_active_tab_view(
+        &mut self,
+        view: TerminalTabView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self.active_tab_id else {
+            return;
+        };
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.view = view;
+        }
+
+        match view {
+            TerminalTabView::Terminal => {
+                if let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
+                {
+                    focus_handle.focus(window);
+                }
+            }
+            TerminalTabView::Files => self.ensure_sftp_directory(session_id, cx),
+        }
+        cx.notify();
+    }
+
+    fn ensure_sftp_directory(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let needs_load = self
+            .session(session_id)
+            .is_some_and(|session| !session.sftp.loaded && !session.sftp.loading);
+        if needs_load {
+            self.request_sftp_directory(session_id, ".".into(), cx);
+        }
+    }
+
+    fn request_sftp_directory(
+        &mut self,
+        session_id: SessionId,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = self.session(session_id).and_then(|session| {
+            (session.connection_state == SessionState::Connected)
+                .then(|| session.connection_handle.clone())
+                .flatten()
+        });
+        let Some(handle) = handle else {
+            if let Some(session) = self.session_mut(session_id) {
+                session.sftp.error = Some("Connect this terminal to browse remote files".into());
+                session.sftp.loading = false;
+            }
+            cx.notify();
+            return;
+        };
+
+        let (request_id, request_path) = {
+            let session = self
+                .session_mut(session_id)
+                .expect("SFTP session should still exist");
+            let request_id = session.sftp.begin_request();
+            (request_id, path)
+        };
+
+        if let Err(error) = handle.read_directory(request_id, request_path)
+            && let Some(session) = self.session_mut(session_id)
+        {
+            session.sftp.fail_request(request_id, error.to_string());
+        }
+        cx.notify();
+    }
+
+    fn refresh_active_sftp_directory(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        let path = self
+            .session(session_id)
+            .map(|session| session.sftp.path.clone())
+            .unwrap_or_else(|| ".".into());
+        self.request_sftp_directory(session_id, path, cx);
+    }
+
+    fn open_remote_directory(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Some(session_id) = self.active_session_id {
+            self.request_sftp_directory(session_id, path, cx);
+        }
+    }
+
+    fn open_parent_remote_directory(&mut self, cx: &mut Context<Self>) {
+        let Some((session_id, parent)) = self.active_session_id.and_then(|session_id| {
+            self.session(session_id)
+                .and_then(|session| remote_parent_path(&session.sftp.path))
+                .map(|parent| (session_id, parent))
+        }) else {
+            return;
+        };
+        self.request_sftp_directory(session_id, parent, cx);
+    }
+
     fn create_tab_for_session(
         &mut self,
         session_id: SessionId,
@@ -597,6 +777,7 @@ impl RemCmdApp {
             profile_id,
             layout: PaneLayout::Pane(pane_id),
             active_pane_id: pane_id,
+            view: TerminalTabView::Terminal,
         });
         self.animate_titlebar_tabs_to_end(cx);
         tab_id
@@ -693,6 +874,12 @@ impl RemCmdApp {
         self.selected_profile_id = Some(profile_id);
         if profile_changed {
             self.load_editor_for_selected_profile(cx);
+        }
+        if self
+            .tab(tab_id)
+            .is_some_and(|tab| tab.view == TerminalTabView::Files)
+        {
+            self.ensure_sftp_directory(session_id, cx);
         }
         true
     }
@@ -1657,6 +1844,7 @@ impl RemCmdApp {
         session.terminal_selecting = false;
         session.terminal_scroll_accumulator = 0.0;
         session.terminal_resize_task = None;
+        session.sftp = SftpBrowserState::default();
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -2522,6 +2710,7 @@ impl RemCmdApp {
                         session.terminal_resize_task = None;
                         session.connection_handle = None;
                         session.connection_credential = None;
+                        session.sftp.stop_loading();
                         if previous_state == SessionState::Disconnecting
                             && session.terminal_end_reason.is_none()
                         {
@@ -2560,6 +2749,7 @@ impl RemCmdApp {
                     session.terminal_resize_task = None;
                     session.connection_handle = None;
                     session.host_key_prompt = None;
+                    session.sftp.stop_loading();
                     (profile_id, credential, session.close_when_disconnected)
                 };
 
@@ -2615,6 +2805,25 @@ impl RemCmdApp {
 
                 if !prompted_for_credential && let Some(session) = self.session_mut(session_id) {
                     session.connection_error = Some(error.to_string());
+                }
+                true
+            }
+            ConnectionEvent::DirectoryRead {
+                request_id,
+                directory,
+            } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.sftp.complete_request(request_id, directory);
+                }
+                true
+            }
+            ConnectionEvent::SftpFailed {
+                request_id,
+                path: _,
+                error,
+            } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.sftp.fail_request(request_id, error.to_string());
                 }
                 true
             }
@@ -2688,6 +2897,7 @@ impl Render for RemCmdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_profile = self.selected_profile().cloned();
         let should_focus_terminal = self.active_panel == ActivePanel::Connection
+            && self.active_tab_view() == TerminalTabView::Terminal
             && selected_profile
                 .as_ref()
                 .is_some_and(|profile| self.is_terminal_visible(&profile.id));
@@ -4198,6 +4408,7 @@ impl RemCmdApp {
                                 .items_center()
                                 .justify_end()
                                 .gap_2()
+                                .child(self.render_workspace_controls(cx))
                                 .child(self.render_pane_controls(cx))
                                 .child(self.render_connection_controls(cx))
                                 .child(
@@ -4218,17 +4429,26 @@ impl RemCmdApp {
                 );
 
                 if self.has_terminal_workspace(&profile.id) {
-                    if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
-                        panel = panel.child(
-                            div()
-                                .flex()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .min_h(px(0.0))
-                                .mt_4()
-                                .overflow_hidden()
-                                .child(self.render_pane_layout(layout, cx)),
-                        );
+                    match self.active_tab_view() {
+                        TerminalTabView::Terminal => {
+                            if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
+                                panel = panel.child(
+                                    div()
+                                        .flex()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .min_h(px(0.0))
+                                        .mt_4()
+                                        .overflow_hidden()
+                                        .child(self.render_pane_layout(layout, cx)),
+                                );
+                            }
+                        }
+                        TerminalTabView::Files => {
+                            if let Some(session_id) = self.active_session_id {
+                                panel = panel.child(self.render_sftp_browser(session_id, cx));
+                            }
+                        }
                     }
                 } else {
                     let form = div()
@@ -4574,7 +4794,7 @@ impl RemCmdApp {
             .selected_profile_id
             .as_deref()
             .is_some_and(|profile_id| self.has_terminal_workspace(profile_id));
-        if !has_workspace {
+        if !has_workspace || self.active_tab_view() != TerminalTabView::Terminal {
             return div().id("pane_controls_empty");
         }
 
@@ -4636,6 +4856,257 @@ impl RemCmdApp {
                     this.close_active_pane(window, cx);
                 })),
             )
+    }
+
+    fn render_workspace_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_workspace = self
+            .selected_profile_id
+            .as_deref()
+            .is_some_and(|profile_id| self.has_terminal_workspace(profile_id));
+        if !has_workspace {
+            return div().id("workspace_controls_empty");
+        }
+
+        let view = self.active_tab_view();
+        let can_browse_files = self
+            .active_session()
+            .is_some_and(|session| session.connection_state == SessionState::Connected);
+        let selected_background = self.theme.control_bg;
+        let terminal_button = self
+            .render_icon_button(
+                "show_terminal",
+                IconName::Terminal,
+                "Terminal",
+                IconTone::Default,
+                true,
+            )
+            .bg(if view == TerminalTabView::Terminal {
+                selected_background
+            } else {
+                self.theme.transparent
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.set_active_tab_view(TerminalTabView::Terminal, window, cx);
+            }));
+        let mut files_button = self
+            .render_icon_button(
+                "show_remote_files",
+                IconName::Folder,
+                "Remote files",
+                IconTone::Default,
+                can_browse_files,
+            )
+            .bg(if view == TerminalTabView::Files {
+                selected_background
+            } else {
+                self.theme.transparent
+            });
+        if can_browse_files {
+            files_button = files_button.on_click(cx.listener(|this, _, window, cx| {
+                this.set_active_tab_view(TerminalTabView::Files, window, cx);
+            }));
+        }
+
+        div()
+            .id("workspace_controls")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(terminal_button)
+            .child(files_button)
+    }
+
+    fn render_sftp_browser(&self, session_id: SessionId, cx: &mut Context<Self>) -> AnyElement {
+        let Some(session) = self.session(session_id) else {
+            return div().into_any_element();
+        };
+        let path = session.sftp.path.clone();
+        let entries = session.sftp.entries.clone();
+        let loading = session.sftp.loading;
+        let loaded = session.sftp.loaded;
+        let error = session.sftp.error.clone();
+        let connected = session.connection_state == SessionState::Connected;
+        let can_go_up = connected && remote_parent_path(&path).is_some() && !loading;
+        let list_hover = self.theme.list_hover_bg;
+        let pressed = self.theme.control_pressed_bg;
+
+        let mut list = div()
+            .id("sftp_directory_entries")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll();
+
+        if !loaded && loading {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child("Loading remote files..."),
+            );
+        } else if loaded && entries.is_empty() {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child("This directory is empty"),
+            );
+        } else {
+            for entry in entries {
+                let is_directory = entry.kind == RemoteFileKind::Directory;
+                let entry_path = entry.path.clone();
+                let icon_name = if is_directory {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                };
+                let size = if is_directory {
+                    "-".into()
+                } else {
+                    entry
+                        .size
+                        .map(format_remote_size)
+                        .unwrap_or_else(|| "-".into())
+                };
+                let mut row = div()
+                    .id(SharedString::from(format!("sftp-entry-{}", entry.path)))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(36.0))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(self.render_sidebar_icon(icon_name, 16.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .child(entry.name),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(88.0))
+                            .text_right()
+                            .text_sm()
+                            .text_color(self.theme.text_muted)
+                            .child(size),
+                    );
+                if is_directory && connected && !loading {
+                    row = row
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(list_hover))
+                        .active(move |this| this.bg(pressed))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_remote_directory(entry_path.clone(), cx);
+                        }));
+                }
+                list = list.child(row);
+            }
+        }
+
+        let mut parent_button = self.render_icon_button(
+            "sftp_parent_directory",
+            IconName::ArrowUp,
+            "Parent directory",
+            IconTone::Default,
+            can_go_up,
+        );
+        if can_go_up {
+            parent_button = parent_button.on_click(cx.listener(|this, _, _, cx| {
+                this.open_parent_remote_directory(cx);
+            }));
+        }
+        let can_refresh = connected && !loading;
+        let mut refresh_button = self.render_icon_button(
+            "sftp_refresh_directory",
+            IconName::Reconnect,
+            "Refresh",
+            IconTone::Default,
+            can_refresh,
+        );
+        if can_refresh {
+            refresh_button = refresh_button.on_click(cx.listener(|this, _, _, cx| {
+                this.refresh_active_sftp_directory(cx);
+            }));
+        }
+
+        let mut browser = div()
+            .id("sftp_browser")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .mt_4()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.panel_bg)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .h(px(40.0))
+                    .px_2()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(parent_button)
+                    .child(refresh_button)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .ml_2()
+                            .truncate()
+                            .font_family(TERMINAL_FONT_FAMILY)
+                            .text_sm()
+                            .child(path),
+                    )
+                    .when(loading && loaded, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(self.theme.text_muted)
+                                .child("Loading..."),
+                        )
+                    }),
+            );
+
+        if let Some(error) = error {
+            browser = browser.child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .bg(self.theme.control_bg)
+                    .text_sm()
+                    .text_color(self.theme.error_text)
+                    .child(error),
+            );
+        }
+
+        browser.child(list).into_any_element()
     }
 
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5123,6 +5594,36 @@ fn estimated_titlebar_label_width(label: &str) -> f32 {
         .max(20.0)
 }
 
+fn remote_parent_path(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || path == "." {
+        return None;
+    }
+
+    match path.rfind('/') {
+        Some(0) => Some("/".into()).filter(|_| path != "/"),
+        Some(separator) => Some(path[..separator].into()),
+        None => Some(".".into()),
+    }
+}
+
+fn format_remote_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
 fn titlebar_active_tab_basis(track_width: f32, tab_count: usize, expanded_width: f32) -> f32 {
     if tab_count <= 1 {
         return 0.0;
@@ -5323,6 +5824,45 @@ mod tests {
     }
 
     #[test]
+    fn remote_parent_path_handles_root_and_nested_directories() {
+        assert_eq!(remote_parent_path("/"), None);
+        assert_eq!(remote_parent_path("/home"), Some("/".into()));
+        assert_eq!(remote_parent_path("/home/test/"), Some("/home".into()));
+        assert_eq!(remote_parent_path("relative"), Some(".".into()));
+    }
+
+    #[test]
+    fn remote_file_sizes_use_compact_binary_units() {
+        assert_eq!(format_remote_size(42), "42 B");
+        assert_eq!(format_remote_size(1536), "1.5 KB");
+        assert_eq!(format_remote_size(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[test]
+    fn stale_sftp_response_does_not_replace_the_latest_directory() {
+        let mut browser = SftpBrowserState::default();
+        let stale_request = browser.begin_request();
+        let current_request = browser.begin_request();
+
+        assert!(!browser.complete_request(
+            stale_request,
+            RemoteDirectory {
+                path: "/stale".into(),
+                entries: Vec::new(),
+            },
+        ));
+        assert!(browser.complete_request(
+            current_request,
+            RemoteDirectory {
+                path: "/current".into(),
+                entries: Vec::new(),
+            },
+        ));
+        assert_eq!(browser.path, "/current");
+        assert!(!browser.loading);
+    }
+
+    #[test]
     fn profile_auth_kind_reflects_saved_configuration() {
         assert_eq!(
             ProfileAuthKind::from_config(&AuthConfig::Password),
@@ -5456,6 +5996,7 @@ mod tests {
             profile_id: "server-1".into(),
             layout: PaneLayout::Pane(first_pane),
             active_pane_id: first_pane,
+            view: TerminalTabView::Terminal,
         };
 
         assert!(
