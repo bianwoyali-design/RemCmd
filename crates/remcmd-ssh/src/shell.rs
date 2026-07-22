@@ -5,9 +5,8 @@ use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty, client}
 use crate::{SshError, SshErrorKind, shell_integration::ShellIntegration};
 
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
-const INTEGRATION_START_MARKER: &[u8] = b"\x1b]777;remcmd-shell-start\x07";
 const INTEGRATION_READY_MARKER: &[u8] = b"\x1b]777;remcmd-shell-ready\x07";
-const INTEGRATION_START_COMMAND: &str = "printf '\\033]777;remcmd-shell-start\\007'\r";
+const INTEGRATION_COMMAND_PREFIX: &str = " stty -echo; ";
 const INTEGRATION_READY_COMMAND: &str = "stty echo; printf '\\033]777;remcmd-shell-ready\\007'; __remcmd_last_cwd=$PWD; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
 
 /// Dimensions reported to the remote pseudo-terminal.
@@ -138,36 +137,22 @@ impl SshShell {
         channel: &mut Channel<client::Msg>,
         shell_integration: &ShellIntegration,
     ) -> Result<VecDeque<ShellEvent>, SshError> {
-        channel
-            .data_bytes(INTEGRATION_START_COMMAND.as_bytes().to_vec())
-            .await
-            .map_err(SshError::from)?;
-
-        let (startup_output, _) =
-            Self::read_until_marker(channel, INTEGRATION_START_MARKER).await?;
-
-        let install_commands = format!(
-            " {}\r {INTEGRATION_READY_COMMAND}",
+        let install_command = format!(
+            "{INTEGRATION_COMMAND_PREFIX}{}; {INTEGRATION_READY_COMMAND}",
             shell_integration.install_command()
         );
         channel
-            .data_bytes(install_commands.into_bytes())
+            .data_bytes(install_command.into_bytes())
             .await
             .map_err(SshError::from)?;
 
-        let (_, ready_output) = Self::read_until_marker(channel, INTEGRATION_READY_MARKER).await?;
+        let (startup_output, ready_output) =
+            Self::read_until_marker(channel, INTEGRATION_READY_MARKER).await?;
         let mut initial_events = VecDeque::new();
 
-        // Preserve complete startup lines such as a remote MOTD, but discard the
-        // first prompt that was on screen while the hidden hook was installed.
-        let startup_line_end = startup_output
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        if startup_line_end > 0 {
-            initial_events.push_back(ShellEvent::Output(
-                startup_output[..startup_line_end].to_vec(),
-            ));
+        let startup_output = complete_startup_lines(&startup_output);
+        if !startup_output.is_empty() {
+            initial_events.push_back(ShellEvent::Output(startup_output));
         }
         if !ready_output.is_empty() {
             initial_events.push_back(ShellEvent::Output(ready_output));
@@ -340,6 +325,17 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn complete_startup_lines(output: &[u8]) -> Vec<u8> {
+    let before_injection = find_bytes(output, INTEGRATION_COMMAND_PREFIX.as_bytes())
+        .map_or(output, |index| &output[..index]);
+    let complete_line_end = before_injection
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+
+    before_injection[..complete_line_end].to_vec()
 }
 
 impl SshShellWriter {

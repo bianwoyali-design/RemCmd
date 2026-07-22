@@ -97,6 +97,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generated_hooks_report_directory_changes() {
+        let bash = ShellIntegration::detect(b"/bin/bash").unwrap();
+        let bash_script = format!(
+            "{}; cd /tmp; eval \"$PROMPT_COMMAND\"",
+            bash.install_command()
+        );
+        assert_cwd_report("/bin/bash", &bash_script);
+
+        let zsh = ShellIntegration::detect(b"/bin/zsh").unwrap();
+        if Command::new("/bin/zsh").arg("--version").output().is_ok() {
+            let zsh_script = format!("{}; cd /tmp", zsh.install_command());
+            assert_cwd_report("/bin/zsh", &zsh_script);
+        }
+    }
+
     fn assert_shell_syntax(shell: &str, script: &str) {
         let output = Command::new(shell)
             .args(["-n", "-c", script])
@@ -106,6 +122,26 @@ mod tests {
             output.status.success(),
             "{shell} rejected generated shell integration: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_cwd_report(shell: &str, script: &str) {
+        let output = Command::new(shell)
+            .args(["-f", "-c", script])
+            .output()
+            .expect("cwd-report shell should start");
+        assert!(
+            output.status.success(),
+            "{shell} rejected cwd hook: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output
+                .stdout
+                .windows(b"7;file:///tmp".len())
+                .any(|window| { window == b"7;file:///tmp" }),
+            "{shell} did not report the directory change: {:?}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 }

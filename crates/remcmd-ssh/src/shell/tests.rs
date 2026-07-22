@@ -105,18 +105,6 @@ impl server::Handler for TestServer {
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         if data
-            .windows(b"remcmd-shell-start".len())
-            .any(|window| window == b"remcmd-shell-start")
-        {
-            self.state
-                .lock()
-                .expect("test state lock")
-                .integration_input
-                .extend_from_slice(data);
-            let (start, end) = super::INTEGRATION_START_MARKER.split_at(9);
-            session.data(channel, start.to_vec())?;
-            session.data(channel, end.to_vec())?;
-        } else if data
             .windows(b"remcmd-shell-ready".len())
             .any(|window| window == b"remcmd-shell-ready")
         {
@@ -125,6 +113,8 @@ impl server::Handler for TestServer {
                 .expect("test state lock")
                 .integration_input
                 .extend_from_slice(data);
+            session.data(channel, data.to_vec())?;
+            session.data(channel, b"\n".to_vec())?;
             let (start, end) = super::INTEGRATION_READY_MARKER.split_at(11);
             session.data(channel, start.to_vec())?;
             let mut final_output = end.to_vec();
@@ -398,6 +388,7 @@ async fn shell_integration_preserves_native_shell_and_stays_hidden() {
         assert_eq!(state.pty_modes, vec![(Pty::ECHO, 0)]);
         let integration_input = String::from_utf8_lossy(&state.integration_input);
         assert!(integration_input.contains("7;file://%s"));
+        assert!(!integration_input.contains("remcmd-shell-start"));
         assert!(!integration_input.contains("PS1"));
         assert!(!integration_input.contains("PROMPT="));
     }
