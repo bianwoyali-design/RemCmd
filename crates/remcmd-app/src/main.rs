@@ -1201,6 +1201,9 @@ impl RemCmdApp {
     fn dismiss_credential_prompt(&mut self, cx: &mut Context<Self>) {
         if let Some(prompt) = self.credential_prompt.take() {
             prompt.input.update(cx, |input, cx| input.clear(cx));
+            if self.pane_for_session(prompt.session_id).is_none() {
+                self.remove_session(prompt.session_id, cx);
+            }
         }
     }
 
@@ -1588,8 +1591,7 @@ impl RemCmdApp {
             .selected_session()
             .map(|session| session.id)
             .unwrap_or_else(|| self.create_session_for_profile(&profile.id));
-        self.activate_session_in_window(session_id, window, cx);
-        self.connect_profile_in_session(session_id, profile, cx);
+        self.connect_profile_in_session(session_id, profile, window, cx);
     }
 
     fn connect_selected_profile_in_new_session(
@@ -1609,8 +1611,7 @@ impl RemCmdApp {
         }
 
         let session_id = self.create_session_for_profile(&profile.id);
-        self.activate_session_in_window(session_id, window, cx);
-        self.connect_profile_in_session(session_id, profile, cx);
+        self.connect_profile_in_session(session_id, profile, window, cx);
     }
 
     fn split_active_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
@@ -1652,7 +1653,7 @@ impl RemCmdApp {
         debug_assert!(split, "validated active pane should be splittable");
 
         self.activate_session(session_id, cx);
-        self.connect_profile_in_session(session_id, profile, cx);
+        self.connect_profile_in_session(session_id, profile, window, cx);
         if let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) {
             focus_handle.focus(window);
         }
@@ -1692,6 +1693,7 @@ impl RemCmdApp {
         &mut self,
         session_id: SessionId,
         profile: ConnectionProfile,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self
@@ -1715,15 +1717,18 @@ impl RemCmdApp {
                     session_id,
                     profile,
                     CredentialPromptKind::Password,
+                    window,
                     cx,
                 );
             }
             AuthConfig::PrivateKey { path } => {
                 let prompt_kind = CredentialPromptKind::PrivateKeyPassphrase { path: path.clone() };
-                self.lookup_credential_and_connect(session_id, profile, prompt_kind, cx);
+                self.lookup_credential_and_connect(session_id, profile, prompt_kind, window, cx);
             }
             AuthConfig::Agent => {
-                self.start_connection(session_id, profile, AuthMethod::Agent, None, cx);
+                if self.activate_session_in_window(session_id, window, cx) {
+                    self.start_connection(session_id, profile, AuthMethod::Agent, None, cx);
+                }
             }
         }
     }
@@ -1733,6 +1738,7 @@ impl RemCmdApp {
         session_id: SessionId,
         profile: ConnectionProfile,
         prompt_kind: CredentialPromptKind,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         let profile_id = profile.id.clone();
@@ -1744,13 +1750,13 @@ impl RemCmdApp {
         }
         self.credential_lookup_session_id = Some(session_id);
 
-        self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
+        self.credential_lookup_task = Some(cx.spawn_in(window, async move |this, cx| {
             let lookup_profile_id = profile_id.clone();
             let result = runtime
                 .spawn_blocking(move || load_credential(&lookup_profile_id, credential_kind))
                 .await;
 
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.credential_lookup_task = None;
                 this.credential_lookup_session_id = None;
                 if !this
@@ -1780,11 +1786,12 @@ impl RemCmdApp {
                         let auth = auth_method_with_secret(prompt_kind, secret);
                         let credential =
                             ConnectionCredential::from_keychain(profile_id, credential_kind);
-                        this.start_connection(session_id, profile, auth, Some(credential), cx);
+                        if this.activate_session_in_window(session_id, window, cx) {
+                            this.start_connection(session_id, profile, auth, Some(credential), cx);
+                        }
                     }
                     Ok(None) => match prompt_kind {
                         CredentialPromptKind::Password => {
-                            this.activate_session(session_id, cx);
                             this.open_credential_prompt(
                                 session_id,
                                 profile_id,
@@ -1798,12 +1805,13 @@ impl RemCmdApp {
                                 path,
                                 passphrase: None,
                             };
-                            this.start_connection(session_id, profile, auth, None, cx);
+                            if this.activate_session_in_window(session_id, window, cx) {
+                                this.start_connection(session_id, profile, auth, None, cx);
+                            }
                         }
                     },
                     Err(error) => match prompt_kind {
                         CredentialPromptKind::Password => {
-                            this.activate_session(session_id, cx);
                             this.open_credential_prompt(
                                 session_id,
                                 profile_id,
@@ -1817,9 +1825,11 @@ impl RemCmdApp {
                                 path,
                                 passphrase: None,
                             };
-                            this.start_connection(session_id, profile, auth, None, cx);
-                            if let Some(session) = this.session_mut(session_id) {
-                                session.connection_message = Some(error);
+                            if this.activate_session_in_window(session_id, window, cx) {
+                                this.start_connection(session_id, profile, auth, None, cx);
+                                if let Some(session) = this.session_mut(session_id) {
+                                    session.connection_message = Some(error);
+                                }
                             }
                         }
                     },
@@ -1935,7 +1945,9 @@ impl RemCmdApp {
         let credential =
             ConnectionCredential::from_prompt(profile_id, credential_kind, save_on_success);
 
-        self.start_connection(session_id, profile, auth, Some(credential), cx);
+        if self.activate_session_in_window(session_id, window, cx) {
+            self.start_connection(session_id, profile, auth, Some(credential), cx);
+        }
     }
 
     fn on_submit_credential(
@@ -3561,7 +3573,7 @@ impl RemCmdApp {
         };
 
         if self.activate_session_in_window(session_id, window, cx) {
-            self.connect_profile_in_session(session_id, profile, cx);
+            self.connect_profile_in_session(session_id, profile, window, cx);
         }
     }
 
