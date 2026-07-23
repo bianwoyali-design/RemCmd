@@ -4,8 +4,7 @@ use gpui::{AnyElement, AssetSource, Hsla, IntoElement, Result, SharedString, pre
 
 use crate::theme::{IconTone, Theme};
 
-// Path data is from Lucide, rendered with its standard 24px view box and
-// rounded caps and joins. The stroke is tuned slightly lighter for GPUI.
+// RemCmd-owned icon paths use a shared 24px view box with rounded caps and joins.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum IconName {
     Add,
@@ -93,60 +92,76 @@ impl IconName {
 
     const fn body(self) -> &'static str {
         match self {
-            Self::Add => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
-            Self::ArrowLeft => r#"<path d="m15 18-6-6 6-6"/>"#,
-            Self::ArrowUp => r#"<path d="m18 15-6-6-6 6"/>"#,
-            Self::Cancel => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
-            Self::ClosePane => {
-                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/><path d="m8 9 3 3-3 3"/>"#
+            Self::Add => {
+                r#"<path d="M4 12H20" stroke-width="1.4"/><path d="M12 4V20" stroke-width="1.4"/>"#
             }
-            Self::Collapse => r#"<path d="m6 9 6 6 6-6"/>"#,
+            Self::ArrowLeft => r#"<path d="M15.25 3.5 7.75 12l7.5 8.5"/>"#,
+            Self::ArrowUp => r#"<path d="m3.5 15.25 8.5-7.5 8.5 7.5"/>"#,
+            Self::Cancel => r#"<path d="m5.5 5.5 13 13"/><path d="m18.5 5.5-13 13"/>"#,
+            Self::ClosePane => {
+                r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="M15 4v16"/><path d="m17.2 9.7 2.6 2.6m0-2.6-2.6 2.6" stroke-width="0.9"/>"#
+            }
+            Self::Collapse => r#"<path d="m6.5 9.25 5.5 5.5 5.5-5.5"/>"#,
             Self::Connect => {
-                r#"<path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z"/><path d="m2 22 3-3"/><path d="M7.5 13.5 10 11"/><path d="M10.5 16.5 13 14"/><path d="m18 3-4 4h6l-4 4"/>"#
+                r#"<path d="M3 12h13.5"/><path d="m12.5 8 4 4-4 4"/><rect x="16.5" y="4" width="4.5" height="16" rx="2.25"/>"#
             }
             Self::Delete => {
-                r#"<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>"#
+                r#"<path d="M3.5 7h17"/>
+                <path d="m5.75 7 .5 11.5c.05 1.15 1 2 2.15 2h7.2c1.15 0 2.1-.85 2.15-2l.5-11.5"/>
+                <path d="M9.25 7V5.5c0-1.105.895-2 2-2h1.5c1.105 0 2 .895 2 2V7"/>
+                <path d="M9 9.75v8.5M12 9.75v8.5M15 9.75v8.5" stroke-width="0.8"/>"#
             }
             Self::Disconnect => {
-                r#"<path d="m19 5 3-3"/><path d="m2 22 3-3"/><path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z"/><path d="M7.5 13.5 10 11"/><path d="M10.5 16.5 13 14"/><path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z"/>"#
+                r#"<rect x="3" y="4" width="4.5" height="16" rx="2.25"/><path d="M7.5 12H21"/><path d="m17 8 4 4-4 4"/>"#
             }
-            Self::Expand => r#"<path d="m9 18 6-6-6-6"/>"#,
+            Self::Expand => r#"<path d="m9.25 6.5 5.5 5.5-5.5 5.5"/>"#,
             Self::File => {
-                r#"<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/>"#
+                r#"<path d="M6.5 2.5H14L19.5 8v12a1.5 1.5 0 0 1-1.5 1.5H6.5a2 2 0 0 1-2-2v-15a2 2 0 0 1 2-2Z"/><path d="M14 2.5V8h5.5"/><path d="M8 12h8m-8 3h8m-8 3h5.5" stroke-width="0.7"/>"#
             }
             Self::Folder => {
-                r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#
+                r#"<path d="M3 6.5h5.75L11 8.75h9.5a1.5 1.5 0 0 1 1.5 1.5V19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8.5a2 2 0 0 1 2-2Z"/><path d="M2 11.25h20" stroke-width="0.7"/>"#
             }
             Self::ForgetCredential => {
-                r#"<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>"#
+                r#"<circle cx="7.5" cy="14" r="4"/><path d="M11.5 14h9m-3 0v3m-3-3v2"/><circle cx="18" cy="5.5" r="3"/><path d="M16.5 5.5h3" stroke-width="1.1"/>"#
             }
             Self::NewConnection => {
-                r#"<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/>"#
+                r#"<path d="M14.75 5H5.5A2.5 2.5 0 0 0 3 7.5v10A2.5 2.5 0 0 0 5.5 20H16a2.5 2.5 0 0 0 2.5-2.5V9"/><path d="M3 12.5h15.5"/><circle cx="6.5" cy="8.75" r="0.55" fill="currentColor" stroke="none"/><circle cx="6.5" cy="16.25" r="0.55" fill="currentColor" stroke="none"/><circle cx="18.5" cy="5.5" r="3.25"/><path d="M18.5 3.75v3.5M16.75 5.5h3.5" stroke-width="1.1"/>"#
             }
             Self::Reconnect => {
-                r#"<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>"#
+                r#"<path d="M19.5 8.25A8.25 8.25 0 1 0 19.75 15.25"/><path d="M19.5 3.75v4.5H15"/>"#
             }
-            Self::Search => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
+            Self::Search => {
+                r#"<circle cx="10.25" cy="10.25" r="7.25"/><path d="m15.65 15.65 5.35 5.35"/>"#
+            }
             Self::Server => {
-                r#"<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>"#
+                r#"<rect x="2.5" y="3.5" width="19" height="7" rx="2.25"/><rect x="2.5" y="13.5" width="19" height="7" rx="2.25"/><circle cx="6" cy="7" r="0.65" fill="currentColor" stroke="none"/><circle cx="6" cy="17" r="0.65" fill="currentColor" stroke="none"/><path d="M9.5 7h9m-9 10h9" stroke-width="0.7"/>"#
             }
             Self::Settings => {
-                r#"<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>"#
+                r#"<path d="M8.977 4.701 10.089 4.335 10.264 2.152h3.472l.175 2.183 1.112.366 1.046.527 1.667-1.42 2.456 2.456-1.42 1.667.527 1.046.366 1.112 2.183.175v3.472l-2.183.175-.366 1.112-.527 1.046 1.42 1.667-2.456 2.456-1.667-1.42-1.046.527-1.112.366-.175 2.183h-3.472l-.175-2.183-1.112-.366-1.046-.527-1.667 1.42-2.456-2.456 1.42-1.667-.527-1.046-.366-1.112-2.183-.175v-3.472l2.183-.175.366-1.112.527-1.046-1.42-1.667 2.456-2.456 1.667 1.42Z"/><circle cx="12" cy="12" r="3.25"/>"#
             }
             Self::SidebarLeft => {
-                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>"#
+                r#"<rect x="2" y="4" width="20" height="16" rx="3" stroke-width="1.333" stroke-linejoin="round"/>
+                <path d="M9.36842 4V20" stroke-width="1.333"/>
+                <path d="M4.10526 7.73333H7.26316" stroke-width="0.7" stroke-linecap="round"/>
+                <path d="M4.10526 10.4H7.26316" stroke-width="0.7" stroke-linecap="round"/>
+                <path d="M4.10526 13.0667H7.26316" stroke-width="0.7" stroke-linecap="round"/>
+"#
             }
             Self::SidebarRight => {
-                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>"#
+                r#"<rect x="2" y="4" width="20" height="16" rx="3" stroke-width="1.333" stroke-linejoin="round"/>
+                <path d="M14.63 4V20" stroke-width="1.333"/>
+                <path d="M16.73 7.73333H19.8879" stroke-width="0.7" stroke-linecap="round"/>
+                <path d="M16.73 10.4H19.8879" stroke-width="0.7" stroke-linecap="round"/>
+                <path d="M16.73 13.0667H19.8879" stroke-width="0.7" stroke-linecap="round"/>"#
             }
             Self::SplitDown => {
-                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/>"#
+                r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="M2 12h20"/><path d="M5 8h4m-4 8h4" stroke-width="0.7"/>"#
             }
             Self::SplitRight => {
-                r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>"#
+                r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="M12 4v16"/><path d="M5 8h3m7 0h3" stroke-width="0.7"/>"#
             }
             Self::Terminal => {
-                r#"<path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/>"#
+                r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="m6.5 8.75 3.25 3.25-3.25 3.25"/><path d="M12.5 15.25h5"/>"#
             }
         }
     }
@@ -187,7 +202,7 @@ pub(crate) fn icon_with_color(name: IconName, color: Hsla, size: f32) -> AnyElem
 
 fn build_svg(name: IconName) -> String {
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" color="#000" stroke="#000" stroke-width="1.333333" stroke-linecap="round" stroke-linejoin="round">{}</svg>"##,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.333333" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
         name.body()
     )
 }
@@ -203,7 +218,7 @@ mod tests {
         assert!(svg.contains(r#"width="24" height="24""#));
         assert!(svg.contains(r#"viewBox="0 0 24 24""#));
         assert!(svg.contains(r#"stroke-width="1.333333""#));
-        assert!(svg.contains(r##"stroke="#000""##));
+        assert!(svg.contains(r#"stroke="currentColor""#));
     }
 
     #[test]

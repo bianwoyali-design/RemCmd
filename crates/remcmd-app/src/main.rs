@@ -81,11 +81,15 @@ const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 340.0;
 const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 260.0;
 const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 520.0;
 const MIN_DETAIL_PANEL_WIDTH: f32 = 180.0;
-const COLLAPSED_TITLEBAR_LEADING_WIDTH: f32 = 132.0;
+const COLLAPSED_TITLEBAR_LEADING_WIDTH: f32 = 140.0;
 const TITLEBAR_HEIGHT: f32 = 52.0;
 const TITLEBAR_TAB_HEIGHT: f32 = 30.0;
 const TITLEBAR_TAB_GROUP_HEIGHT: f32 = 36.0;
-const TITLEBAR_ACTION_GROUP_WIDTH: f32 = 67.0;
+const TITLEBAR_ACTION_GROUP_WIDTH: f32 = 74.0;
+const TITLEBAR_CONTROL_HOVER_SIZE: f32 = 28.0;
+const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
+const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
+const TITLEBAR_LEFT_CONTROL_EDGE_GAP: f32 = 10.0;
 const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
 const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
 const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
@@ -3738,7 +3742,7 @@ impl RemCmdApp {
             },
             self.theme,
             IconTone::Default,
-            17.0,
+            TITLEBAR_SIDEBAR_ICON_SIZE,
         )
     }
 
@@ -3747,7 +3751,6 @@ impl RemCmdApp {
         id: &'static str,
         left: bool,
         tooltip: &'static str,
-        selected: bool,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
         icon_button(
@@ -3757,13 +3760,8 @@ impl RemCmdApp {
             true,
             &theme,
         )
-        .size(px(TITLEBAR_TAB_HEIGHT))
+        .size(px(TITLEBAR_CONTROL_HOVER_SIZE))
         .rounded_full()
-        .bg(if selected {
-            theme.control_bg
-        } else {
-            theme.transparent
-        })
         .tooltip(move |_, cx| -> AnyView {
             cx.new(|_| CommandTooltip {
                 label: tooltip.into(),
@@ -3785,13 +3783,28 @@ impl RemCmdApp {
                         .credential_mutations_in_progress
                         .contains_key(profile_id)
                 });
-        let mut new_terminal = self.render_icon_button(
+        let theme = self.theme;
+        let mut new_terminal = icon_button(
             "new-titlebar-terminal",
-            IconName::Add,
-            "New terminal",
+            icon(
+                IconName::Add,
+                theme,
+                IconTone::Default,
+                TITLEBAR_ADD_ICON_SIZE,
+            ),
             IconTone::Default,
             can_create_terminal,
-        );
+            &theme,
+        )
+        .size(px(TITLEBAR_CONTROL_HOVER_SIZE))
+        .rounded_full()
+        .tooltip(move |_, cx| -> AnyView {
+            cx.new(|_| CommandTooltip {
+                label: "New terminal".into(),
+                theme,
+            })
+            .into()
+        });
         if can_create_terminal {
             new_terminal = new_terminal.on_click(cx.listener(|this, _, window, cx| {
                 this.connect_selected_profile_in_new_session(window, cx);
@@ -3799,12 +3812,7 @@ impl RemCmdApp {
         }
 
         let right_sidebar = self
-            .render_titlebar_sidebar_button(
-                "toggle_right_sidebar",
-                false,
-                "Toggle SFTP sidebar",
-                self.right_sidebar_open,
-            )
+            .render_titlebar_sidebar_button("toggle_right_sidebar", false, "Toggle SFTP sidebar")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)));
 
         div()
@@ -3812,36 +3820,49 @@ impl RemCmdApp {
             .flex()
             .flex_none()
             .items_center()
+            .gap(px(2.0))
             .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
-            .p(px(3.0))
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_add_border)
             .bg(self.theme.titlebar_tab_selected_bg)
-            .shadow(vec![
-                BoxShadow {
-                    color: self.theme.titlebar_add_shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(2.0),
-                    spread_radius: px(-0.5),
-                },
-                BoxShadow {
-                    color: self.theme.titlebar_add_shadow,
-                    offset: point(px(0.0), px(2.0)),
-                    blur_radius: px(7.0),
-                    spread_radius: px(-2.5),
-                },
-            ])
+            .shadow(self.titlebar_control_shadow())
             .overflow_hidden()
-            .child(new_terminal.size(px(TITLEBAR_TAB_HEIGHT)).rounded_full())
             .child(
                 div()
+                    .flex()
                     .flex_none()
-                    .w(px(1.0))
-                    .h(px(18.0))
-                    .bg(self.theme.titlebar_tab_separator),
+                    .items_center()
+                    .justify_center()
+                    .size(px(TITLEBAR_TAB_GROUP_HEIGHT))
+                    .child(new_terminal),
             )
-            .child(right_sidebar)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(TITLEBAR_TAB_GROUP_HEIGHT))
+                    .child(right_sidebar),
+            )
+    }
+
+    fn titlebar_control_shadow(&self) -> Vec<BoxShadow> {
+        vec![
+            BoxShadow {
+                color: self.theme.titlebar_add_shadow,
+                offset: point(px(0.0), px(0.5)),
+                blur_radius: px(1.0),
+                spread_radius: px(-0.25),
+            },
+            BoxShadow {
+                color: self.theme.titlebar_add_shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(3.0),
+                spread_radius: px(-1.5),
+            },
+        ]
     }
 
     fn terminal_tab_title(&self, tab: &TerminalTab) -> String {
@@ -3911,38 +3932,20 @@ impl RemCmdApp {
             0.0
         };
         let left_sidebar_button = self
-            .render_titlebar_sidebar_button(
-                "toggle_left_sidebar",
-                true,
-                "Toggle sidebar",
-                self.left_sidebar_open,
-            )
+            .render_titlebar_sidebar_button("toggle_left_sidebar", true, "Toggle sidebar")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_left_sidebar(cx)));
         let left_sidebar_group = div()
             .id("titlebar_left_sidebar_group")
             .flex()
             .flex_none()
             .items_center()
-            .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
-            .p(px(3.0))
+            .justify_center()
+            .size(px(TITLEBAR_TAB_GROUP_HEIGHT))
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_add_border)
             .bg(self.theme.titlebar_tab_selected_bg)
-            .shadow(vec![
-                BoxShadow {
-                    color: self.theme.titlebar_add_shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(2.0),
-                    spread_radius: px(-0.5),
-                },
-                BoxShadow {
-                    color: self.theme.titlebar_add_shadow,
-                    offset: point(px(0.0), px(2.0)),
-                    blur_radius: px(7.0),
-                    spread_radius: px(-2.5),
-                },
-            ])
+            .shadow(self.titlebar_control_shadow())
             .overflow_hidden()
             .child(left_sidebar_button);
         let leading = div()
@@ -3953,7 +3956,7 @@ impl RemCmdApp {
             .h_full()
             .child(drag_area().flex_1())
             .child(left_sidebar_group)
-            .child(drag_area().w(px(10.0)));
+            .child(drag_area().w(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP)));
         let titlebar = div()
             .id("window_titlebar")
             .absolute()
@@ -5300,7 +5303,7 @@ impl RemCmdApp {
                     .cursor_pointer()
                     .hover(move |this| this.bg(list_hover_background))
                     .active(move |this| this.bg(pressed_background))
-                    .child(self.render_sidebar_icon(IconName::NewConnection, 19.0))
+                    .child(self.render_sidebar_icon(IconName::NewConnection, 17.0))
                     .child("New Connection")
                     .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
             )
