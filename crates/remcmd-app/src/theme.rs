@@ -49,6 +49,10 @@ pub struct Theme {
     pub control_bg: Hsla,
     pub control_hover_bg: Hsla,
     pub control_pressed_bg: Hsla,
+    pub button_primary_bg: Hsla,
+    pub button_primary_pressed_bg: Hsla,
+    pub button_secondary_bg: Hsla,
+    pub button_secondary_pressed_bg: Hsla,
     pub settings_group_bg: Hsla,
     pub settings_separator: Hsla,
     pub settings_picker_bg: Hsla,
@@ -80,8 +84,8 @@ impl Theme {
             text_muted: opaque(0xa1a1aa),
             text_faint: opaque(0x71717a),
 
-            accent: opaque(0x2563eb),
-            accent_hover: opaque(0x3b82f6),
+            accent: opaque(0x0159d1),
+            accent_hover: opaque(0x126be0),
             on_accent: opaque(0xffffff),
             danger: opaque(0xdc2626),
             danger_hover: opaque(0xef4444),
@@ -106,6 +110,10 @@ impl Theme {
             control_bg: alpha(0xffffff0d),
             control_hover_bg: alpha(0xffffff1f),
             control_pressed_bg: alpha(0xffffff33),
+            button_primary_bg: opaque(0x0159d1),
+            button_primary_pressed_bg: opaque(0x0149ad),
+            button_secondary_bg: alpha(0xffffff18),
+            button_secondary_pressed_bg: alpha(0xffffff32),
             settings_group_bg: alpha(0xffffff0d),
             settings_separator: alpha(0xffffff14),
             settings_picker_bg: alpha(0xffffff14),
@@ -124,7 +132,7 @@ impl Theme {
 
             input_cursor: hsla(0.0, 0.0, 1.0, 0.9),
             input_placeholder: hsla(0.0, 0.0, 1.0, 0.45),
-            selection_bg: alpha(0x60a5fa55),
+            selection_bg: alpha(0x0159d155),
         }
     }
 
@@ -135,8 +143,8 @@ impl Theme {
             text_muted: opaque(0x5f5f66),
             text_faint: opaque(0x8b8b92),
 
-            accent: opaque(0x2563eb),
-            accent_hover: opaque(0x1d4ed8),
+            accent: opaque(0x0159d1),
+            accent_hover: opaque(0x014fb8),
             on_accent: opaque(0xffffff),
             danger: opaque(0xdc2626),
             danger_hover: opaque(0xb91c1c),
@@ -161,6 +169,10 @@ impl Theme {
             control_bg: alpha(0x00000005),
             control_hover_bg: alpha(0x0000000f),
             control_pressed_bg: alpha(0x0000001f),
+            button_primary_bg: opaque(0x0159d1),
+            button_primary_pressed_bg: opaque(0x014398),
+            button_secondary_bg: alpha(0x0000000d),
+            button_secondary_pressed_bg: alpha(0x00000024),
             settings_group_bg: alpha(0x0000000a),
             settings_separator: alpha(0x00000014),
             settings_picker_bg: alpha(0x0000000f),
@@ -179,7 +191,7 @@ impl Theme {
 
             input_cursor: hsla(0.0, 0.0, 0.0, 0.8),
             input_placeholder: hsla(0.0, 0.0, 0.0, 0.4),
-            selection_bg: alpha(0x2563eb33),
+            selection_bg: alpha(0x0159d133),
         }
     }
 
@@ -281,9 +293,17 @@ pub fn text_button(
     enabled: bool,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    let (text, hover_text, border) = match tone {
-        TextButtonTone::Primary => (theme.accent, theme.accent_hover, theme.accent),
-        TextButtonTone::Secondary => (theme.text_primary, theme.text_primary, theme.border),
+    let (text, background, pressed_background) = match tone {
+        TextButtonTone::Primary => (
+            theme.on_accent,
+            theme.button_primary_bg,
+            theme.button_primary_pressed_bg,
+        ),
+        TextButtonTone::Secondary => (
+            theme.text_primary,
+            theme.button_secondary_bg,
+            theme.button_secondary_pressed_bg,
+        ),
     };
 
     let mut el = div()
@@ -294,10 +314,8 @@ pub fn text_button(
         .justify_center()
         .min_h(px(32.0))
         .px_3()
-        .rounded_md()
-        .border_1()
-        .border_color(border)
-        .bg(theme.transparent)
+        .rounded_lg()
+        .bg(background)
         .text_color(text)
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -307,8 +325,7 @@ pub fn text_button(
     if enabled {
         el = el
             .cursor_pointer()
-            .hover(move |this| this.bg(theme.control_hover_bg).text_color(hover_text))
-            .active(move |this| this.bg(theme.control_pressed_bg).text_color(text));
+            .active(move |this| this.bg(pressed_background));
     } else {
         el = el.opacity(0.5);
     }
@@ -335,5 +352,15 @@ mod tests {
             Theme::for_appearance(WindowAppearance::VibrantDark),
             Theme::dark()
         );
+    }
+
+    #[test]
+    fn light_and_dark_themes_share_the_remcmd_accent() {
+        let expected = opaque(0x0159d1);
+
+        for theme in [Theme::light(), Theme::dark()] {
+            assert_eq!(theme.accent, expected);
+            assert_eq!(theme.button_primary_bg, expected);
+        }
     }
 }

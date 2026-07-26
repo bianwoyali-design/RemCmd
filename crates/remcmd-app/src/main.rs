@@ -422,7 +422,7 @@ impl SettingsSelector {
 
     const fn control_width(self) -> f32 {
         match self {
-            Self::Theme => 76.0,
+            Self::Theme => 92.0,
             Self::TabLayout => 104.0,
             Self::TransferRate => 104.0,
             Self::ParallelTransfers => 56.0,
@@ -7329,6 +7329,8 @@ impl RemCmdApp {
                     .flex_1()
                     .min_w(px(0.0))
                     .truncate()
+                    .pr(px(4.0))
+                    .text_right()
                     .child(current_label),
             )
             .child(picker)
