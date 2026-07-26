@@ -13,7 +13,8 @@ use tokio::{runtime::Handle, sync::mpsc};
 use crate::{
     AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteFile, SessionState, SftpOperation,
     SftpTransferDirection, ShellEvent, SshError, SshErrorKind, SshSession, SshShellWriter,
-    SshTransport, host_key::HostKeyDecision, sftp::SftpWorkerHandle, transport::TransportOpen,
+    SshTransport, TransferRateLimiter, host_key::HostKeyDecision, sftp::SftpWorkerHandle,
+    transport::TransportOpen,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -294,6 +295,22 @@ impl SshConnection {
         auth: AuthMethod,
         initial_size: PtySize,
     ) -> Self {
+        Self::spawn_with_transfer_rate_limiter(
+            runtime,
+            profile,
+            auth,
+            initial_size,
+            Arc::new(TransferRateLimiter::default()),
+        )
+    }
+
+    pub fn spawn_with_transfer_rate_limiter(
+        runtime: &Handle,
+        profile: ConnectionProfile,
+        auth: AuthMethod,
+        initial_size: PtySize,
+        transfer_rate_limiter: Arc<TransferRateLimiter>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (host_key_decision_tx, host_key_decision_rx) = mpsc::unbounded_channel();
         let host_key_verification_pending = Arc::new(AtomicBool::new(false));
@@ -303,10 +320,13 @@ impl SshConnection {
             profile,
             auth,
             initial_size,
-            command_rx,
-            host_key_decision_rx,
-            host_key_verification_pending.clone(),
-            event_tx,
+            ConnectionWorkerContext {
+                commands: command_rx,
+                host_key_decisions: host_key_decision_rx,
+                host_key_verification_pending: host_key_verification_pending.clone(),
+                events: event_tx,
+                transfer_rate_limiter,
+            },
         ));
 
         Self {
@@ -328,6 +348,14 @@ impl SshConnection {
 enum PendingResult<T> {
     Completed(Result<T, SshError>),
     Disconnect,
+}
+
+struct ConnectionWorkerContext {
+    commands: mpsc::UnboundedReceiver<ConnectionCommand>,
+    host_key_decisions: mpsc::UnboundedReceiver<HostKeyDecision>,
+    host_key_verification_pending: Arc<AtomicBool>,
+    events: mpsc::Sender<ConnectionEvent>,
+    transfer_rate_limiter: Arc<TransferRateLimiter>,
 }
 
 async fn wait_for_operation<T, F>(
@@ -436,11 +464,15 @@ async fn run_connection(
     profile: ConnectionProfile,
     auth: AuthMethod,
     mut latest_size: PtySize,
-    mut commands: mpsc::UnboundedReceiver<ConnectionCommand>,
-    mut host_key_decisions: mpsc::UnboundedReceiver<HostKeyDecision>,
-    host_key_verification_pending: Arc<AtomicBool>,
-    events: mpsc::Sender<ConnectionEvent>,
+    context: ConnectionWorkerContext,
 ) {
+    let ConnectionWorkerContext {
+        mut commands,
+        mut host_key_decisions,
+        host_key_verification_pending,
+        events,
+        transfer_rate_limiter,
+    } = context;
     let mut session = SshSession::new(profile.clone());
 
     if let Err(error) = session.begin_connect() {
@@ -671,7 +703,11 @@ async fn run_connection(
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn(session, events.clone()));
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
                         }
                         Err(error) => {
                             if events
@@ -712,7 +748,11 @@ async fn run_connection(
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn(session, events.clone()));
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
                         }
                         Err(error) => {
                             if events
@@ -758,7 +798,11 @@ async fn run_connection(
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn(session, events.clone()));
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
                         }
                         Err(error) => {
                             if events
@@ -805,8 +849,11 @@ async fn run_connection(
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(sftp_session) => {
-                            sftp_worker =
-                                Some(SftpWorkerHandle::spawn(sftp_session, events.clone()));
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                sftp_session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
                         }
                         Err(error) => {
                             if events
@@ -853,8 +900,11 @@ async fn run_connection(
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(sftp_session) => {
-                            sftp_worker =
-                                Some(SftpWorkerHandle::spawn(sftp_session, events.clone()));
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                sftp_session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
                         }
                         Err(error) => {
                             if events

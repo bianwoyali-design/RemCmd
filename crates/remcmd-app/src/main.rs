@@ -38,6 +38,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -54,11 +55,11 @@ use gpui::{
 };
 use secrecy::SecretString;
 
-use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode};
+use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
     RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, SessionState, SftpOperation,
-    SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind,
+    SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind, TransferRateLimiter,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -99,6 +100,13 @@ const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
 const TITLEBAR_CLOSE_SYMBOL_SIZE: f32 = 12.0;
 const TRAFFIC_LIGHT_INSET_X: f32 = 20.0;
 const TRAFFIC_LIGHT_INSET_Y: f32 = 18.0;
+const TRANSFER_RATE_OPTIONS: [(u32, &str); 4] = [
+    (0, "Unlimited"),
+    (5, "5 MiB/s"),
+    (20, "20 MiB/s"),
+    (100, "100 MiB/s"),
+];
+const PARALLEL_TRANSFER_OPTIONS: [u8; 4] = [1, 2, 4, 8];
 
 #[cfg(target_os = "macos")]
 const TERMINAL_FONT_FAMILY: &str = "SF Mono";
@@ -151,6 +159,9 @@ struct RemCmdApp {
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
     tab_layout: TabLayout,
+    transfer_settings: TransferSettings,
+    transfer_rate_limiter: Arc<TransferRateLimiter>,
+    next_transfer_session_cursor: usize,
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
@@ -596,8 +607,8 @@ enum SftpTransferState {
 }
 
 impl SftpTransferState {
-    const fn is_blocking(self) -> bool {
-        matches!(self, Self::Running | Self::Cancelling | Self::Conflict)
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling)
     }
 
     const fn is_finished(self) -> bool {
@@ -686,9 +697,6 @@ impl SftpTransferQueue {
     }
 
     fn start_next(&mut self) -> Option<SftpTransferTask> {
-        if self.tasks.iter().any(|task| task.state.is_blocking()) {
-            return None;
-        }
         let task = self
             .tasks
             .iter_mut()
@@ -696,6 +704,13 @@ impl SftpTransferQueue {
         task.state = SftpTransferState::Running;
         task.error = None;
         Some(task.clone())
+    }
+
+    fn active_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.state.is_active())
+            .count()
     }
 
     fn task_mut(&mut self, id: u64) -> Option<&mut SftpTransferTask> {
@@ -712,7 +727,7 @@ impl SftpTransferQueue {
         ) {
             return false;
         }
-        task.transferred = transferred;
+        task.transferred = task.transferred.max(transferred);
         task.total = total;
         true
     }
@@ -1026,6 +1041,10 @@ impl RemCmdApp {
         };
         let theme_mode = settings.theme_mode;
         let tab_layout = settings.tab_layout;
+        let transfer_settings = settings.transfers.normalized();
+        let transfer_rate_limiter = Arc::new(TransferRateLimiter::new(
+            transfer_settings.bytes_per_second(),
+        ));
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
 
@@ -1076,6 +1095,9 @@ impl RemCmdApp {
             active_panel: ActivePanel::Connection,
             theme_mode,
             tab_layout,
+            transfer_settings,
+            transfer_rate_limiter,
+            next_transfer_session_cursor: 0,
             theme,
             settings_path,
             settings_error,
@@ -1728,21 +1750,52 @@ impl RemCmdApp {
         session
             .transfers
             .enqueue(direction, local_path, remote_path, overwrite);
-        self.start_next_sftp_transfer(session_id, cx);
+        self.start_queued_sftp_transfers(cx);
         cx.notify();
     }
 
-    fn start_next_sftp_transfer(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+    fn active_sftp_transfer_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .map(|session| session.transfers.active_count())
+            .sum()
+    }
+
+    fn take_next_queued_sftp_transfer(
+        &mut self,
+    ) -> Option<(SessionId, Option<ConnectionHandle>, SftpTransferTask)> {
+        if self.sessions.is_empty() {
+            self.next_transfer_session_cursor = 0;
+            return None;
+        }
+
+        let session_count = self.sessions.len();
+        for offset in 0..session_count {
+            let index = (self.next_transfer_session_cursor + offset) % session_count;
+            let session = &mut self.sessions[index];
+            let Some(task) = session.transfers.start_next() else {
+                continue;
+            };
+            let handle = (session.connection_state == SessionState::Connected)
+                .then(|| session.connection_handle.clone())
+                .flatten();
+            self.next_transfer_session_cursor = (index + 1) % session_count;
+            return Some((session.id, handle, task));
+        }
+        None
+    }
+
+    fn start_queued_sftp_transfers(&mut self, cx: &mut Context<Self>) {
         loop {
-            let Some((handle, task)) = self.session_mut(session_id).and_then(|session| {
-                let task = session.transfers.start_next()?;
-                let handle = (session.connection_state == SessionState::Connected)
-                    .then(|| session.connection_handle.clone())
-                    .flatten();
-                Some((handle, task))
-            }) else {
+            if self.active_sftp_transfer_count()
+                >= usize::from(self.transfer_settings.max_parallel_transfers)
+            {
+                break;
+            }
+            let Some((session_id, handle, task)) = self.take_next_queued_sftp_transfer() else {
                 break;
             };
+            let transfer_id = task.id;
 
             let result = match handle {
                 Some(handle) => match task.direction {
@@ -1766,10 +1819,12 @@ impl RemCmdApp {
             };
 
             match result {
-                Ok(()) => break,
+                Ok(()) => {}
                 Err(error) => {
                     if let Some(session) = self.session_mut(session_id) {
-                        session.transfers.mark_failed(task.id, error.to_string());
+                        session
+                            .transfers
+                            .mark_failed(transfer_id, error.to_string());
                     }
                 }
             }
@@ -1805,10 +1860,10 @@ impl RemCmdApp {
                 session
                     .transfers
                     .mark_failed(transfer_id, error.to_string());
-                self.start_next_sftp_transfer(session_id, cx);
+                self.start_queued_sftp_transfers(cx);
             }
         } else {
-            self.start_next_sftp_transfer(session_id, cx);
+            self.start_queued_sftp_transfers(cx);
         }
         cx.notify();
     }
@@ -1823,7 +1878,7 @@ impl RemCmdApp {
             .session_mut(session_id)
             .is_some_and(|session| session.transfers.retry_with_overwrite(transfer_id))
         {
-            self.start_next_sftp_transfer(session_id, cx);
+            self.start_queued_sftp_transfers(cx);
         }
         cx.notify();
     }
@@ -1867,7 +1922,7 @@ impl RemCmdApp {
             }
         }
 
-        self.start_next_sftp_transfer(session_id, cx);
+        self.start_queued_sftp_transfers(cx);
     }
 
     fn create_tab_for_session(
@@ -2206,10 +2261,28 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn set_transfer_rate_limit(&mut self, rate_limit_mib_per_second: u32, cx: &mut Context<Self>) {
+        self.transfer_settings.rate_limit_mib_per_second = rate_limit_mib_per_second;
+        self.transfer_settings = self.transfer_settings.normalized();
+        self.transfer_rate_limiter
+            .set_bytes_per_second(self.transfer_settings.bytes_per_second());
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_max_parallel_transfers(&mut self, max_parallel_transfers: u8, cx: &mut Context<Self>) {
+        self.transfer_settings.max_parallel_transfers = max_parallel_transfers;
+        self.transfer_settings = self.transfer_settings.normalized();
+        self.persist_settings();
+        self.start_queued_sftp_transfers(cx);
+        cx.notify();
+    }
+
     fn persist_settings(&mut self) {
         let settings = AppSettings {
             theme_mode: self.theme_mode,
             tab_layout: self.tab_layout,
+            transfers: self.transfer_settings,
         };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
@@ -2952,7 +3025,13 @@ impl RemCmdApp {
 
         let runtime = cx.global::<SshRuntime>().handle();
         let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
-        let connection = SshConnection::spawn(&runtime, profile.clone(), auth, pty_size);
+        let connection = SshConnection::spawn_with_transfer_rate_limiter(
+            &runtime,
+            profile.clone(),
+            auth,
+            pty_size,
+            self.transfer_rate_limiter.clone(),
+        );
         let (handle, mut events) = connection.split();
 
         let session = self
@@ -3999,6 +4078,7 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     session.transfers.mark_conflict(transfer_id);
                 }
+                self.start_queued_sftp_transfers(cx);
                 true
             }
             ConnectionEvent::TransferCompleted {
@@ -4014,7 +4094,7 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     session.transfers.mark_cancelled(transfer_id);
                 }
-                self.start_next_sftp_transfer(session_id, cx);
+                self.start_queued_sftp_transfers(cx);
                 true
             }
             ConnectionEvent::SftpFailed {
@@ -4051,7 +4131,7 @@ impl RemCmdApp {
                     false
                 };
                 if transfer_failed {
-                    self.start_next_sftp_transfer(session_id, cx);
+                    self.start_queued_sftp_transfers(cx);
                 }
                 true
             }
@@ -6236,6 +6316,42 @@ impl RemCmdApp {
                 TabLayout::Vertical,
                 cx,
             ));
+        let mut transfer_rate_control = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .p(px(2.0))
+            .gap(px(2.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.control_bg);
+        for (rate, label) in TRANSFER_RATE_OPTIONS {
+            transfer_rate_control = transfer_rate_control.child(self.render_transfer_rate_option(
+                SharedString::from(format!("transfer_rate_{rate}")),
+                label,
+                rate,
+                cx,
+            ));
+        }
+        let mut parallel_transfer_control = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .p(px(2.0))
+            .gap(px(2.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.control_bg);
+        for count in PARALLEL_TRANSFER_OPTIONS {
+            parallel_transfer_control =
+                parallel_transfer_control.child(self.render_parallel_transfer_option(
+                    SharedString::from(format!("parallel_transfers_{count}")),
+                    count,
+                    cx,
+                ));
+        }
 
         let content = div()
             .id("settings_content")
@@ -6277,6 +6393,44 @@ impl RemCmdApp {
                             .child("Tab layout"),
                     )
                     .child(tab_layout_control),
+            )
+            .child(
+                div()
+                    .mt_6()
+                    .mb_3()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(self.theme.text_muted)
+                    .child("Transfers"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .truncate()
+                            .child("Speed limit"),
+                    )
+                    .child(transfer_rate_control),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .mt_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .truncate()
+                            .child("Parallel files"),
+                    )
+                    .child(parallel_transfer_control),
             )
             .when_some(self.settings_error.as_ref(), |this, error| {
                 this.child(
@@ -6404,6 +6558,118 @@ impl RemCmdApp {
             .child(div().truncate().child(label))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.set_tab_layout(tab_layout, cx);
+            }))
+    }
+
+    fn render_transfer_rate_option(
+        &self,
+        id: SharedString,
+        label: &'static str,
+        rate_limit_mib_per_second: u32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected =
+            self.transfer_settings.rate_limit_mib_per_second == rate_limit_mib_per_second;
+        let background = if is_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let border = if is_selected {
+            self.theme.border_strong
+        } else {
+            self.theme.transparent
+        };
+        let hover_background = if is_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.control_hover_bg
+        };
+        let pressed_background = self.theme.control_pressed_bg;
+
+        div()
+            .id(id)
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py(px(6.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover_background))
+            .active(move |this| this.bg(pressed_background))
+            .when(is_selected, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(3.0),
+                    spread_radius: px(-1.0),
+                }])
+            })
+            .child(div().truncate().child(label))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_transfer_rate_limit(rate_limit_mib_per_second, cx);
+            }))
+    }
+
+    fn render_parallel_transfer_option(
+        &self,
+        id: SharedString,
+        max_parallel_transfers: u8,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.transfer_settings.max_parallel_transfers == max_parallel_transfers;
+        let background = if is_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let border = if is_selected {
+            self.theme.border_strong
+        } else {
+            self.theme.transparent
+        };
+        let hover_background = if is_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.control_hover_bg
+        };
+        let pressed_background = self.theme.control_pressed_bg;
+
+        div()
+            .id(id)
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py(px(6.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover_background))
+            .active(move |this| this.bg(pressed_background))
+            .when(is_selected, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(3.0),
+                    spread_radius: px(-1.0),
+                }])
+            })
+            .child(max_parallel_transfers.to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_max_parallel_transfers(max_parallel_transfers, cx);
             }))
     }
 
@@ -8079,7 +8345,7 @@ mod tests {
     }
 
     #[test]
-    fn sftp_transfer_queue_runs_one_task_at_a_time_and_pauses_for_conflicts() {
+    fn sftp_transfer_queue_tracks_multiple_active_tasks_and_conflicts_release_slots() {
         let mut queue = SftpTransferQueue::default();
         let upload = queue.enqueue(
             SftpTransferDirection::Upload,
@@ -8095,11 +8361,15 @@ mod tests {
         );
 
         assert_eq!(queue.start_next().unwrap().id, upload);
-        assert!(queue.start_next().is_none());
-        assert!(queue.mark_completed(upload, 12));
         assert_eq!(queue.start_next().unwrap().id, download);
+        assert_eq!(queue.active_count(), 2);
+        assert!(queue.mark_progress(upload, 9, Some(12)));
+        assert!(queue.mark_progress(upload, 3, Some(12)));
+        assert_eq!(queue.task_mut(upload).unwrap().transferred, 9);
         assert!(queue.mark_conflict(download));
-        assert!(queue.start_next().is_none());
+        assert_eq!(queue.active_count(), 1);
+        assert!(queue.mark_completed(upload, 12));
+        assert_eq!(queue.active_count(), 0);
         assert!(queue.retry_with_overwrite(download));
         let retried = queue.start_next().unwrap();
         assert_eq!(retried.id, download);
