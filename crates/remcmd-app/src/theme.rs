@@ -49,6 +49,9 @@ pub struct Theme {
     pub control_bg: Hsla,
     pub control_hover_bg: Hsla,
     pub control_pressed_bg: Hsla,
+    pub settings_group_bg: Hsla,
+    pub settings_separator: Hsla,
+    pub settings_picker_bg: Hsla,
 
     pub titlebar_tab_selected_bg: Hsla,
     pub titlebar_tab_selected_hover_bg: Hsla,
@@ -103,6 +106,9 @@ impl Theme {
             control_bg: alpha(0xffffff0d),
             control_hover_bg: alpha(0xffffff1f),
             control_pressed_bg: alpha(0xffffff33),
+            settings_group_bg: alpha(0xffffff0d),
+            settings_separator: alpha(0xffffff14),
+            settings_picker_bg: alpha(0xffffff14),
 
             titlebar_tab_selected_bg: alpha(0xffffff1f),
             titlebar_tab_selected_hover_bg: alpha(0xffffff2b),
@@ -155,6 +161,9 @@ impl Theme {
             control_bg: alpha(0x00000005),
             control_hover_bg: alpha(0x0000000f),
             control_pressed_bg: alpha(0x0000001f),
+            settings_group_bg: alpha(0x0000000a),
+            settings_separator: alpha(0x00000014),
+            settings_picker_bg: alpha(0x0000000f),
 
             titlebar_tab_selected_bg: alpha(0xffffffc7),
             titlebar_tab_selected_hover_bg: alpha(0xffffffdc),
