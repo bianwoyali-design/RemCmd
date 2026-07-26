@@ -38,6 +38,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -49,16 +50,16 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render,
     ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions,
     UTF16Selection, UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowOptions, canvas, div, ease_in_out, ease_out_quint, img, point,
-    prelude::*, px, rgb, size, uniform_list,
+    WindowControlArea, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, img,
+    point, prelude::*, px, rgb, size, uniform_list,
 };
 use secrecy::SecretString;
 
-use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode};
+use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
     RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, SessionState, SftpOperation,
-    SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind,
+    SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind, TransferRateLimiter,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -99,7 +100,6 @@ const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
 const TITLEBAR_CLOSE_SYMBOL_SIZE: f32 = 12.0;
 const TRAFFIC_LIGHT_INSET_X: f32 = 20.0;
 const TRAFFIC_LIGHT_INSET_Y: f32 = 18.0;
-
 #[cfg(target_os = "macos")]
 const TERMINAL_FONT_FAMILY: &str = "SF Mono";
 #[cfg(target_os = "windows")]
@@ -109,6 +109,7 @@ const TERMINAL_FONT_FAMILY: &str = "DejaVu Sans Mono";
 
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
+gpui::actions!(settings_selector, [CancelSettingsSelector]);
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -151,6 +152,11 @@ struct RemCmdApp {
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
     tab_layout: TabLayout,
+    transfer_settings: TransferSettings,
+    transfer_rate_limiter: Arc<TransferRateLimiter>,
+    next_transfer_session_cursor: usize,
+    open_settings_selector: Option<SettingsSelector>,
+    settings_focus_handle: FocusHandle,
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
@@ -383,6 +389,109 @@ enum ActivePanel {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSelector {
+    Theme,
+    TabLayout,
+    TransferRate,
+    ParallelTransfers,
+}
+
+impl SettingsSelector {
+    const fn element_id(self) -> &'static str {
+        match self {
+            Self::Theme => "settings-theme-selector",
+            Self::TabLayout => "settings-tab-layout-selector",
+            Self::TransferRate => "settings-transfer-rate-selector",
+            Self::ParallelTransfers => "settings-parallel-transfers-selector",
+        }
+    }
+
+    const fn options(self) -> &'static [SettingsOption] {
+        match self {
+            Self::Theme => &THEME_SETTING_OPTIONS,
+            Self::TabLayout => &TAB_LAYOUT_SETTING_OPTIONS,
+            Self::TransferRate => &TRANSFER_RATE_SETTING_OPTIONS,
+            Self::ParallelTransfers => &PARALLEL_TRANSFER_SETTING_OPTIONS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsValue {
+    Theme(ThemeMode),
+    TabLayout(TabLayout),
+    TransferRate(u32),
+    ParallelTransfers(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SettingsOption {
+    label: &'static str,
+    value: SettingsValue,
+}
+
+const THEME_SETTING_OPTIONS: [SettingsOption; 3] = [
+    SettingsOption {
+        label: "System",
+        value: SettingsValue::Theme(ThemeMode::System),
+    },
+    SettingsOption {
+        label: "Light",
+        value: SettingsValue::Theme(ThemeMode::Light),
+    },
+    SettingsOption {
+        label: "Dark",
+        value: SettingsValue::Theme(ThemeMode::Dark),
+    },
+];
+const TAB_LAYOUT_SETTING_OPTIONS: [SettingsOption; 2] = [
+    SettingsOption {
+        label: "Horizontal",
+        value: SettingsValue::TabLayout(TabLayout::Horizontal),
+    },
+    SettingsOption {
+        label: "Vertical",
+        value: SettingsValue::TabLayout(TabLayout::Vertical),
+    },
+];
+const TRANSFER_RATE_SETTING_OPTIONS: [SettingsOption; 4] = [
+    SettingsOption {
+        label: "Unlimited",
+        value: SettingsValue::TransferRate(0),
+    },
+    SettingsOption {
+        label: "5 MiB/s",
+        value: SettingsValue::TransferRate(5),
+    },
+    SettingsOption {
+        label: "20 MiB/s",
+        value: SettingsValue::TransferRate(20),
+    },
+    SettingsOption {
+        label: "100 MiB/s",
+        value: SettingsValue::TransferRate(100),
+    },
+];
+const PARALLEL_TRANSFER_SETTING_OPTIONS: [SettingsOption; 4] = [
+    SettingsOption {
+        label: "1",
+        value: SettingsValue::ParallelTransfers(1),
+    },
+    SettingsOption {
+        label: "2",
+        value: SettingsValue::ParallelTransfers(2),
+    },
+    SettingsOption {
+        label: "4",
+        value: SettingsValue::ParallelTransfers(4),
+    },
+    SettingsOption {
+        label: "8",
+        value: SettingsValue::ParallelTransfers(8),
+    },
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TerminalTabView {
     #[default]
@@ -596,8 +705,8 @@ enum SftpTransferState {
 }
 
 impl SftpTransferState {
-    const fn is_blocking(self) -> bool {
-        matches!(self, Self::Running | Self::Cancelling | Self::Conflict)
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling)
     }
 
     const fn is_finished(self) -> bool {
@@ -686,9 +795,6 @@ impl SftpTransferQueue {
     }
 
     fn start_next(&mut self) -> Option<SftpTransferTask> {
-        if self.tasks.iter().any(|task| task.state.is_blocking()) {
-            return None;
-        }
         let task = self
             .tasks
             .iter_mut()
@@ -696,6 +802,13 @@ impl SftpTransferQueue {
         task.state = SftpTransferState::Running;
         task.error = None;
         Some(task.clone())
+    }
+
+    fn active_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.state.is_active())
+            .count()
     }
 
     fn task_mut(&mut self, id: u64) -> Option<&mut SftpTransferTask> {
@@ -712,7 +825,7 @@ impl SftpTransferQueue {
         ) {
             return false;
         }
-        task.transferred = transferred;
+        task.transferred = task.transferred.max(transferred);
         task.total = total;
         true
     }
@@ -1026,6 +1139,10 @@ impl RemCmdApp {
         };
         let theme_mode = settings.theme_mode;
         let tab_layout = settings.tab_layout;
+        let transfer_settings = settings.transfers.normalized();
+        let transfer_rate_limiter = Arc::new(TransferRateLimiter::new(
+            transfer_settings.bytes_per_second(),
+        ));
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
 
@@ -1034,6 +1151,7 @@ impl RemCmdApp {
         });
         let sidebar_search = cx.new(|cx| TextField::new(cx, "", "Search connections"));
         cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
+        let settings_focus_handle = cx.focus_handle();
 
         let mut app = Self {
             profiles,
@@ -1076,6 +1194,11 @@ impl RemCmdApp {
             active_panel: ActivePanel::Connection,
             theme_mode,
             tab_layout,
+            transfer_settings,
+            transfer_rate_limiter,
+            next_transfer_session_cursor: 0,
+            open_settings_selector: None,
+            settings_focus_handle,
             theme,
             settings_path,
             settings_error,
@@ -1728,21 +1851,52 @@ impl RemCmdApp {
         session
             .transfers
             .enqueue(direction, local_path, remote_path, overwrite);
-        self.start_next_sftp_transfer(session_id, cx);
+        self.start_queued_sftp_transfers(cx);
         cx.notify();
     }
 
-    fn start_next_sftp_transfer(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+    fn active_sftp_transfer_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .map(|session| session.transfers.active_count())
+            .sum()
+    }
+
+    fn take_next_queued_sftp_transfer(
+        &mut self,
+    ) -> Option<(SessionId, Option<ConnectionHandle>, SftpTransferTask)> {
+        if self.sessions.is_empty() {
+            self.next_transfer_session_cursor = 0;
+            return None;
+        }
+
+        let session_count = self.sessions.len();
+        for offset in 0..session_count {
+            let index = (self.next_transfer_session_cursor + offset) % session_count;
+            let session = &mut self.sessions[index];
+            let Some(task) = session.transfers.start_next() else {
+                continue;
+            };
+            let handle = (session.connection_state == SessionState::Connected)
+                .then(|| session.connection_handle.clone())
+                .flatten();
+            self.next_transfer_session_cursor = (index + 1) % session_count;
+            return Some((session.id, handle, task));
+        }
+        None
+    }
+
+    fn start_queued_sftp_transfers(&mut self, cx: &mut Context<Self>) {
         loop {
-            let Some((handle, task)) = self.session_mut(session_id).and_then(|session| {
-                let task = session.transfers.start_next()?;
-                let handle = (session.connection_state == SessionState::Connected)
-                    .then(|| session.connection_handle.clone())
-                    .flatten();
-                Some((handle, task))
-            }) else {
+            if self.active_sftp_transfer_count()
+                >= usize::from(self.transfer_settings.max_parallel_transfers)
+            {
+                break;
+            }
+            let Some((session_id, handle, task)) = self.take_next_queued_sftp_transfer() else {
                 break;
             };
+            let transfer_id = task.id;
 
             let result = match handle {
                 Some(handle) => match task.direction {
@@ -1766,10 +1920,12 @@ impl RemCmdApp {
             };
 
             match result {
-                Ok(()) => break,
+                Ok(()) => {}
                 Err(error) => {
                     if let Some(session) = self.session_mut(session_id) {
-                        session.transfers.mark_failed(task.id, error.to_string());
+                        session
+                            .transfers
+                            .mark_failed(transfer_id, error.to_string());
                     }
                 }
             }
@@ -1805,10 +1961,10 @@ impl RemCmdApp {
                 session
                     .transfers
                     .mark_failed(transfer_id, error.to_string());
-                self.start_next_sftp_transfer(session_id, cx);
+                self.start_queued_sftp_transfers(cx);
             }
         } else {
-            self.start_next_sftp_transfer(session_id, cx);
+            self.start_queued_sftp_transfers(cx);
         }
         cx.notify();
     }
@@ -1823,7 +1979,7 @@ impl RemCmdApp {
             .session_mut(session_id)
             .is_some_and(|session| session.transfers.retry_with_overwrite(transfer_id))
         {
-            self.start_next_sftp_transfer(session_id, cx);
+            self.start_queued_sftp_transfers(cx);
         }
         cx.notify();
     }
@@ -1867,7 +2023,7 @@ impl RemCmdApp {
             }
         }
 
-        self.start_next_sftp_transfer(session_id, cx);
+        self.start_queued_sftp_transfers(cx);
     }
 
     fn create_tab_for_session(
@@ -1979,6 +2135,7 @@ impl RemCmdApp {
         self.active_pane_id = Some(pane_id);
         self.active_session_id = Some(session_id);
         self.active_panel = ActivePanel::Connection;
+        self.open_settings_selector = None;
         self.selected_profile_id = Some(profile_id);
         if profile_changed {
             self.load_editor_for_selected_profile(cx);
@@ -2206,10 +2363,98 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn set_transfer_rate_limit(&mut self, rate_limit_mib_per_second: u32, cx: &mut Context<Self>) {
+        self.transfer_settings.rate_limit_mib_per_second = rate_limit_mib_per_second;
+        self.transfer_settings = self.transfer_settings.normalized();
+        self.transfer_rate_limiter
+            .set_bytes_per_second(self.transfer_settings.bytes_per_second());
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_max_parallel_transfers(&mut self, max_parallel_transfers: u8, cx: &mut Context<Self>) {
+        self.transfer_settings.max_parallel_transfers = max_parallel_transfers;
+        self.transfer_settings = self.transfer_settings.normalized();
+        self.persist_settings();
+        self.start_queued_sftp_transfers(cx);
+        cx.notify();
+    }
+
+    fn settings_value(&self, selector: SettingsSelector) -> SettingsValue {
+        match selector {
+            SettingsSelector::Theme => SettingsValue::Theme(self.theme_mode),
+            SettingsSelector::TabLayout => SettingsValue::TabLayout(self.tab_layout),
+            SettingsSelector::TransferRate => {
+                SettingsValue::TransferRate(self.transfer_settings.rate_limit_mib_per_second)
+            }
+            SettingsSelector::ParallelTransfers => {
+                SettingsValue::ParallelTransfers(self.transfer_settings.max_parallel_transfers)
+            }
+        }
+    }
+
+    fn settings_value_label(&self, selector: SettingsSelector) -> SharedString {
+        let value = self.settings_value(selector);
+        if let Some(option) = selector
+            .options()
+            .iter()
+            .find(|option| option.value == value)
+        {
+            return option.label.into();
+        }
+
+        match value {
+            SettingsValue::TransferRate(rate) => format!("{rate} MiB/s").into(),
+            SettingsValue::ParallelTransfers(count) => count.to_string().into(),
+            SettingsValue::Theme(_) | SettingsValue::TabLayout(_) => {
+                unreachable!("all theme and tab-layout values have labels")
+            }
+        }
+    }
+
+    fn toggle_settings_selector(
+        &mut self,
+        selector: SettingsSelector,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_selector = if self.open_settings_selector == Some(selector) {
+            None
+        } else {
+            Some(selector)
+        };
+        self.settings_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn dismiss_settings_selector(&mut self, cx: &mut Context<Self>) {
+        if self.open_settings_selector.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn apply_settings_value(
+        &mut self,
+        value: SettingsValue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_selector = None;
+        match value {
+            SettingsValue::Theme(mode) => self.set_theme_mode(mode, window, cx),
+            SettingsValue::TabLayout(layout) => self.set_tab_layout(layout, cx),
+            SettingsValue::TransferRate(rate) => self.set_transfer_rate_limit(rate, cx),
+            SettingsValue::ParallelTransfers(count) => {
+                self.set_max_parallel_transfers(count, cx);
+            }
+        }
+    }
+
     fn persist_settings(&mut self) {
         let settings = AppSettings {
             theme_mode: self.theme_mode,
             tab_layout: self.tab_layout,
+            transfers: self.transfer_settings,
         };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
@@ -2384,6 +2629,7 @@ impl RemCmdApp {
     fn select_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::Connection;
+        self.open_settings_selector = None;
         let tab_id = self
             .active_tab()
             .filter(|tab| tab.profile_id == profile_id)
@@ -2415,6 +2661,7 @@ impl RemCmdApp {
         );
 
         self.active_panel = ActivePanel::Connection;
+        self.open_settings_selector = None;
         self.active_session_id = None;
         self.selected_profile_id = Some(profile.id.clone());
         self.profiles.push(profile);
@@ -2426,9 +2673,11 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn show_settings(&mut self, cx: &mut Context<Self>) {
+    fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::Settings;
+        self.open_settings_selector = None;
+        self.settings_focus_handle.focus(window);
         cx.notify();
     }
 
@@ -2952,7 +3201,13 @@ impl RemCmdApp {
 
         let runtime = cx.global::<SshRuntime>().handle();
         let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
-        let connection = SshConnection::spawn(&runtime, profile.clone(), auth, pty_size);
+        let connection = SshConnection::spawn_with_transfer_rate_limiter(
+            &runtime,
+            profile.clone(),
+            auth,
+            pty_size,
+            self.transfer_rate_limiter.clone(),
+        );
         let (handle, mut events) = connection.split();
 
         let session = self
@@ -3114,6 +3369,15 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         self.reject_pending_host_key(cx);
+    }
+
+    fn on_cancel_settings_selector(
+        &mut self,
+        _: &CancelSettingsSelector,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_settings_selector(cx);
     }
 
     fn prompt_for_private_key_passphrase(
@@ -3999,6 +4263,7 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     session.transfers.mark_conflict(transfer_id);
                 }
+                self.start_queued_sftp_transfers(cx);
                 true
             }
             ConnectionEvent::TransferCompleted {
@@ -4014,7 +4279,7 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     session.transfers.mark_cancelled(transfer_id);
                 }
-                self.start_next_sftp_transfer(session_id, cx);
+                self.start_queued_sftp_transfers(cx);
                 true
             }
             ConnectionEvent::SftpFailed {
@@ -4051,7 +4316,7 @@ impl RemCmdApp {
                     false
                 };
                 if transfer_failed {
-                    self.start_next_sftp_transfer(session_id, cx);
+                    self.start_queued_sftp_transfers(cx);
                 }
                 true
             }
@@ -4198,6 +4463,25 @@ impl Render for RemCmdApp {
         }
         if self.right_sidebar_open {
             root = root.child(self.render_right_sidebar_resize_handle(right_sidebar_width, cx));
+        }
+        if self.active_panel == ActivePanel::Settings && self.open_settings_selector.is_some() {
+            root = root.child(
+                div()
+                    .id("settings_selector_dismiss_layer")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .bg(self.theme.transparent)
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dismiss_settings_selector(cx);
+                        }),
+                    ),
+            );
         }
 
         if self
@@ -5781,8 +6065,8 @@ impl RemCmdApp {
                     .active(move |this| this.bg(pressed_background))
                     .child(self.render_sidebar_icon(IconName::Settings, 18.0))
                     .child("Settings")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_settings(cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_settings(window, cx);
                     })),
             );
 
@@ -6201,42 +6485,6 @@ impl RemCmdApp {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let appearance_control = div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .p(px(2.0))
-            .gap(px(2.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.control_bg)
-            .child(self.render_theme_mode_option("theme_system", "System", ThemeMode::System, cx))
-            .child(self.render_theme_mode_option("theme_light", "Light", ThemeMode::Light, cx))
-            .child(self.render_theme_mode_option("theme_dark", "Dark", ThemeMode::Dark, cx));
-        let tab_layout_control = div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .p(px(2.0))
-            .gap(px(2.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.control_bg)
-            .child(self.render_tab_layout_option(
-                "tabs_horizontal",
-                "Horizontal",
-                TabLayout::Horizontal,
-                cx,
-            ))
-            .child(self.render_tab_layout_option(
-                "tabs_vertical",
-                "Vertical",
-                TabLayout::Vertical,
-                cx,
-            ));
-
         let content = div()
             .id("settings_content")
             .flex()
@@ -6261,7 +6509,7 @@ impl RemCmdApp {
                     .items_center()
                     .gap_3()
                     .child(div().flex_none().w(px(112.0)).truncate().child("Theme"))
-                    .child(appearance_control),
+                    .child(self.render_settings_selector(SettingsSelector::Theme, cx)),
             )
             .child(
                 div()
@@ -6276,7 +6524,45 @@ impl RemCmdApp {
                             .truncate()
                             .child("Tab layout"),
                     )
-                    .child(tab_layout_control),
+                    .child(self.render_settings_selector(SettingsSelector::TabLayout, cx)),
+            )
+            .child(
+                div()
+                    .mt_6()
+                    .mb_3()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(self.theme.text_muted)
+                    .child("Transfers"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .truncate()
+                            .child("Speed limit"),
+                    )
+                    .child(self.render_settings_selector(SettingsSelector::TransferRate, cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .mt_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .truncate()
+                            .child("Parallel files"),
+                    )
+                    .child(self.render_settings_selector(SettingsSelector::ParallelTransfers, cx)),
             )
             .when_some(self.settings_error.as_ref(), |this, error| {
                 this.child(
@@ -6288,6 +6574,9 @@ impl RemCmdApp {
             });
 
         self.detail_panel_shell()
+            .key_context("Settings")
+            .track_focus(&self.settings_focus_handle)
+            .on_action(cx.listener(Self::on_cancel_settings_selector))
             .child(
                 div()
                     .flex_none()
@@ -6297,114 +6586,125 @@ impl RemCmdApp {
             .child(content)
     }
 
-    fn render_theme_mode_option(
+    fn render_settings_selector(
         &self,
-        id: &'static str,
-        label: &'static str,
-        mode: ThemeMode,
+        selector: SettingsSelector,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.theme_mode == mode;
-        let background = if is_selected {
-            self.theme.list_selected_bg
-        } else {
-            self.theme.transparent
-        };
-        let border = if is_selected {
+    ) -> gpui::Div {
+        let is_open = self.open_settings_selector == Some(selector);
+        let border = if is_open {
             self.theme.border_strong
         } else {
-            self.theme.transparent
+            self.theme.border
         };
-        let hover_background = if is_selected {
-            self.theme.list_selected_hover_bg
-        } else {
-            self.theme.control_hover_bg
-        };
-
-        div()
-            .id(id)
+        let mut menu = div()
+            .id(SharedString::from(format!(
+                "{}-menu",
+                selector.element_id()
+            )))
+            .absolute()
+            .top(px(36.0))
+            .left_0()
+            .right_0()
             .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .items_center()
-            .justify_center()
-            .px_2()
-            .py(px(6.0))
+            .flex_col()
+            .gap_1()
+            .p_1()
             .rounded_md()
             .border_1()
-            .border_color(border)
-            .bg(background)
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.modal_bg)
             .text_sm()
-            .cursor_pointer()
-            .hover(move |this| this.bg(hover_background))
-            .when(is_selected, |this| {
-                this.shadow(vec![BoxShadow {
-                    color: self.theme.shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(3.0),
-                    spread_radius: px(-1.0),
-                }])
-            })
-            .child(div().truncate().child(label))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.set_theme_mode(mode, window, cx);
-            }))
-    }
-
-    fn render_tab_layout_option(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        tab_layout: TabLayout,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = self.tab_layout == tab_layout;
-        let background = if is_selected {
-            self.theme.list_selected_bg
-        } else {
-            self.theme.transparent
-        };
-        let border = if is_selected {
-            self.theme.border_strong
-        } else {
-            self.theme.transparent
-        };
-        let hover_background = if is_selected {
-            self.theme.list_selected_hover_bg
-        } else {
-            self.theme.control_hover_bg
-        };
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(5.0)),
+                blur_radius: px(16.0),
+                spread_radius: px(-5.0),
+            }])
+            .occlude();
+        let selected_value = self.settings_value(selector);
         let pressed_background = self.theme.control_pressed_bg;
+        for (index, option) in selector.options().iter().copied().enumerate() {
+            let is_selected = option.value == selected_value;
+            let mut check = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(18.0));
+            if is_selected {
+                check = check.child(icon(IconName::Check, self.theme, IconTone::Accent, 13.0));
+            }
+            let option_hover = self.theme.control_hover_bg;
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "{}-option-{index}",
+                        selector.element_id()
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.0))
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(option_hover))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(check)
+                    .child(div().flex_1().min_w(px(0.0)).truncate().child(option.label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.apply_settings_value(option.value, window, cx);
+                    })),
+            );
+        }
 
-        div()
-            .id(id)
+        let button_hover = self.theme.control_hover_bg;
+        let current_label = self.settings_value_label(selector);
+        let button = div()
+            .id(selector.element_id())
             .flex()
-            .flex_1()
+            .w_full()
             .min_w(px(0.0))
             .items_center()
-            .justify_center()
-            .px_2()
-            .py(px(6.0))
+            .justify_between()
+            .h(px(32.0))
+            .px_3()
             .rounded_md()
             .border_1()
             .border_color(border)
-            .bg(background)
+            .bg(self.theme.surface_bg)
             .text_sm()
             .cursor_pointer()
-            .hover(move |this| this.bg(hover_background))
+            .hover(move |this| this.bg(button_hover))
             .active(move |this| this.bg(pressed_background))
-            .when(is_selected, |this| {
-                this.shadow(vec![BoxShadow {
-                    color: self.theme.shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(3.0),
-                    spread_radius: px(-1.0),
-                }])
-            })
-            .child(div().truncate().child(label))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_tab_layout(tab_layout, cx);
-            }))
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(2.0),
+                spread_radius: px(-1.0),
+            }])
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .child(current_label),
+            )
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 14.0))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_settings_selector(selector, window, cx);
+            }));
+
+        div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .max_w(px(260.0))
+            .child(button)
+            .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
     }
 
     fn render_pane_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7952,6 +8252,14 @@ fn bind_host_key_prompt_keys(cx: &mut App) {
     )]);
 }
 
+fn bind_settings_selector_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        CancelSettingsSelector,
+        Some("Settings"),
+    )]);
+}
+
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
 
@@ -7959,6 +8267,7 @@ fn launch(cx: &mut App) {
     bind_file_editor_keys(cx);
     bind_credential_prompt_keys(cx);
     bind_host_key_prompt_keys(cx);
+    bind_settings_selector_keys(cx);
     open_main_window(cx);
     cx.activate(true);
 }
@@ -7984,6 +8293,39 @@ mod tests {
         assert_eq!(clamp_sidebar_width(120.0, 1200.0), 220.0);
         assert_eq!(clamp_sidebar_width(600.0, 1200.0), 480.0);
         assert_eq!(clamp_sidebar_width(300.0, 720.0), 300.0);
+    }
+
+    #[test]
+    fn settings_selectors_cover_every_persisted_choice() {
+        assert_eq!(SettingsSelector::Theme.options(), &THEME_SETTING_OPTIONS);
+        assert_eq!(
+            SettingsSelector::TabLayout.options(),
+            &TAB_LAYOUT_SETTING_OPTIONS
+        );
+        assert_eq!(
+            SettingsSelector::TransferRate.options(),
+            &TRANSFER_RATE_SETTING_OPTIONS
+        );
+        assert_eq!(
+            SettingsSelector::ParallelTransfers.options(),
+            &PARALLEL_TRANSFER_SETTING_OPTIONS
+        );
+        assert!(THEME_SETTING_OPTIONS.contains(&SettingsOption {
+            label: "System",
+            value: SettingsValue::Theme(ThemeMode::System),
+        }));
+        assert!(TAB_LAYOUT_SETTING_OPTIONS.contains(&SettingsOption {
+            label: "Horizontal",
+            value: SettingsValue::TabLayout(TabLayout::Horizontal),
+        }));
+        assert!(TRANSFER_RATE_SETTING_OPTIONS.contains(&SettingsOption {
+            label: "Unlimited",
+            value: SettingsValue::TransferRate(0),
+        }));
+        assert!(PARALLEL_TRANSFER_SETTING_OPTIONS.contains(&SettingsOption {
+            label: "4",
+            value: SettingsValue::ParallelTransfers(4),
+        }));
     }
 
     #[test]
@@ -8079,7 +8421,7 @@ mod tests {
     }
 
     #[test]
-    fn sftp_transfer_queue_runs_one_task_at_a_time_and_pauses_for_conflicts() {
+    fn sftp_transfer_queue_tracks_multiple_active_tasks_and_conflicts_release_slots() {
         let mut queue = SftpTransferQueue::default();
         let upload = queue.enqueue(
             SftpTransferDirection::Upload,
@@ -8095,11 +8437,15 @@ mod tests {
         );
 
         assert_eq!(queue.start_next().unwrap().id, upload);
-        assert!(queue.start_next().is_none());
-        assert!(queue.mark_completed(upload, 12));
         assert_eq!(queue.start_next().unwrap().id, download);
+        assert_eq!(queue.active_count(), 2);
+        assert!(queue.mark_progress(upload, 9, Some(12)));
+        assert!(queue.mark_progress(upload, 3, Some(12)));
+        assert_eq!(queue.task_mut(upload).unwrap().transferred, 9);
         assert!(queue.mark_conflict(download));
-        assert!(queue.start_next().is_none());
+        assert_eq!(queue.active_count(), 1);
+        assert!(queue.mark_completed(upload, 12));
+        assert_eq!(queue.active_count(), 0);
         assert!(queue.retry_with_overwrite(download));
         let retried = queue.start_next().unwrap();
         assert_eq!(retried.id, download);

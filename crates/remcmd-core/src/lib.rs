@@ -63,6 +63,47 @@ pub enum TabLayout {
     Vertical,
 }
 
+pub const DEFAULT_MAX_PARALLEL_TRANSFERS: u8 = 4;
+pub const MAX_PARALLEL_TRANSFERS: u8 = 8;
+pub const MAX_TRANSFER_RATE_MIB_PER_SECOND: u32 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TransferSettings {
+    #[serde(default)]
+    pub rate_limit_mib_per_second: u32,
+    #[serde(default = "default_max_parallel_transfers")]
+    pub max_parallel_transfers: u8,
+}
+
+impl TransferSettings {
+    pub fn normalized(self) -> Self {
+        Self {
+            rate_limit_mib_per_second: self
+                .rate_limit_mib_per_second
+                .min(MAX_TRANSFER_RATE_MIB_PER_SECOND),
+            max_parallel_transfers: self.max_parallel_transfers.clamp(1, MAX_PARALLEL_TRANSFERS),
+        }
+    }
+
+    pub fn bytes_per_second(self) -> Option<u64> {
+        (self.rate_limit_mib_per_second > 0)
+            .then_some(u64::from(self.rate_limit_mib_per_second) * 1024 * 1024)
+    }
+}
+
+impl Default for TransferSettings {
+    fn default() -> Self {
+        Self {
+            rate_limit_mib_per_second: 0,
+            max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
+        }
+    }
+}
+
+const fn default_max_parallel_transfers() -> u8 {
+    DEFAULT_MAX_PARALLEL_TRANSFERS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
@@ -133,5 +174,33 @@ mod tests {
             serde_json::from_str::<TabLayout>(r#""vertical""#).unwrap(),
             TabLayout::Vertical
         );
+    }
+
+    #[test]
+    fn transfer_settings_default_and_normalize_limits() {
+        assert_eq!(
+            TransferSettings::default().max_parallel_transfers,
+            DEFAULT_MAX_PARALLEL_TRANSFERS
+        );
+        assert_eq!(
+            TransferSettings {
+                rate_limit_mib_per_second: u32::MAX,
+                max_parallel_transfers: 0,
+            }
+            .normalized(),
+            TransferSettings {
+                rate_limit_mib_per_second: MAX_TRANSFER_RATE_MIB_PER_SECOND,
+                max_parallel_transfers: 1,
+            }
+        );
+        assert_eq!(
+            TransferSettings {
+                rate_limit_mib_per_second: 20,
+                max_parallel_transfers: 4,
+            }
+            .bytes_per_second(),
+            Some(20 * 1024 * 1024)
+        );
+        assert_eq!(TransferSettings::default().bytes_per_second(), None);
     }
 }

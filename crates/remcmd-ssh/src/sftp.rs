@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -9,17 +10,58 @@ use std::{
 };
 
 use russh_sftp::{client::SftpSession, protocol::FileType};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     task::JoinSet,
-    time::{Duration, timeout},
+    time::{Duration, sleep, timeout},
 };
 
 use crate::{ConnectionEvent, SshError, SshErrorKind};
 
 pub const MAX_REMOTE_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+pub struct TransferRateLimiter {
+    bytes_per_second: AtomicU64,
+    pacing: AsyncMutex<()>,
+}
+
+impl TransferRateLimiter {
+    pub fn new(bytes_per_second: Option<u64>) -> Self {
+        Self {
+            bytes_per_second: AtomicU64::new(bytes_per_second.unwrap_or(0)),
+            pacing: AsyncMutex::new(()),
+        }
+    }
+
+    pub fn set_bytes_per_second(&self, bytes_per_second: Option<u64>) {
+        self.bytes_per_second
+            .store(bytes_per_second.unwrap_or(0), Ordering::Release);
+    }
+
+    async fn acquire(&self, bytes: usize) {
+        if bytes == 0 || self.bytes_per_second.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        let _pacing = self.pacing.lock().await;
+        let bytes_per_second = self.bytes_per_second.load(Ordering::Acquire);
+        if bytes_per_second == 0 {
+            return;
+        }
+        sleep(Duration::from_secs_f64(
+            bytes as f64 / bytes_per_second as f64,
+        ))
+        .await;
+    }
+}
+
+impl Default for TransferRateLimiter {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SftpOperation {
@@ -103,7 +145,11 @@ pub(crate) struct SftpWorkerHandle {
 }
 
 impl SftpWorkerHandle {
-    pub(crate) fn spawn(session: SftpSession, events: mpsc::Sender<ConnectionEvent>) -> Self {
+    pub(crate) fn spawn_with_limiter(
+        session: SftpSession,
+        events: mpsc::Sender<ConnectionEvent>,
+        rate_limiter: Arc<TransferRateLimiter>,
+    ) -> Self {
         let (command_tx, mut commands) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
@@ -185,15 +231,20 @@ impl SftpWorkerHandle {
                         let session = session.clone();
                         let events = events.clone();
                         let transfer_cancellations = transfer_cancellations.clone();
+                        let rate_limiter = rate_limiter.clone();
                         transfer_tasks.spawn(async move {
+                            let context = TransferContext::new(
+                                transfer_id,
+                                cancellation,
+                                events.clone(),
+                                rate_limiter,
+                            );
                             let result = upload_file(
                                 &session,
-                                transfer_id,
                                 &local_path,
                                 remote_path.clone(),
                                 overwrite,
-                                &cancellation,
-                                &events,
+                                &context,
                             )
                             .await;
                             let event = transfer_result_event(
@@ -223,15 +274,20 @@ impl SftpWorkerHandle {
                         let session = session.clone();
                         let events = events.clone();
                         let transfer_cancellations = transfer_cancellations.clone();
+                        let rate_limiter = rate_limiter.clone();
                         transfer_tasks.spawn(async move {
-                            let result = download_file(
-                                &session,
+                            let context = TransferContext::new(
                                 transfer_id,
+                                cancellation,
+                                events.clone(),
+                                rate_limiter,
+                            );
+                            let result = download_file(
+                                session,
                                 remote_path.clone(),
                                 &local_path,
                                 overwrite,
-                                &cancellation,
-                                &events,
+                                &context,
                             )
                             .await;
                             let event = transfer_result_event(
@@ -353,12 +409,62 @@ impl SftpWorkerHandle {
 }
 
 const TRANSFER_CHUNK_BYTES: usize = 128 * 1024;
+const DOWNLOAD_PIPELINE_STREAMS: usize = 4;
+const MIN_DOWNLOAD_SEGMENT_BYTES: u64 = 1024 * 1024;
 static NEXT_TRANSFER_TEMPORARY_ID: AtomicU64 = AtomicU64::new(1);
 
 enum TransferResult {
     Completed(u64),
     Conflict,
     Cancelled,
+}
+
+#[derive(Clone)]
+struct TransferContext {
+    transfer_id: u64,
+    cancellation: Arc<AtomicBool>,
+    events: mpsc::Sender<ConnectionEvent>,
+    rate_limiter: Arc<TransferRateLimiter>,
+}
+
+impl TransferContext {
+    fn new(
+        transfer_id: u64,
+        cancellation: Arc<AtomicBool>,
+        events: mpsc::Sender<ConnectionEvent>,
+        rate_limiter: Arc<TransferRateLimiter>,
+    ) -> Self {
+        Self {
+            transfer_id,
+            cancellation,
+            events,
+            rate_limiter,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+
+    async fn acquire_rate_budget(&self, bytes: usize) {
+        self.rate_limiter.acquire(bytes).await;
+    }
+
+    async fn report_progress(&self, transferred: u64, total: Option<u64>) -> Result<(), SshError> {
+        self.events
+            .send(ConnectionEvent::TransferProgress {
+                transfer_id: self.transfer_id,
+                transferred,
+                total,
+            })
+            .await
+            .map_err(|_| {
+                SshError::new(
+                    SshErrorKind::InvalidState,
+                    "SSH connection event receiver is not running",
+                )
+            })
+    }
 }
 
 fn transfer_result_event(
@@ -394,12 +500,10 @@ fn transfer_result_event(
 
 async fn upload_file(
     session: &SftpSession,
-    transfer_id: u64,
     local_path: &Path,
     remote_path: String,
     overwrite: bool,
-    cancellation: &AtomicBool,
-    events: &mpsc::Sender<ConnectionEvent>,
+    context: &TransferContext,
 ) -> Result<TransferResult, SshError> {
     let metadata = fs::metadata(local_path)
         .await
@@ -421,12 +525,14 @@ async fn upload_file(
         return Ok(TransferResult::Conflict);
     }
 
-    if cancellation.load(Ordering::Acquire) {
+    if context.is_cancelled() {
         return Ok(TransferResult::Cancelled);
     }
 
-    let temporary_path =
-        remote_transfer_temporary_path(&remote_path, &transfer_temporary_suffix(transfer_id));
+    let temporary_path = remote_transfer_temporary_path(
+        &remote_path,
+        &transfer_temporary_suffix(context.transfer_id),
+    );
     if session
         .try_exists(temporary_path.clone())
         .await
@@ -438,16 +544,7 @@ async fn upload_file(
             .map_err(SshError::from)?;
     }
 
-    let copy_result = copy_upload(
-        session,
-        transfer_id,
-        local_path,
-        &temporary_path,
-        total,
-        cancellation,
-        events,
-    )
-    .await;
+    let copy_result = copy_upload(session, local_path, &temporary_path, total, context).await;
     let transferred = match copy_result {
         Ok(TransferResult::Completed(bytes)) => bytes,
         Ok(TransferResult::Cancelled) => {
@@ -461,7 +558,7 @@ async fn upload_file(
         }
     };
 
-    if cancellation.load(Ordering::Acquire) {
+    if context.is_cancelled() {
         let _ = session.remove_file(temporary_path).await;
         return Ok(TransferResult::Cancelled);
     }
@@ -494,12 +591,10 @@ async fn upload_file(
 
 async fn copy_upload(
     session: &SftpSession,
-    transfer_id: u64,
     local_path: &Path,
     temporary_path: &str,
     total: u64,
-    cancellation: &AtomicBool,
-    events: &mpsc::Sender<ConnectionEvent>,
+    context: &TransferContext,
 ) -> Result<TransferResult, SshError> {
     let mut local_file = fs::File::open(local_path)
         .await
@@ -512,7 +607,7 @@ async fn copy_upload(
     let mut transferred = 0_u64;
 
     loop {
-        if cancellation.load(Ordering::Acquire) {
+        if context.is_cancelled() {
             return Ok(TransferResult::Cancelled);
         }
         let read = local_file
@@ -522,12 +617,16 @@ async fn copy_upload(
         if read == 0 {
             break;
         }
+        context.acquire_rate_budget(read).await;
+        if context.is_cancelled() {
+            return Ok(TransferResult::Cancelled);
+        }
         remote_file
             .write_all(&buffer[..read])
             .await
             .map_err(|error| transfer_io_error("writing remote file", error))?;
         transferred += read as u64;
-        report_transfer_progress(events, transfer_id, transferred, Some(total)).await?;
+        context.report_progress(transferred, Some(total)).await?;
     }
 
     remote_file.sync_all().await.map_err(SshError::from)?;
@@ -539,13 +638,11 @@ async fn copy_upload(
 }
 
 async fn download_file(
-    session: &SftpSession,
-    transfer_id: u64,
+    session: Arc<SftpSession>,
     remote_path: String,
     local_path: &Path,
     overwrite: bool,
-    cancellation: &AtomicBool,
-    events: &mpsc::Sender<ConnectionEvent>,
+    context: &TransferContext,
 ) -> Result<TransferResult, SshError> {
     if fs::try_exists(local_path)
         .await
@@ -555,7 +652,7 @@ async fn download_file(
         return Ok(TransferResult::Conflict);
     }
 
-    if cancellation.load(Ordering::Acquire) {
+    if context.is_cancelled() {
         return Ok(TransferResult::Cancelled);
     }
 
@@ -569,7 +666,7 @@ async fn download_file(
         .map_err(SshError::from)?;
     let total = metadata.size;
     let temporary_path =
-        local_transfer_temporary_path(local_path, &transfer_temporary_suffix(transfer_id));
+        local_transfer_temporary_path(local_path, &transfer_temporary_suffix(context.transfer_id));
     if fs::try_exists(&temporary_path)
         .await
         .map_err(|error| transfer_io_error("checking temporary download", error))?
@@ -581,12 +678,10 @@ async fn download_file(
 
     let copy_result = copy_download(
         session,
-        transfer_id,
-        &remote_path,
-        &temporary_path,
+        remote_path,
+        temporary_path.clone(),
         total,
-        cancellation,
-        events,
+        context.clone(),
     )
     .await;
     let transferred = match copy_result {
@@ -602,7 +697,7 @@ async fn download_file(
         }
     };
 
-    if cancellation.load(Ordering::Acquire) {
+    if context.is_cancelled() {
         let _ = fs::remove_file(&temporary_path).await;
         return Ok(TransferResult::Cancelled);
     }
@@ -631,13 +726,34 @@ async fn download_file(
 }
 
 async fn copy_download(
+    session: Arc<SftpSession>,
+    remote_path: String,
+    temporary_path: PathBuf,
+    total: Option<u64>,
+    context: TransferContext,
+) -> Result<TransferResult, SshError> {
+    let ranges = total.map(download_segment_ranges).unwrap_or_default();
+    if ranges.len() > 1 {
+        return copy_download_parallel(
+            session,
+            remote_path,
+            temporary_path,
+            total.expect("parallel download ranges require a known size"),
+            ranges,
+            context,
+        )
+        .await;
+    }
+
+    copy_download_sequential(&session, &remote_path, &temporary_path, total, &context).await
+}
+
+async fn copy_download_sequential(
     session: &SftpSession,
-    transfer_id: u64,
     remote_path: &str,
     temporary_path: &Path,
     total: Option<u64>,
-    cancellation: &AtomicBool,
-    events: &mpsc::Sender<ConnectionEvent>,
+    context: &TransferContext,
 ) -> Result<TransferResult, SshError> {
     let mut remote_file = session
         .open(remote_path.to_owned())
@@ -650,7 +766,7 @@ async fn copy_download(
     let mut transferred = 0_u64;
 
     loop {
-        if cancellation.load(Ordering::Acquire) {
+        if context.is_cancelled() {
             return Ok(TransferResult::Cancelled);
         }
         let read = remote_file
@@ -660,12 +776,16 @@ async fn copy_download(
         if read == 0 {
             break;
         }
+        context.acquire_rate_budget(read).await;
+        if context.is_cancelled() {
+            return Ok(TransferResult::Cancelled);
+        }
         local_file
             .write_all(&buffer[..read])
             .await
             .map_err(|error| transfer_io_error("writing temporary download", error))?;
         transferred += read as u64;
-        report_transfer_progress(events, transfer_id, transferred, total).await?;
+        context.report_progress(transferred, total).await?;
     }
 
     local_file
@@ -675,25 +795,161 @@ async fn copy_download(
     Ok(TransferResult::Completed(transferred))
 }
 
-async fn report_transfer_progress(
-    events: &mpsc::Sender<ConnectionEvent>,
-    transfer_id: u64,
-    transferred: u64,
-    total: Option<u64>,
-) -> Result<(), SshError> {
-    events
-        .send(ConnectionEvent::TransferProgress {
-            transfer_id,
-            transferred,
-            total,
-        })
+async fn copy_download_parallel(
+    session: Arc<SftpSession>,
+    remote_path: String,
+    temporary_path: PathBuf,
+    total: u64,
+    ranges: Vec<Range<u64>>,
+    context: TransferContext,
+) -> Result<TransferResult, SshError> {
+    let local_file = fs::File::create(&temporary_path)
         .await
-        .map_err(|_| {
-            SshError::new(
-                SshErrorKind::InvalidState,
-                "SSH connection event receiver is not running",
-            )
+        .map_err(|error| transfer_io_error("creating temporary download", error))?;
+    local_file
+        .set_len(total)
+        .await
+        .map_err(|error| transfer_io_error("preallocating temporary download", error))?;
+    drop(local_file);
+
+    let transferred = Arc::new(AtomicU64::new(0));
+    let mut segments = JoinSet::new();
+    for range in ranges {
+        segments.spawn(copy_download_segment(
+            session.clone(),
+            remote_path.clone(),
+            temporary_path.clone(),
+            range,
+            total,
+            context.clone(),
+            transferred.clone(),
+        ));
+    }
+
+    let mut completed_bytes = 0_u64;
+    while let Some(result) = segments.join_next().await {
+        match result {
+            Ok(Ok(TransferResult::Completed(bytes))) => {
+                completed_bytes += bytes;
+            }
+            Ok(Ok(TransferResult::Cancelled)) => {
+                segments.abort_all();
+                while segments.join_next().await.is_some() {}
+                return Ok(TransferResult::Cancelled);
+            }
+            Ok(Ok(TransferResult::Conflict)) => {
+                unreachable!("download segments cannot report a conflict");
+            }
+            Ok(Err(error)) => {
+                segments.abort_all();
+                while segments.join_next().await.is_some() {}
+                return Err(error);
+            }
+            Err(error) => {
+                segments.abort_all();
+                while segments.join_next().await.is_some() {}
+                return Err(SshError::new(
+                    SshErrorKind::Sftp,
+                    format!("parallel download task failed: {error}"),
+                ));
+            }
+        }
+    }
+
+    let local_file = fs::OpenOptions::new()
+        .write(true)
+        .open(&temporary_path)
+        .await
+        .map_err(|error| transfer_io_error("opening completed download", error))?;
+    local_file
+        .sync_all()
+        .await
+        .map_err(|error| transfer_io_error("syncing downloaded file", error))?;
+    Ok(TransferResult::Completed(completed_bytes))
+}
+
+async fn copy_download_segment(
+    session: Arc<SftpSession>,
+    remote_path: String,
+    temporary_path: PathBuf,
+    range: Range<u64>,
+    total: u64,
+    context: TransferContext,
+    transferred: Arc<AtomicU64>,
+) -> Result<TransferResult, SshError> {
+    let mut remote_file = session.open(remote_path).await.map_err(SshError::from)?;
+    remote_file
+        .seek(std::io::SeekFrom::Start(range.start))
+        .await
+        .map_err(|error| transfer_io_error("seeking remote file", error))?;
+    let mut local_file = fs::OpenOptions::new()
+        .write(true)
+        .open(temporary_path)
+        .await
+        .map_err(|error| transfer_io_error("opening temporary download segment", error))?;
+    local_file
+        .seek(std::io::SeekFrom::Start(range.start))
+        .await
+        .map_err(|error| transfer_io_error("seeking temporary download segment", error))?;
+
+    let mut remaining = range.end - range.start;
+    let mut segment_bytes = 0_u64;
+    let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
+    while remaining > 0 {
+        if context.is_cancelled() {
+            return Ok(TransferResult::Cancelled);
+        }
+        let requested = usize::try_from(remaining.min(TRANSFER_CHUNK_BYTES as u64))
+            .expect("download segment chunk fits usize");
+        let read = remote_file
+            .read(&mut buffer[..requested])
+            .await
+            .map_err(|error| transfer_io_error("reading remote download segment", error))?;
+        if read == 0 {
+            return Err(SshError::new(
+                SshErrorKind::Sftp,
+                "remote file ended before the download segment completed",
+            ));
+        }
+        context.acquire_rate_budget(read).await;
+        if context.is_cancelled() {
+            return Ok(TransferResult::Cancelled);
+        }
+        local_file
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|error| transfer_io_error("writing temporary download segment", error))?;
+        remaining -= read as u64;
+        segment_bytes += read as u64;
+        let aggregate = transferred.fetch_add(read as u64, Ordering::AcqRel) + read as u64;
+        context.report_progress(aggregate, Some(total)).await?;
+    }
+    local_file
+        .flush()
+        .await
+        .map_err(|error| transfer_io_error("flushing temporary download segment", error))?;
+    remote_file
+        .shutdown()
+        .await
+        .map_err(|error| transfer_io_error("closing remote download segment", error))?;
+    Ok(TransferResult::Completed(segment_bytes))
+}
+
+fn download_segment_ranges(total: u64) -> Vec<Range<u64>> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let stream_count = usize::try_from(total.div_ceil(MIN_DOWNLOAD_SEGMENT_BYTES))
+        .unwrap_or(usize::MAX)
+        .clamp(1, DOWNLOAD_PIPELINE_STREAMS);
+    let segment_size = total.div_ceil(stream_count as u64);
+    (0..stream_count)
+        .map(|index| {
+            let start = index as u64 * segment_size;
+            start..(start + segment_size).min(total)
         })
+        .filter(|range| range.start < range.end)
+        .collect()
 }
 
 fn transfer_temporary_suffix(transfer_id: u64) -> String {
@@ -872,6 +1128,19 @@ mod tests {
         }
     }
 
+    fn transfer_context(
+        transfer_id: u64,
+        cancellation: Arc<AtomicBool>,
+        events: &mpsc::Sender<ConnectionEvent>,
+    ) -> TransferContext {
+        TransferContext::new(
+            transfer_id,
+            cancellation,
+            events.clone(),
+            Arc::new(TransferRateLimiter::default()),
+        )
+    }
+
     #[test]
     fn directory_entries_sort_by_kind_then_name() {
         let mut entries = vec![
@@ -892,9 +1161,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn large_downloads_are_split_into_up_to_four_contiguous_ranges() {
+        assert_eq!(download_segment_ranges(0), Vec::<Range<u64>>::new());
+        assert_eq!(
+            download_segment_ranges(MIN_DOWNLOAD_SEGMENT_BYTES),
+            vec![0..MIN_DOWNLOAD_SEGMENT_BYTES]
+        );
+
+        let total = MIN_DOWNLOAD_SEGMENT_BYTES * 4 + 17;
+        let ranges = download_segment_ranges(total);
+
+        assert_eq!(ranges.len(), DOWNLOAD_PIPELINE_STREAMS);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, total);
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_shares_one_budget_between_concurrent_transfers() {
+        let rate_limiter = Arc::new(TransferRateLimiter::new(Some(1024 * 1024)));
+        let started = tokio::time::Instant::now();
+
+        tokio::join!(
+            rate_limiter.acquire(64 * 1024),
+            rate_limiter.acquire(64 * 1024)
+        );
+
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        rate_limiter.set_bytes_per_second(None);
+        timeout(Duration::from_millis(20), rate_limiter.acquire(64 * 1024))
+            .await
+            .expect("disabling the rate limit should take effect immediately");
+    }
+
     struct TestSftpServer {
         directory_read: bool,
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        read_offsets: Arc<Mutex<Vec<u64>>>,
     }
 
     impl Default for TestSftpServer {
@@ -904,6 +1208,7 @@ mod tests {
             Self {
                 directory_read: false,
                 files: Arc::new(Mutex::new(files)),
+                read_offsets: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -972,6 +1277,7 @@ mod tests {
             offset: u64,
             len: u32,
         ) -> Result<Data, Self::Error> {
+            self.read_offsets.lock().unwrap().push(offset);
             let files = self.files.lock().unwrap();
             let Some(contents) = files.get(&handle) else {
                 return Err(StatusCode::NoSuchFile);
@@ -1189,17 +1495,16 @@ mod tests {
         let local_path = directory.path().join("upload.bin");
         let contents = vec![0x5a; TRANSFER_CHUNK_BYTES + 17];
         fs::write(&local_path, &contents).await.unwrap();
-        let cancellation = AtomicBool::new(false);
+        let cancellation = Arc::new(AtomicBool::new(false));
         let (event_tx, mut event_rx) = mpsc::channel(8);
+        let context = transfer_context(41, cancellation, &event_tx);
 
         let result = upload_file(
             &session,
-            41,
             &local_path,
             "/home/test/upload.bin".into(),
             false,
-            &cancellation,
-            &event_tx,
+            &context,
         )
         .await
         .unwrap();
@@ -1227,20 +1532,19 @@ mod tests {
         let expected = server.files.lock().unwrap()["/home/test/notes.txt"].clone();
         let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
         server::run(server_stream, server).await;
-        let session = SftpSession::new(client_stream).await.unwrap();
+        let session = Arc::new(SftpSession::new(client_stream).await.unwrap());
         let directory = tempfile::tempdir().unwrap();
         let local_path = directory.path().join("notes.txt");
-        let cancellation = AtomicBool::new(false);
+        let cancellation = Arc::new(AtomicBool::new(false));
         let (event_tx, _event_rx) = mpsc::channel(8);
+        let context = transfer_context(42, cancellation, &event_tx);
 
         let result = download_file(
-            &session,
-            42,
+            session,
             "/home/test/notes.txt".into(),
             &local_path,
             false,
-            &cancellation,
-            &event_tx,
+            &context,
         )
         .await
         .unwrap();
@@ -1260,40 +1564,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_downloads_use_multiple_ranged_sftp_streams() {
+        let contents = (0..(MIN_DOWNLOAD_SEGMENT_BYTES * 4 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let server = TestSftpServer {
+            files: Arc::new(Mutex::new(HashMap::from([(
+                "/home/test/large.bin".into(),
+                contents.clone(),
+            )]))),
+            ..TestSftpServer::default()
+        };
+        let read_offsets = server.read_offsets.clone();
+        let (client_stream, server_stream) = tokio::io::duplex(512 * 1024);
+        server::run(server_stream, server).await;
+        let session = Arc::new(SftpSession::new(client_stream).await.unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let local_path = directory.path().join("large.bin");
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let total = contents.len() as u64;
+        let expected_ranges = download_segment_ranges(total);
+        let context = transfer_context(49, Arc::new(AtomicBool::new(false)), &event_tx);
+
+        let result = download_file(
+            session,
+            "/home/test/large.bin".into(),
+            &local_path,
+            false,
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, TransferResult::Completed(bytes) if bytes == total));
+        assert_eq!(fs::read(local_path).await.unwrap(), contents);
+        let read_offsets = read_offsets.lock().unwrap();
+        assert!(
+            expected_ranges
+                .iter()
+                .all(|range| read_offsets.contains(&range.start)),
+            "each ranged stream should read from its own starting offset"
+        );
+    }
+
+    #[tokio::test]
     async fn transfer_conflicts_do_not_replace_existing_files() {
         let server = TestSftpServer::default();
         let shared_files = server.files.clone();
         let original_remote = shared_files.lock().unwrap()["/home/test/notes.txt"].clone();
         let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
         server::run(server_stream, server).await;
-        let session = SftpSession::new(client_stream).await.unwrap();
+        let session = Arc::new(SftpSession::new(client_stream).await.unwrap());
         let directory = tempfile::tempdir().unwrap();
         let upload_path = directory.path().join("upload.txt");
         fs::write(&upload_path, b"replacement").await.unwrap();
         let download_path = directory.path().join("download.txt");
         fs::write(&download_path, b"keep local").await.unwrap();
-        let cancellation = AtomicBool::new(false);
+        let cancellation = Arc::new(AtomicBool::new(false));
         let (event_tx, _event_rx) = mpsc::channel(8);
+        let upload_context = transfer_context(43, cancellation.clone(), &event_tx);
+        let download_context = transfer_context(44, cancellation, &event_tx);
 
         let upload = upload_file(
             &session,
-            43,
             &upload_path,
             "/home/test/notes.txt".into(),
             false,
-            &cancellation,
-            &event_tx,
+            &upload_context,
         )
         .await
         .unwrap();
         let download = download_file(
-            &session,
-            44,
+            session,
             "/home/test/notes.txt".into(),
             &download_path,
             false,
-            &cancellation,
-            &event_tx,
+            &download_context,
         )
         .await
         .unwrap();
@@ -1313,7 +1659,7 @@ mod tests {
         let shared_files = server.files.clone();
         let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
         server::run(server_stream, server).await;
-        let session = SftpSession::new(client_stream).await.unwrap();
+        let session = Arc::new(SftpSession::new(client_stream).await.unwrap());
         let directory = tempfile::tempdir().unwrap();
         let upload_path = directory.path().join("upload.txt");
         fs::write(&upload_path, b"remote replacement")
@@ -1321,28 +1667,26 @@ mod tests {
             .unwrap();
         let download_path = directory.path().join("download.txt");
         fs::write(&download_path, b"old local").await.unwrap();
-        let cancellation = AtomicBool::new(false);
+        let cancellation = Arc::new(AtomicBool::new(false));
         let (event_tx, _event_rx) = mpsc::channel(8);
+        let upload_context = transfer_context(45, cancellation.clone(), &event_tx);
+        let download_context = transfer_context(46, cancellation, &event_tx);
 
         let upload = upload_file(
             &session,
-            45,
             &upload_path,
             "/home/test/notes.txt".into(),
             true,
-            &cancellation,
-            &event_tx,
+            &upload_context,
         )
         .await
         .unwrap();
         let download = download_file(
-            &session,
-            46,
+            session,
             "/home/test/notes.txt".into(),
             &download_path,
             true,
-            &cancellation,
-            &event_tx,
+            &download_context,
         )
         .await
         .unwrap();
@@ -1369,17 +1713,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let local_path = directory.path().join("cancelled.txt");
         fs::write(&local_path, b"cancel me").await.unwrap();
-        let cancellation = AtomicBool::new(true);
+        let cancellation = Arc::new(AtomicBool::new(true));
         let (event_tx, _event_rx) = mpsc::channel(8);
+        let context = transfer_context(45, cancellation, &event_tx);
 
         let result = upload_file(
             &session,
-            45,
             &local_path,
             "/home/test/cancelled.txt".into(),
             false,
-            &cancellation,
-            &event_tx,
+            &context,
         )
         .await
         .unwrap();
@@ -1405,17 +1748,16 @@ mod tests {
         fs::write(&local_path, vec![0x5a; TRANSFER_CHUNK_BYTES * 3])
             .await
             .unwrap();
-        let cancellation = AtomicBool::new(false);
+        let cancellation = Arc::new(AtomicBool::new(false));
         let (event_tx, mut event_rx) = mpsc::channel(1);
+        let context = transfer_context(47, cancellation.clone(), &event_tx);
 
         let transfer = upload_file(
             &session,
-            47,
             &local_path,
             "/home/test/cancelled-active.bin".into(),
             false,
-            &cancellation,
-            &event_tx,
+            &context,
         );
         let cancel_after_progress = async {
             assert!(matches!(
@@ -1449,7 +1791,11 @@ mod tests {
             .await
             .unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let worker = SftpWorkerHandle::spawn(session, event_tx);
+        let worker = SftpWorkerHandle::spawn_with_limiter(
+            session,
+            event_tx,
+            Arc::new(TransferRateLimiter::default()),
+        );
 
         worker
             .upload_file(48, local_path, "/home/test/worker-drop.bin".into(), false)

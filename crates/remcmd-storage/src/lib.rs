@@ -4,7 +4,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use remcmd_core::{ConnectionProfile, TabLayout, ThemeMode};
+use remcmd_core::{ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
 
 mod credentials;
 pub use credentials::{
@@ -32,6 +32,8 @@ pub struct AppSettings {
     pub theme_mode: ThemeMode,
     #[serde(default)]
     pub tab_layout: TabLayout,
+    #[serde(default)]
+    pub transfers: TransferSettings,
 }
 
 pub fn ensure_profiles_file(path: &Path) -> io::Result<()> {
@@ -78,8 +80,10 @@ pub fn load_settings(path: &Path) -> io::Result<AppSettings> {
 
     let content = fs::read_to_string(path)?;
 
-    serde_json::from_str(&content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let mut settings: AppSettings = serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    settings.transfers = settings.transfers.normalized();
+    Ok(settings)
 }
 
 pub fn save_settings(path: &Path, settings: &AppSettings) -> io::Result<()> {
@@ -102,6 +106,7 @@ mod tests {
 
         assert_eq!(settings.theme_mode, ThemeMode::System);
         assert_eq!(settings.tab_layout, TabLayout::Vertical);
+        assert_eq!(settings.transfers, TransferSettings::default());
     }
 
     #[test]
@@ -111,6 +116,10 @@ mod tests {
         let settings = AppSettings {
             theme_mode: ThemeMode::Dark,
             tab_layout: TabLayout::Horizontal,
+            transfers: TransferSettings {
+                rate_limit_mib_per_second: 20,
+                max_parallel_transfers: 2,
+            },
         };
 
         save_settings(&path, &settings).unwrap();
@@ -128,6 +137,7 @@ mod tests {
 
         assert_eq!(settings.theme_mode, ThemeMode::Light);
         assert_eq!(settings.tab_layout, TabLayout::Vertical);
+        assert_eq!(settings.transfers, TransferSettings::default());
     }
 
     #[test]
@@ -139,6 +149,32 @@ mod tests {
         assert_eq!(
             load_settings(&path).unwrap_err().kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn transfer_settings_are_normalized_when_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+                "transfers": {
+                    "rate_limit_mib_per_second": 999999,
+                    "max_parallel_transfers": 0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = load_settings(&path).unwrap();
+
+        assert_eq!(
+            settings.transfers,
+            TransferSettings {
+                rate_limit_mib_per_second: remcmd_core::MAX_TRANSFER_RATE_MIB_PER_SECOND,
+                max_parallel_transfers: 1,
+            }
         );
     }
 }
