@@ -112,11 +112,7 @@ impl SshShell {
             .await
             .map_err(SshError::from)?;
 
-        Self::wait_for_request_success(&mut channel, "PTY").await?;
-
         channel.request_shell(true).await.map_err(SshError::from)?;
-
-        Self::wait_for_request_success(&mut channel, "shell").await?;
 
         if install_cwd_hook {
             channel
@@ -126,6 +122,12 @@ impl SshShell {
                 .await
                 .map_err(SshError::from)?;
         }
+
+        // Channel requests and data are processed in packet order. Queue shell
+        // startup and its hidden integration input before waiting for replies so
+        // high-latency connections do not pay a separate round trip per step.
+        Self::wait_for_request_success(&mut channel, "PTY").await?;
+        Self::wait_for_request_success(&mut channel, "shell").await?;
 
         Ok(Self {
             channel,
