@@ -7,7 +7,7 @@ use std::{
 use directories::BaseDirs;
 use remcmd_core::ConnectionProfile;
 use russh::{
-    client,
+    ChannelMsg, client,
     keys::{
         Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, check_known_hosts,
         check_known_hosts_path,
@@ -27,6 +27,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHELL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -549,6 +551,72 @@ impl SshTransport {
         .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening SFTP timed out"))?
     }
 
+    pub(crate) async fn execute(&self, command: &str) -> Result<Vec<u8>, SshError> {
+        tokio::time::timeout(EXEC_TIMEOUT, async {
+            let mut channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(SshError::from)?;
+            channel
+                .exec(true, command.as_bytes())
+                .await
+                .map_err(SshError::from)?;
+
+            let mut accepted = false;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_status = None;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    ChannelMsg::Success => accepted = true,
+                    ChannelMsg::Failure => {
+                        return Err(SshError::new(
+                            SshErrorKind::Protocol,
+                            "remote server rejected performance command",
+                        ));
+                    }
+                    ChannelMsg::Data { data } => {
+                        append_command_output(&mut stdout, &data)?;
+                    }
+                    ChannelMsg::ExtendedData { data, .. } => {
+                        append_command_output(&mut stderr, &data)?;
+                    }
+                    ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => exit_status = Some(status),
+                    ChannelMsg::Close => break,
+                    ChannelMsg::Eof
+                    | ChannelMsg::ExitSignal { .. }
+                    | ChannelMsg::WindowAdjusted { .. } => {}
+                    _ => {}
+                }
+            }
+
+            if !accepted {
+                return Err(SshError::new(
+                    SshErrorKind::Protocol,
+                    "remote server did not accept performance command",
+                ));
+            }
+            if exit_status.unwrap_or(0) != 0 {
+                let message = String::from_utf8_lossy(&stderr).trim().to_owned();
+                return Err(SshError::new(
+                    SshErrorKind::Protocol,
+                    if message.is_empty() {
+                        "remote performance command failed".to_owned()
+                    } else {
+                        message
+                    },
+                ));
+            }
+
+            Ok(stdout)
+        })
+        .await
+        .map_err(|_| SshError::new(SshErrorKind::Timeout, "performance sampling timed out"))?
+    }
+
     /// Sends a protocol-level disconnect request to the server.
     ///
     /// Dropping SshTransport also closes local resources, but this method
@@ -568,6 +636,17 @@ impl SshTransport {
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
     }
+}
+
+fn append_command_output(output: &mut Vec<u8>, data: &[u8]) -> Result<(), SshError> {
+    if output.len().saturating_add(data.len()) > MAX_EXEC_OUTPUT_BYTES {
+        return Err(SshError::new(
+            SshErrorKind::Protocol,
+            "remote performance response exceeded the output limit",
+        ));
+    }
+    output.extend_from_slice(data);
+    Ok(())
 }
 
 #[cfg(test)]

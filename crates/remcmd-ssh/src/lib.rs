@@ -2,6 +2,7 @@ mod auth;
 mod connection;
 mod error;
 mod host_key;
+mod performance;
 mod session;
 mod sftp;
 mod shell;
@@ -14,6 +15,7 @@ pub use connection::{
 };
 pub use error::{SshError, SshErrorKind};
 pub use host_key::HostKeyInfo;
+pub use performance::ServerPerformanceSnapshot;
 pub use session::{SessionState, SshSession};
 pub use sftp::{
     MAX_REMOTE_FILE_BYTES, RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind,

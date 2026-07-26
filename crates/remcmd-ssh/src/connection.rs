@@ -13,7 +13,10 @@ use tokio::{runtime::Handle, sync::mpsc};
 use crate::{
     AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteFile, SessionState, SftpOperation,
     SftpTransferDirection, ShellEvent, SshError, SshErrorKind, SshSession, SshShellWriter,
-    SshTransport, TransferRateLimiter, host_key::HostKeyDecision, sftp::SftpWorkerHandle,
+    SshTransport, TransferRateLimiter,
+    host_key::HostKeyDecision,
+    performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
+    sftp::SftpWorkerHandle,
     transport::TransportOpen,
 };
 
@@ -63,6 +66,9 @@ pub enum ConnectionCommand {
 
     /// Requests cancellation of an active SFTP transfer.
     CancelTransfer { transfer_id: u64 },
+
+    /// Starts or stops periodic server performance sampling.
+    SetPerformanceMonitoring(bool),
 
     /// Requests an orderly shell and transport shutdown.
     Disconnect,
@@ -127,6 +133,12 @@ pub enum ConnectionEvent {
         operation: SftpOperation,
         error: SshError,
     },
+
+    /// Reports one sample from the independent server performance channel.
+    PerformanceSnapshot(ServerPerformanceSnapshot),
+
+    /// Reports a performance sampling failure without failing the SSH shell.
+    PerformanceFailed(SshError),
 
     /// Reports an operational failure and implies SessionState::Failed.
     Failed(SshError),
@@ -221,6 +233,11 @@ impl ConnectionHandle {
     /// Requests cancellation of an active SFTP transfer.
     pub fn cancel_transfer(&self, transfer_id: u64) -> Result<(), SshError> {
         self.send(ConnectionCommand::CancelTransfer { transfer_id })
+    }
+
+    /// Starts or stops periodic server performance sampling.
+    pub fn set_performance_monitoring(&self, enabled: bool) -> Result<(), SshError> {
+        self.send(ConnectionCommand::SetPerformanceMonitoring(enabled))
     }
 
     /// Requests an orderly disconnection.
@@ -388,9 +405,10 @@ where
                         | ConnectionCommand::WriteFile { .. }
                         | ConnectionCommand::UploadFile { .. }
                         | ConnectionCommand::DownloadFile { .. }
-                        | ConnectionCommand::CancelTransfer { .. },
+                        | ConnectionCommand::CancelTransfer { .. }
+                        | ConnectionCommand::SetPerformanceMonitoring(_),
                     ) => {
-                        // SFTP requests are ignored until authentication completes.
+                        // Subsystem requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
                         return PendingResult::Disconnect;
@@ -431,9 +449,10 @@ async fn wait_for_host_key_decision(
                         | ConnectionCommand::WriteFile { .. }
                         | ConnectionCommand::UploadFile { .. }
                         | ConnectionCommand::DownloadFile { .. }
-                        | ConnectionCommand::CancelTransfer { .. },
+                        | ConnectionCommand::CancelTransfer { .. }
+                        | ConnectionCommand::SetPerformanceMonitoring(_),
                     ) => {
-                        // SFTP requests are ignored until authentication completes.
+                        // Subsystem requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
                         return PendingResult::Disconnect;
@@ -635,8 +654,10 @@ async fn run_connection(
         return;
     }
 
+    let transport = Arc::new(transport);
     let mut pending_command = None;
     let mut sftp_worker = None;
+    let mut performance_monitor = None;
 
     loop {
         let command = if let Some(command) = pending_command.take() {
@@ -961,6 +982,16 @@ async fn run_connection(
                 {
                     close_resources(&transport, Some(&writer)).await;
                     return;
+                }
+            }
+            Some(ConnectionCommand::SetPerformanceMonitoring(enabled)) => {
+                if enabled && performance_monitor.is_none() {
+                    performance_monitor = Some(PerformanceMonitorHandle::spawn(
+                        transport.clone(),
+                        events.clone(),
+                    ));
+                } else if !enabled {
+                    performance_monitor = None;
                 }
             }
             Some(ConnectionCommand::Disconnect) | None => {
