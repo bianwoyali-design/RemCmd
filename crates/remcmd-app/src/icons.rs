@@ -15,6 +15,7 @@ pub(crate) enum IconName {
     Collapse,
     Connect,
     Delete,
+    Download,
     Disconnect,
     Expand,
     File,
@@ -30,6 +31,7 @@ pub(crate) enum IconName {
     SplitDown,
     SplitRight,
     Terminal,
+    Upload,
 }
 
 impl IconName {
@@ -43,6 +45,7 @@ impl IconName {
             Self::Collapse => "icons/collapse.svg",
             Self::Connect => "icons/connect.svg",
             Self::Delete => "icons/delete.svg",
+            Self::Download => "icons/download.svg",
             Self::Disconnect => "icons/disconnect.svg",
             Self::Expand => "icons/expand.svg",
             Self::File => "icons/file.svg",
@@ -58,6 +61,7 @@ impl IconName {
             Self::SplitDown => "icons/split-down.svg",
             Self::SplitRight => "icons/split-right.svg",
             Self::Terminal => "icons/terminal.svg",
+            Self::Upload => "icons/upload.svg",
         }
     }
 
@@ -71,6 +75,7 @@ impl IconName {
             "icons/collapse.svg" => Self::Collapse,
             "icons/connect.svg" => Self::Connect,
             "icons/delete.svg" => Self::Delete,
+            "icons/download.svg" => Self::Download,
             "icons/disconnect.svg" => Self::Disconnect,
             "icons/expand.svg" => Self::Expand,
             "icons/file.svg" => Self::File,
@@ -86,6 +91,7 @@ impl IconName {
             "icons/split-down.svg" => Self::SplitDown,
             "icons/split-right.svg" => Self::SplitRight,
             "icons/terminal.svg" => Self::Terminal,
+            "icons/upload.svg" => Self::Upload,
             _ => return None,
         })
     }
@@ -110,6 +116,9 @@ impl IconName {
                 <path d="m5.75 7 .5 11.5c.05 1.15 1 2 2.15 2h7.2c1.15 0 2.1-.85 2.15-2l.5-11.5"/>
                 <path d="M9.25 7V5.5c0-1.105.895-2 2-2h1.5c1.105 0 2 .895 2 2V7"/>
                 <path d="M9 9.75v8.5M12 9.75v8.5M15 9.75v8.5" stroke-width="0.8"/>"#
+            }
+            Self::Download => {
+                r#"<path d="M12 3.5v10.75"/><path d="m7.75 10 4.25 4.25L16.25 10"/><path d="M4 15.5v3A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-3"/>"#
             }
             Self::Disconnect => {
                 r#"<rect x="3" y="4" width="4.5" height="16" rx="2.25"/><path d="M7.5 12H21"/><path d="m17 8 4 4-4 4"/>"#
@@ -162,6 +171,9 @@ impl IconName {
             }
             Self::Terminal => {
                 r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="m6.5 8.75 3.25 3.25-3.25 3.25"/><path d="M12.5 15.25h5"/>"#
+            }
+            Self::Upload => {
+                r#"<path d="M12 14.25V3.5"/><path d="m7.75 7.75 4.25-4.25 4.25 4.25"/><path d="M4 15.5v3A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-3"/>"#
             }
         }
     }
