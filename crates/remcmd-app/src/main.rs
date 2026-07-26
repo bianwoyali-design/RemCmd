@@ -422,9 +422,18 @@ impl SettingsSelector {
 
     const fn control_width(self) -> f32 {
         match self {
-            Self::Theme => 112.0,
-            Self::TabLayout => 124.0,
-            Self::TransferRate => 128.0,
+            Self::Theme => 76.0,
+            Self::TabLayout => 104.0,
+            Self::TransferRate => 104.0,
+            Self::ParallelTransfers => 56.0,
+        }
+    }
+
+    const fn menu_width(self) -> f32 {
+        match self {
+            Self::Theme => 104.0,
+            Self::TabLayout => 120.0,
+            Self::TransferRate => 120.0,
             Self::ParallelTransfers => 72.0,
         }
     }
@@ -7066,7 +7075,6 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .w_full()
-            .max_w(px(680.0))
             .rounded_lg()
             .bg(self.theme.settings_group_bg)
             .child(self.render_settings_row(
@@ -7087,7 +7095,6 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .w_full()
-            .max_w(px(680.0))
             .rounded_lg()
             .bg(self.theme.settings_group_bg)
             .child(self.render_settings_row(
@@ -7109,16 +7116,14 @@ impl RemCmdApp {
             .id("settings_content")
             .flex()
             .flex_col()
-            .items_center()
             .flex_1()
             .min_h(px(0.0))
             .overflow_x_hidden()
             .overflow_y_scroll()
-            .pr_1()
+            .px(px(100.0))
             .child(
                 div()
                     .w_full()
-                    .max_w(px(680.0))
                     .mt_6()
                     .mb_2()
                     .text_sm()
@@ -7129,7 +7134,6 @@ impl RemCmdApp {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(680.0))
                     .mt_6()
                     .mb_2()
                     .text_sm()
@@ -7141,7 +7145,6 @@ impl RemCmdApp {
                 this.child(
                     div()
                         .w_full()
-                        .max_w(px(680.0))
                         .mt_3()
                         .text_color(self.theme.error_text)
                         .child(error.clone()),
@@ -7149,15 +7152,10 @@ impl RemCmdApp {
             });
 
         self.detail_panel_shell()
+            .px(px(0.0))
             .key_context("Settings")
             .track_focus(&self.settings_focus_handle)
             .on_action(cx.listener(Self::on_cancel_settings_selector))
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Settings"),
-            )
             .child(content)
     }
 
@@ -7176,8 +7174,8 @@ impl RemCmdApp {
             .items_center()
             .justify_between()
             .gap_3()
-            .min_h(px(52.0))
-            .px_3()
+            .min_h(px(38.0))
+            .px(px(10.0))
             .child(
                 div()
                     .flex_1()
@@ -7193,8 +7191,8 @@ impl RemCmdApp {
                     div()
                         .absolute()
                         .bottom_0()
-                        .left(px(12.0))
-                        .right(px(12.0))
+                        .left(px(10.0))
+                        .right(px(10.0))
                         .h(px(1.0))
                         .bg(self.theme.settings_separator),
                 )
@@ -7208,15 +7206,17 @@ impl RemCmdApp {
     ) -> gpui::Div {
         let is_open = self.open_settings_selector == Some(selector);
         let control_width = selector.control_width();
+        let menu_width = selector.menu_width();
+        let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let mut menu = div()
             .id(SharedString::from(format!(
                 "{}-menu",
                 selector.element_id()
             )))
             .absolute()
-            .top(px(34.0))
+            .top(px(26.0))
             .right_0()
-            .w(px(control_width))
+            .w(px(menu_width))
             .flex()
             .flex_col()
             .p(px(3.0))
@@ -7227,9 +7227,9 @@ impl RemCmdApp {
             .text_sm()
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(0.0), px(5.0)),
-                blur_radius: px(16.0),
-                spread_radius: px(-5.0),
+                offset: point(px(0.0), px(3.0)),
+                blur_radius: px(12.0),
+                spread_radius: px(-3.0),
             }])
             .occlude();
         let selected_value = self.settings_value(selector);
@@ -7258,7 +7258,7 @@ impl RemCmdApp {
                     )))
                     .flex()
                     .items_center()
-                    .h(px(28.0))
+                    .h(px(24.0))
                     .px_1()
                     .rounded_lg()
                     .when(is_selected, |this| {
@@ -7286,15 +7286,34 @@ impl RemCmdApp {
 
         let button_hover = self.theme.control_hover_bg;
         let current_label = self.settings_value_label(selector);
+        let picker = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded_full()
+            .bg(if is_open {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.settings_picker_bg
+            })
+            .when(!is_open, |this| {
+                this.group_hover(control_group.clone(), |style| {
+                    style.bg(self.theme.transparent)
+                })
+            })
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id(selector.element_id())
+            .group(control_group)
             .flex()
             .flex_none()
             .w(px(control_width))
             .items_center()
-            .h(px(32.0))
-            .pl_2()
-            .pr_1()
+            .h(px(24.0))
+            .pl(px(6.0))
+            .pr(px(1.0))
             .rounded_lg()
             .bg(if is_open {
                 self.theme.control_hover_bg
@@ -7312,21 +7331,7 @@ impl RemCmdApp {
                     .truncate()
                     .child(current_label),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(26.0))
-                    .rounded_full()
-                    .bg(if is_open {
-                        self.theme.control_pressed_bg
-                    } else {
-                        self.theme.settings_picker_bg
-                    })
-                    .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0)),
-            )
+            .child(picker)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_settings_selector(selector, window, cx);
             }));
