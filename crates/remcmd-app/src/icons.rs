@@ -11,16 +11,19 @@ pub(crate) enum IconName {
     ArrowLeft,
     ArrowUp,
     Cancel,
+    Check,
     ClosePane,
     Collapse,
     Connect,
     Delete,
+    Download,
     Disconnect,
     Expand,
     File,
     Folder,
     ForgetCredential,
     NewConnection,
+    Picker,
     Reconnect,
     Search,
     Server,
@@ -30,6 +33,7 @@ pub(crate) enum IconName {
     SplitDown,
     SplitRight,
     Terminal,
+    Upload,
 }
 
 impl IconName {
@@ -39,16 +43,19 @@ impl IconName {
             Self::ArrowLeft => "icons/arrow-left.svg",
             Self::ArrowUp => "icons/arrow-up.svg",
             Self::Cancel => "icons/cancel.svg",
+            Self::Check => "icons/check.svg",
             Self::ClosePane => "icons/close-pane.svg",
             Self::Collapse => "icons/collapse.svg",
             Self::Connect => "icons/connect.svg",
             Self::Delete => "icons/delete.svg",
+            Self::Download => "icons/download.svg",
             Self::Disconnect => "icons/disconnect.svg",
             Self::Expand => "icons/expand.svg",
             Self::File => "icons/file.svg",
             Self::Folder => "icons/folder.svg",
             Self::ForgetCredential => "icons/forget-credential.svg",
             Self::NewConnection => "icons/new-connection.svg",
+            Self::Picker => "icons/picker.svg",
             Self::Reconnect => "icons/reconnect.svg",
             Self::Search => "icons/search.svg",
             Self::Server => "icons/server.svg",
@@ -58,6 +65,7 @@ impl IconName {
             Self::SplitDown => "icons/split-down.svg",
             Self::SplitRight => "icons/split-right.svg",
             Self::Terminal => "icons/terminal.svg",
+            Self::Upload => "icons/upload.svg",
         }
     }
 
@@ -67,16 +75,19 @@ impl IconName {
             "icons/arrow-left.svg" => Self::ArrowLeft,
             "icons/arrow-up.svg" => Self::ArrowUp,
             "icons/cancel.svg" => Self::Cancel,
+            "icons/check.svg" => Self::Check,
             "icons/close-pane.svg" => Self::ClosePane,
             "icons/collapse.svg" => Self::Collapse,
             "icons/connect.svg" => Self::Connect,
             "icons/delete.svg" => Self::Delete,
+            "icons/download.svg" => Self::Download,
             "icons/disconnect.svg" => Self::Disconnect,
             "icons/expand.svg" => Self::Expand,
             "icons/file.svg" => Self::File,
             "icons/folder.svg" => Self::Folder,
             "icons/forget-credential.svg" => Self::ForgetCredential,
             "icons/new-connection.svg" => Self::NewConnection,
+            "icons/picker.svg" => Self::Picker,
             "icons/reconnect.svg" => Self::Reconnect,
             "icons/search.svg" => Self::Search,
             "icons/server.svg" => Self::Server,
@@ -86,6 +97,7 @@ impl IconName {
             "icons/split-down.svg" => Self::SplitDown,
             "icons/split-right.svg" => Self::SplitRight,
             "icons/terminal.svg" => Self::Terminal,
+            "icons/upload.svg" => Self::Upload,
             _ => return None,
         })
     }
@@ -98,6 +110,7 @@ impl IconName {
             Self::ArrowLeft => r#"<path d="M15.25 3.5 7.75 12l7.5 8.5"/>"#,
             Self::ArrowUp => r#"<path d="m3.5 15.25 8.5-7.5 8.5 7.5"/>"#,
             Self::Cancel => r#"<path d="m5.5 5.5 13 13"/><path d="m18.5 5.5-13 13"/>"#,
+            Self::Check => r#"<path d="m4.75 12.5 4.5 4.5 10-10"/>"#,
             Self::ClosePane => {
                 r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="M15 4v16"/><path d="m17.2 9.7 2.6 2.6m0-2.6-2.6 2.6" stroke-width="0.9"/>"#
             }
@@ -110,6 +123,9 @@ impl IconName {
                 <path d="m5.75 7 .5 11.5c.05 1.15 1 2 2.15 2h7.2c1.15 0 2.1-.85 2.15-2l.5-11.5"/>
                 <path d="M9.25 7V5.5c0-1.105.895-2 2-2h1.5c1.105 0 2 .895 2 2V7"/>
                 <path d="M9 9.75v8.5M12 9.75v8.5M15 9.75v8.5" stroke-width="0.8"/>"#
+            }
+            Self::Download => {
+                r#"<path d="M12 3.5v10.75"/><path d="m7.75 10 4.25 4.25L16.25 10"/><path d="M4 15.5v3A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-3"/>"#
             }
             Self::Disconnect => {
                 r#"<rect x="3" y="4" width="4.5" height="16" rx="2.25"/><path d="M7.5 12H21"/><path d="m17 8 4 4-4 4"/>"#
@@ -126,6 +142,9 @@ impl IconName {
             }
             Self::NewConnection => {
                 r#"<path d="M14.75 5H5.5A2.5 2.5 0 0 0 3 7.5v10A2.5 2.5 0 0 0 5.5 20H16a2.5 2.5 0 0 0 2.5-2.5V9"/><path d="M3 12.5h15.5"/><circle cx="6.5" cy="8.75" r="0.55" fill="currentColor" stroke="none"/><circle cx="6.5" cy="16.25" r="0.55" fill="currentColor" stroke="none"/><circle cx="18.5" cy="5.5" r="3.25"/><path d="M18.5 3.75v3.5M16.75 5.5h3.5" stroke-width="1.1"/>"#
+            }
+            Self::Picker => {
+                r#"<path d="m8.25 9.75 3.75-3.5 3.75 3.5"/><path d="m8.25 14.25 3.75 3.5 3.75-3.5"/>"#
             }
             Self::Reconnect => {
                 r#"<path d="M19.5 8.25A8.25 8.25 0 1 0 19.75 15.25"/><path d="M19.5 3.75v4.5H15"/>"#
@@ -162,6 +181,9 @@ impl IconName {
             }
             Self::Terminal => {
                 r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="m6.5 8.75 3.25 3.25-3.25 3.25"/><path d="M12.5 15.25h5"/>"#
+            }
+            Self::Upload => {
+                r#"<path d="M12 14.25V3.5"/><path d="m7.75 7.75 4.25-4.25 4.25 4.25"/><path d="M4 15.5v3A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-3"/>"#
             }
         }
     }
@@ -226,6 +248,8 @@ mod tests {
         let assets = RemCmdAssets;
 
         assert!(assets.load("icons/add.svg").unwrap().is_some());
+        assert!(assets.load("icons/check.svg").unwrap().is_some());
+        assert!(assets.load("icons/picker.svg").unwrap().is_some());
         assert!(assets.load("icons/unknown.svg").unwrap().is_none());
     }
 }

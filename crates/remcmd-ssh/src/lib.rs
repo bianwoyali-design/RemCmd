@@ -17,7 +17,7 @@ pub use host_key::HostKeyInfo;
 pub use session::{SessionState, SshSession};
 pub use sftp::{
     MAX_REMOTE_FILE_BYTES, RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind,
-    SftpOperation,
+    SftpOperation, SftpTransferDirection, TransferRateLimiter,
 };
 pub use shell::{PtySize, ShellEvent, SshShell, SshShellReader, SshShellWriter};
 pub use transport::SshTransport;
