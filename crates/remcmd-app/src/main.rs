@@ -34,28 +34,31 @@ mod private_key_picker;
 #[cfg(target_os = "macos")]
 mod macos_symbols;
 
-use std::{collections::HashMap, ops::Range, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
+use directories::UserDirs;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
-    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowOptions, canvas, div, ease_in_out, ease_out_quint, img, point, prelude::*, px, rgb, size,
-    uniform_list,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions,
+    UTF16Selection, UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowOptions, canvas, div, ease_in_out, ease_out_quint, img, point,
+    prelude::*, px, rgb, size, uniform_list,
 };
 use secrecy::SecretString;
-
-#[cfg(not(target_os = "macos"))]
-use gpui::PathPromptOptions;
 
 use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
     RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, SessionState, SftpOperation,
-    ShellEvent, SshConnection, SshErrorKind,
+    SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -195,6 +198,7 @@ struct TerminalSession {
     connection_credential: Option<ConnectionCredential>,
     sftp: SftpBrowserState,
     sidebar_sftp: SftpBrowserState,
+    transfers: SftpTransferQueue,
 }
 
 impl TerminalSession {
@@ -218,6 +222,7 @@ impl TerminalSession {
             connection_credential: None,
             sftp: SftpBrowserState::default(),
             sidebar_sftp: SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START),
+            transfers: SftpTransferQueue::default(),
         }
     }
 
@@ -550,7 +555,12 @@ impl SftpBrowserState {
                 file.write_request_id = None;
                 file.error = Some(error);
             }
-            SftpOperation::ReadDirectory | SftpOperation::ReadFile | SftpOperation::WriteFile => {}
+            SftpOperation::ReadDirectory
+            | SftpOperation::ReadFile
+            | SftpOperation::WriteFile
+            | SftpOperation::UploadFile
+            | SftpOperation::DownloadFile
+            | SftpOperation::CancelTransfer => {}
         }
     }
 
@@ -572,6 +582,238 @@ struct SftpFileState {
     error: Option<String>,
     read_request_id: Option<u64>,
     write_request_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SftpTransferState {
+    Queued,
+    Running,
+    Cancelling,
+    Conflict,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl SftpTransferState {
+    const fn is_blocking(self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling | Self::Conflict)
+    }
+
+    const fn is_finished(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SftpTransferTask {
+    id: u64,
+    direction: SftpTransferDirection,
+    local_path: PathBuf,
+    remote_path: String,
+    overwrite: bool,
+    state: SftpTransferState,
+    transferred: u64,
+    total: Option<u64>,
+    error: Option<String>,
+}
+
+impl SftpTransferTask {
+    fn display_name(&self) -> String {
+        match self.direction {
+            SftpTransferDirection::Upload => self
+                .local_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.local_path.display().to_string()),
+            SftpTransferDirection::Download => remote_file_name(&self.remote_path).to_owned(),
+        }
+    }
+
+    fn status_text(&self) -> String {
+        match self.state {
+            SftpTransferState::Queued => "Queued".into(),
+            SftpTransferState::Running => self.total.map_or_else(
+                || format_remote_size(self.transferred),
+                |total| {
+                    format!(
+                        "{} / {}",
+                        format_remote_size(self.transferred),
+                        format_remote_size(total)
+                    )
+                },
+            ),
+            SftpTransferState::Cancelling => "Cancelling...".into(),
+            SftpTransferState::Conflict => "Destination already exists".into(),
+            SftpTransferState::Completed => {
+                format!("Completed · {}", format_remote_size(self.transferred))
+            }
+            SftpTransferState::Failed => self.error.clone().unwrap_or_else(|| "Failed".into()),
+            SftpTransferState::Cancelled => "Cancelled".into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SftpTransferQueue {
+    next_id: u64,
+    tasks: Vec<SftpTransferTask>,
+}
+
+impl SftpTransferQueue {
+    fn enqueue(
+        &mut self,
+        direction: SftpTransferDirection,
+        local_path: PathBuf,
+        remote_path: String,
+        overwrite: bool,
+    ) -> u64 {
+        self.next_id = self.next_id.max(1);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tasks.push(SftpTransferTask {
+            id,
+            direction,
+            local_path,
+            remote_path,
+            overwrite,
+            state: SftpTransferState::Queued,
+            transferred: 0,
+            total: None,
+            error: None,
+        });
+        id
+    }
+
+    fn start_next(&mut self) -> Option<SftpTransferTask> {
+        if self.tasks.iter().any(|task| task.state.is_blocking()) {
+            return None;
+        }
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.state == SftpTransferState::Queued)?;
+        task.state = SftpTransferState::Running;
+        task.error = None;
+        Some(task.clone())
+    }
+
+    fn task_mut(&mut self, id: u64) -> Option<&mut SftpTransferTask> {
+        self.tasks.iter_mut().find(|task| task.id == id)
+    }
+
+    fn mark_progress(&mut self, id: u64, transferred: u64, total: Option<u64>) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        if !matches!(
+            task.state,
+            SftpTransferState::Running | SftpTransferState::Cancelling
+        ) {
+            return false;
+        }
+        task.transferred = transferred;
+        task.total = total;
+        true
+    }
+
+    fn mark_conflict(&mut self, id: u64) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        if task.state != SftpTransferState::Running {
+            return false;
+        }
+        task.state = SftpTransferState::Conflict;
+        true
+    }
+
+    fn mark_completed(&mut self, id: u64, bytes: u64) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        if !matches!(
+            task.state,
+            SftpTransferState::Running | SftpTransferState::Cancelling
+        ) {
+            return false;
+        }
+        task.state = SftpTransferState::Completed;
+        task.transferred = bytes;
+        task.total = Some(bytes);
+        task.error = None;
+        true
+    }
+
+    fn mark_failed(&mut self, id: u64, error: String) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        if task.state.is_finished() {
+            return false;
+        }
+        task.state = SftpTransferState::Failed;
+        task.error = Some(error);
+        true
+    }
+
+    fn mark_cancelled(&mut self, id: u64) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        if task.state.is_finished() {
+            return false;
+        }
+        task.state = SftpTransferState::Cancelled;
+        task.error = None;
+        true
+    }
+
+    fn retry_with_overwrite(&mut self, id: u64) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        if task.state != SftpTransferState::Conflict {
+            return false;
+        }
+        task.overwrite = true;
+        task.state = SftpTransferState::Queued;
+        task.transferred = 0;
+        task.total = None;
+        task.error = None;
+        true
+    }
+
+    fn begin_cancel(&mut self, id: u64) -> Option<bool> {
+        let task = self.task_mut(id)?;
+        match task.state {
+            SftpTransferState::Running => {
+                task.state = SftpTransferState::Cancelling;
+                Some(true)
+            }
+            SftpTransferState::Queued | SftpTransferState::Conflict => {
+                task.state = SftpTransferState::Cancelled;
+                Some(false)
+            }
+            SftpTransferState::Cancelling
+            | SftpTransferState::Completed
+            | SftpTransferState::Failed
+            | SftpTransferState::Cancelled => None,
+        }
+    }
+
+    fn clear_finished(&mut self) {
+        self.tasks.retain(|task| !task.state.is_finished());
+    }
+
+    fn fail_pending(&mut self, error: &str) {
+        for task in &mut self.tasks {
+            if !task.state.is_finished() {
+                task.state = SftpTransferState::Failed;
+                task.error = Some(error.into());
+            }
+        }
+    }
 }
 
 impl SftpFileState {
@@ -1375,6 +1617,257 @@ impl RemCmdApp {
             session.sftp.file = None;
         }
         cx.notify();
+    }
+
+    fn choose_sftp_uploads(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(remote_directory) = self
+            .session(session_id)
+            .map(|session| session.sftp_browser(placement).path.clone())
+        else {
+            return;
+        };
+        let selected_paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Upload".into()),
+        });
+
+        cx.spawn(async move |this, cx| match selected_paths.await {
+            Ok(Ok(Some(paths))) => {
+                let _ = this.update(cx, |this, cx| {
+                    for local_path in paths {
+                        let Some(file_name) = local_path.file_name() else {
+                            continue;
+                        };
+                        let remote_path = remote_join_path(
+                            &remote_directory,
+                            file_name.to_string_lossy().as_ref(),
+                        );
+                        this.enqueue_sftp_transfer(
+                            session_id,
+                            SftpTransferDirection::Upload,
+                            local_path,
+                            remote_path,
+                            false,
+                            cx,
+                        );
+                    }
+                });
+            }
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(session) = this.session_mut(session_id) {
+                        session.sftp_browser_mut(placement).error =
+                            Some(format!("Failed to open upload picker: {error}"));
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn choose_sftp_download(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        remote_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = default_download_directory();
+        let suggested_name = remote_file_name(&remote_path).to_owned();
+        let selected_path = cx.prompt_for_new_path(&directory, Some(&suggested_name));
+
+        cx.spawn(async move |this, cx| match selected_path.await {
+            Ok(Ok(Some(local_path))) => {
+                let overwrite = local_path.exists();
+                let _ = this.update(cx, |this, cx| {
+                    this.enqueue_sftp_transfer(
+                        session_id,
+                        SftpTransferDirection::Download,
+                        local_path,
+                        remote_path,
+                        overwrite,
+                        cx,
+                    );
+                });
+            }
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(session) = this.session_mut(session_id) {
+                        session.sftp_browser_mut(placement).error =
+                            Some(format!("Failed to open download picker: {error}"));
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn enqueue_sftp_transfer(
+        &mut self,
+        session_id: SessionId,
+        direction: SftpTransferDirection,
+        local_path: PathBuf,
+        remote_path: String,
+        overwrite: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session
+            .transfers
+            .enqueue(direction, local_path, remote_path, overwrite);
+        self.start_next_sftp_transfer(session_id, cx);
+        cx.notify();
+    }
+
+    fn start_next_sftp_transfer(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        loop {
+            let Some((handle, task)) = self.session_mut(session_id).and_then(|session| {
+                let task = session.transfers.start_next()?;
+                let handle = (session.connection_state == SessionState::Connected)
+                    .then(|| session.connection_handle.clone())
+                    .flatten();
+                Some((handle, task))
+            }) else {
+                break;
+            };
+
+            let result = match handle {
+                Some(handle) => match task.direction {
+                    SftpTransferDirection::Upload => handle.upload_file(
+                        task.id,
+                        task.local_path,
+                        task.remote_path,
+                        task.overwrite,
+                    ),
+                    SftpTransferDirection::Download => handle.download_file(
+                        task.id,
+                        task.remote_path,
+                        task.local_path,
+                        task.overwrite,
+                    ),
+                },
+                None => Err(remcmd_ssh::SshError::new(
+                    SshErrorKind::InvalidState,
+                    "Connect this terminal before transferring files",
+                )),
+            };
+
+            match result {
+                Ok(()) => break,
+                Err(error) => {
+                    if let Some(session) = self.session_mut(session_id) {
+                        session.transfers.mark_failed(task.id, error.to_string());
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_sftp_transfer(
+        &mut self,
+        session_id: SessionId,
+        transfer_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((signal_worker, handle)) = self.session_mut(session_id).and_then(|session| {
+            let signal_worker = session.transfers.begin_cancel(transfer_id)?;
+            Some((signal_worker, session.connection_handle.clone()))
+        }) else {
+            return;
+        };
+
+        if signal_worker {
+            let result = handle
+                .ok_or_else(|| {
+                    remcmd_ssh::SshError::new(
+                        SshErrorKind::InvalidState,
+                        "SSH connection task is not running",
+                    )
+                })
+                .and_then(|handle| handle.cancel_transfer(transfer_id));
+            if let Err(error) = result
+                && let Some(session) = self.session_mut(session_id)
+            {
+                session
+                    .transfers
+                    .mark_failed(transfer_id, error.to_string());
+                self.start_next_sftp_transfer(session_id, cx);
+            }
+        } else {
+            self.start_next_sftp_transfer(session_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_sftp_transfer_destination(
+        &mut self,
+        session_id: SessionId,
+        transfer_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .session_mut(session_id)
+            .is_some_and(|session| session.transfers.retry_with_overwrite(transfer_id))
+        {
+            self.start_next_sftp_transfer(session_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn clear_finished_sftp_transfers(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut(session_id) {
+            session.transfers.clear_finished();
+        }
+        cx.notify();
+    }
+
+    fn complete_sftp_transfer(
+        &mut self,
+        session_id: SessionId,
+        transfer_id: u64,
+        direction: SftpTransferDirection,
+        remote_path: String,
+        bytes: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let completed = self
+            .session_mut(session_id)
+            .is_some_and(|session| session.transfers.mark_completed(transfer_id, bytes));
+        if !completed {
+            return;
+        }
+
+        if direction == SftpTransferDirection::Upload {
+            let parent = remote_parent_path(&remote_path).unwrap_or_else(|| ".".into());
+            let placements = [SftpBrowserPlacement::Center, SftpBrowserPlacement::Sidebar]
+                .into_iter()
+                .filter(|placement| {
+                    self.session(session_id).is_some_and(|session| {
+                        let browser = session.sftp_browser(*placement);
+                        browser.loaded && browser.path == parent
+                    })
+                })
+                .collect::<Vec<_>>();
+            for placement in placements {
+                self.request_sftp_directory(session_id, placement, parent.clone(), cx);
+            }
+        }
+
+        self.start_next_sftp_transfer(session_id, cx);
     }
 
     fn create_tab_for_session(
@@ -3366,6 +3859,7 @@ impl RemCmdApp {
                         session.connection_credential = None;
                         session.sftp.stop_loading();
                         session.sidebar_sftp.stop_loading();
+                        session.transfers.fail_pending("SSH connection closed");
                         if previous_state == SessionState::Disconnecting
                             && session.terminal_end_reason.is_none()
                         {
@@ -3406,6 +3900,7 @@ impl RemCmdApp {
                     session.host_key_prompt = None;
                     session.sftp.stop_loading();
                     session.sidebar_sftp.stop_loading();
+                    session.transfers.fail_pending("SSH connection failed");
                     (profile_id, credential, session.close_when_disconnected)
                 };
 
@@ -3484,19 +3979,58 @@ impl RemCmdApp {
                 self.complete_remote_file_write(session_id, request_id, file);
                 true
             }
+            ConnectionEvent::TransferProgress {
+                transfer_id,
+                transferred,
+                total,
+            } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session
+                        .transfers
+                        .mark_progress(transfer_id, transferred, total);
+                }
+                true
+            }
+            ConnectionEvent::TransferConflict {
+                transfer_id,
+                direction: _,
+                path: _,
+            } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.transfers.mark_conflict(transfer_id);
+                }
+                true
+            }
+            ConnectionEvent::TransferCompleted {
+                transfer_id,
+                direction,
+                path,
+                bytes,
+            } => {
+                self.complete_sftp_transfer(session_id, transfer_id, direction, path, bytes, cx);
+                true
+            }
+            ConnectionEvent::TransferCancelled { transfer_id } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.transfers.mark_cancelled(transfer_id);
+                }
+                self.start_next_sftp_transfer(session_id, cx);
+                true
+            }
             ConnectionEvent::SftpFailed {
                 request_id,
                 path: _,
                 operation,
                 error,
             } => {
-                if let Some(session) = self.session_mut(session_id) {
+                let transfer_failed = if let Some(session) = self.session_mut(session_id) {
                     match operation {
                         SftpOperation::ReadDirectory => {
                             let placement = sftp_browser_placement_for_request(request_id);
                             session
                                 .sftp_browser_mut(placement)
                                 .fail_request(request_id, error.to_string());
+                            false
                         }
                         SftpOperation::ReadFile | SftpOperation::WriteFile => {
                             session.sftp.fail_file_request(
@@ -3504,8 +4038,20 @@ impl RemCmdApp {
                                 operation,
                                 error.to_string(),
                             );
+                            false
+                        }
+                        SftpOperation::UploadFile
+                        | SftpOperation::DownloadFile
+                        | SftpOperation::CancelTransfer => {
+                            session.transfers.mark_failed(request_id, error.to_string());
+                            true
                         }
                     }
+                } else {
+                    false
+                };
+                if transfer_failed {
+                    self.start_next_sftp_transfer(session_id, cx);
                 }
                 true
             }
@@ -6085,6 +6631,19 @@ impl RemCmdApp {
                 this.refresh_active_sftp_directory(placement, cx);
             }));
         }
+        let can_upload = connected && !loading;
+        let mut upload_button = self.render_icon_button(
+            SharedString::from(format!("sftp_upload_{element_suffix}")),
+            IconName::Upload,
+            "Upload files",
+            IconTone::Default,
+            can_upload,
+        );
+        if can_upload {
+            upload_button = upload_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.choose_sftp_uploads(session_id, placement, cx);
+            }));
+        }
 
         let mut browser = div()
             .id(SharedString::from(format!("sftp_browser_{element_suffix}")))
@@ -6111,6 +6670,7 @@ impl RemCmdApp {
                     .border_color(self.theme.border)
                     .child(parent_button)
                     .child(refresh_button)
+                    .child(upload_button)
                     .child(
                         div()
                             .flex_1()
@@ -6147,7 +6707,10 @@ impl RemCmdApp {
             );
         }
 
-        browser.child(list).into_any_element()
+        browser
+            .child(list)
+            .child(self.render_sftp_transfer_queue(session_id, placement, cx))
+            .into_any_element()
     }
 
     fn render_sftp_entry_rows(
@@ -6193,6 +6756,23 @@ impl RemCmdApp {
                     .map(format_remote_size)
                     .unwrap_or_else(|| "-".into())
             };
+            let download_control = if is_file && connected && !loading {
+                let download_path = entry_path.clone();
+                self.render_icon_button(
+                    SharedString::from(format!("sftp-download-{element_suffix}-{}", entry.path)),
+                    IconName::Download,
+                    "Download",
+                    IconTone::Default,
+                    true,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.choose_sftp_download(session_id, placement, download_path.clone(), cx);
+                }))
+                .into_any_element()
+            } else {
+                div().flex_none().size(px(32.0)).into_any_element()
+            };
             let mut row = div()
                 .id(SharedString::from(format!(
                     "sftp-entry-{element_suffix}-{}",
@@ -6225,7 +6805,8 @@ impl RemCmdApp {
                         .text_sm()
                         .text_color(self.theme.text_muted)
                         .child(size),
-                );
+                )
+                .child(download_control);
             if (is_directory || is_file) && connected && !loading {
                 row = row
                     .cursor_pointer()
@@ -6243,6 +6824,222 @@ impl RemCmdApp {
         }
 
         rows
+    }
+
+    fn render_sftp_transfer_queue(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tasks = self
+            .session(session_id)
+            .map(|session| session.transfers.tasks.clone())
+            .unwrap_or_default();
+        if tasks.is_empty() {
+            return div().into_any_element();
+        }
+        let has_finished = tasks.iter().any(|task| task.state.is_finished());
+        let element_suffix = placement.element_suffix();
+
+        let mut clear_button = self.render_icon_button(
+            SharedString::from(format!(
+                "clear-sftp-transfers-{element_suffix}-{}",
+                session_id.0
+            )),
+            IconName::Delete,
+            "Clear finished transfers",
+            IconTone::Default,
+            has_finished,
+        );
+        if has_finished {
+            clear_button = clear_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.clear_finished_sftp_transfers(session_id, cx);
+            }));
+        }
+
+        let mut queue = div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .max_h(px(220.0))
+            .border_t_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.surface_bg)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(36.0))
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Transfers"),
+                    )
+                    .child(clear_button),
+            );
+
+        let mut rows = div()
+            .id(SharedString::from(format!(
+                "sftp-transfer-rows-{element_suffix}-{}",
+                session_id.0
+            )))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
+        for task in tasks {
+            let transfer_id = task.id;
+            let direction = task.direction;
+            let state = task.state;
+            let progress = task
+                .total
+                .filter(|total| *total > 0)
+                .map(|total| (task.transferred as f32 / total as f32).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            let status_color = match state {
+                SftpTransferState::Completed => self.theme.status_ok,
+                SftpTransferState::Failed => self.theme.error_text,
+                SftpTransferState::Conflict => self.theme.status_warn,
+                SftpTransferState::Queued
+                | SftpTransferState::Running
+                | SftpTransferState::Cancelling
+                | SftpTransferState::Cancelled => self.theme.text_muted,
+            };
+            let mut controls = div().flex().flex_none().items_center().gap_1();
+            match state {
+                SftpTransferState::Conflict => {
+                    controls = controls
+                        .child(
+                            text_button(
+                                SharedString::from(format!(
+                                    "replace-sftp-transfer-{element_suffix}-{transfer_id}"
+                                )),
+                                "Replace",
+                                TextButtonTone::Primary,
+                                true,
+                                &self.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.replace_sftp_transfer_destination(
+                                        session_id,
+                                        transfer_id,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                        .child(
+                            text_button(
+                                SharedString::from(format!(
+                                    "cancel-conflicted-sftp-transfer-{element_suffix}-{transfer_id}"
+                                )),
+                                "Cancel",
+                                TextButtonTone::Secondary,
+                                true,
+                                &self.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.cancel_sftp_transfer(session_id, transfer_id, cx);
+                                },
+                            )),
+                        );
+                }
+                SftpTransferState::Queued | SftpTransferState::Running => {
+                    controls = controls.child(
+                        self.render_icon_button(
+                            SharedString::from(format!(
+                                "cancel-active-sftp-transfer-{element_suffix}-{transfer_id}"
+                            )),
+                            IconName::Cancel,
+                            "Cancel transfer",
+                            IconTone::Default,
+                            true,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cancel_sftp_transfer(session_id, transfer_id, cx);
+                        })),
+                    );
+                }
+                SftpTransferState::Cancelling
+                | SftpTransferState::Completed
+                | SftpTransferState::Failed
+                | SftpTransferState::Cancelled => {}
+            }
+
+            let row = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(self.theme.border)
+                .child(self.render_sidebar_icon(
+                    match direction {
+                        SftpTransferDirection::Upload => IconName::Upload,
+                        SftpTransferDirection::Download => IconName::Download,
+                    },
+                    16.0,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(task.display_name()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(status_color)
+                                .child(task.status_text()),
+                        )
+                        .when(
+                            matches!(
+                                state,
+                                SftpTransferState::Running | SftpTransferState::Cancelling
+                            ),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .h(px(3.0))
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .rounded_full()
+                                        .bg(self.theme.control_bg)
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(gpui::relative(progress))
+                                                .rounded_full()
+                                                .bg(self.theme.accent),
+                                        ),
+                                )
+                            },
+                        ),
+                )
+                .child(controls);
+            rows = rows.child(row);
+        }
+
+        queue = queue.child(rows);
+        queue.into_any_element()
     }
 
     fn render_sftp_file(&self, session_id: SessionId, cx: &mut Context<Self>) -> AnyElement {
@@ -6391,6 +7188,7 @@ impl RemCmdApp {
                 )
             })
             .child(content)
+            .child(self.render_sftp_transfer_queue(session_id, SftpBrowserPlacement::Center, cx))
             .into_any_element()
     }
 
@@ -6939,6 +7737,31 @@ fn remote_parent_path(path: &str) -> Option<String> {
     }
 }
 
+fn remote_file_name(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+}
+
+fn remote_join_path(directory: &str, name: &str) -> String {
+    if directory == "/" {
+        format!("/{name}")
+    } else if directory == "." {
+        name.to_owned()
+    } else {
+        format!("{}/{}", directory.trim_end_matches('/'), name)
+    }
+}
+
+fn default_download_directory() -> PathBuf {
+    UserDirs::new()
+        .and_then(|directories| directories.download_dir().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn format_remote_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -7242,6 +8065,62 @@ mod tests {
         assert_eq!(format_remote_size(42), "42 B");
         assert_eq!(format_remote_size(1536), "1.5 KB");
         assert_eq!(format_remote_size(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[test]
+    fn remote_transfer_paths_join_root_relative_and_nested_directories() {
+        assert_eq!(remote_join_path("/", "notes.txt"), "/notes.txt");
+        assert_eq!(remote_join_path(".", "notes.txt"), "notes.txt");
+        assert_eq!(
+            remote_join_path("/home/test/", "notes.txt"),
+            "/home/test/notes.txt"
+        );
+        assert_eq!(remote_file_name("/home/test/notes.txt"), "notes.txt");
+    }
+
+    #[test]
+    fn sftp_transfer_queue_runs_one_task_at_a_time_and_pauses_for_conflicts() {
+        let mut queue = SftpTransferQueue::default();
+        let upload = queue.enqueue(
+            SftpTransferDirection::Upload,
+            PathBuf::from("/tmp/upload.txt"),
+            "/remote/upload.txt".into(),
+            false,
+        );
+        let download = queue.enqueue(
+            SftpTransferDirection::Download,
+            PathBuf::from("/tmp/download.txt"),
+            "/remote/download.txt".into(),
+            false,
+        );
+
+        assert_eq!(queue.start_next().unwrap().id, upload);
+        assert!(queue.start_next().is_none());
+        assert!(queue.mark_completed(upload, 12));
+        assert_eq!(queue.start_next().unwrap().id, download);
+        assert!(queue.mark_conflict(download));
+        assert!(queue.start_next().is_none());
+        assert!(queue.retry_with_overwrite(download));
+        let retried = queue.start_next().unwrap();
+        assert_eq!(retried.id, download);
+        assert!(retried.overwrite);
+    }
+
+    #[test]
+    fn queued_sftp_transfer_can_be_cancelled_without_signalling_the_worker() {
+        let mut queue = SftpTransferQueue::default();
+        let transfer = queue.enqueue(
+            SftpTransferDirection::Upload,
+            PathBuf::from("/tmp/upload.txt"),
+            "/remote/upload.txt".into(),
+            false,
+        );
+
+        assert_eq!(queue.begin_cancel(transfer), Some(false));
+        assert_eq!(
+            queue.task_mut(transfer).map(|task| task.state),
+            Some(SftpTransferState::Cancelled)
+        );
     }
 
     #[test]

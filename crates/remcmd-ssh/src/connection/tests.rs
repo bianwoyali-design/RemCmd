@@ -27,6 +27,25 @@ fn connection_handle_forwards_commands() {
         .write_file(9, "/home/test/notes.txt", b"old".to_vec(), b"new".to_vec())
         .expect("file write should be sent");
     handle
+        .upload_file(
+            10,
+            PathBuf::from("/tmp/upload.txt"),
+            "/home/test/upload.txt",
+            false,
+        )
+        .expect("upload should be sent");
+    handle
+        .download_file(
+            11,
+            "/home/test/download.txt",
+            PathBuf::from("/tmp/download.txt"),
+            true,
+        )
+        .expect("download should be sent");
+    handle
+        .cancel_transfer(11)
+        .expect("transfer cancellation should be sent");
+    handle
         .trust_host_key()
         .expect("host key trust should be sent");
     handle
@@ -67,6 +86,30 @@ fn connection_handle_forwards_commands() {
             expected_contents: b"old".to_vec(),
             contents: b"new".to_vec(),
         }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("upload command"),
+        ConnectionCommand::UploadFile {
+            transfer_id: 10,
+            local_path: PathBuf::from("/tmp/upload.txt"),
+            remote_path: "/home/test/upload.txt".into(),
+            overwrite: false,
+        }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("download command"),
+        ConnectionCommand::DownloadFile {
+            transfer_id: 11,
+            remote_path: "/home/test/download.txt".into(),
+            local_path: PathBuf::from("/tmp/download.txt"),
+            overwrite: true,
+        }
+    );
+    assert_eq!(
+        command_rx
+            .try_recv()
+            .expect("transfer cancellation command"),
+        ConnectionCommand::CancelTransfer { transfer_id: 11 }
     );
     assert_eq!(
         host_key_decision_rx.try_recv().expect("trust decision"),
