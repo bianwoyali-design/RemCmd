@@ -39,7 +39,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use directories::UserDirs;
@@ -58,8 +58,9 @@ use secrecy::SecretString;
 use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
-    RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, SessionState, SftpOperation,
-    SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind, TransferRateLimiter,
+    RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, ServerPerformanceSnapshot,
+    SessionState, SftpOperation, SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind,
+    TransferRateLimiter,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -146,6 +147,7 @@ struct RemCmdApp {
     right_sidebar_width: f32,
     right_sidebar_resize: Option<SidebarResize>,
     right_sidebar_transition_id: u64,
+    right_sidebar_view: RightSidebarView,
     credential_lookup_task: Option<Task<()>>,
     credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
@@ -205,6 +207,7 @@ struct TerminalSession {
     sftp: SftpBrowserState,
     sidebar_sftp: SftpBrowserState,
     transfers: SftpTransferQueue,
+    performance: ServerPerformanceState,
 }
 
 impl TerminalSession {
@@ -229,6 +232,7 @@ impl TerminalSession {
             sftp: SftpBrowserState::default(),
             sidebar_sftp: SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START),
             transfers: SftpTransferQueue::default(),
+            performance: ServerPerformanceState::default(),
         }
     }
 
@@ -503,6 +507,87 @@ enum TerminalTabView {
 enum SftpBrowserPlacement {
     Center,
     Sidebar,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RightSidebarView {
+    #[default]
+    Sftp,
+    Performance,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PerformanceCounters {
+    captured_at: Instant,
+    cpu_total: u64,
+    cpu_idle: u64,
+    network_rx_bytes: u64,
+    network_tx_bytes: u64,
+}
+
+#[derive(Default)]
+struct ServerPerformanceState {
+    snapshot: Option<ServerPerformanceSnapshot>,
+    previous: Option<PerformanceCounters>,
+    cpu_usage: Option<f32>,
+    network_rx_per_second: Option<f64>,
+    network_tx_per_second: Option<f64>,
+    monitoring: bool,
+    loading: bool,
+    error: Option<String>,
+}
+
+impl ServerPerformanceState {
+    fn update(&mut self, snapshot: ServerPerformanceSnapshot, captured_at: Instant) {
+        if let Some(previous) = self.previous {
+            let total_delta = snapshot.cpu_total.saturating_sub(previous.cpu_total);
+            let idle_delta = snapshot.cpu_idle.saturating_sub(previous.cpu_idle);
+            if total_delta > 0 && idle_delta <= total_delta {
+                self.cpu_usage =
+                    Some((total_delta - idle_delta) as f32 / total_delta as f32 * 100.0);
+            }
+
+            let elapsed = captured_at
+                .saturating_duration_since(previous.captured_at)
+                .as_secs_f64();
+            if elapsed > 0.0 {
+                self.network_rx_per_second = Some(
+                    snapshot
+                        .network_rx_bytes
+                        .saturating_sub(previous.network_rx_bytes) as f64
+                        / elapsed,
+                );
+                self.network_tx_per_second = Some(
+                    snapshot
+                        .network_tx_bytes
+                        .saturating_sub(previous.network_tx_bytes) as f64
+                        / elapsed,
+                );
+            }
+        }
+
+        self.previous = Some(PerformanceCounters {
+            captured_at,
+            cpu_total: snapshot.cpu_total,
+            cpu_idle: snapshot.cpu_idle,
+            network_rx_bytes: snapshot.network_rx_bytes,
+            network_tx_bytes: snapshot.network_tx_bytes,
+        });
+        self.snapshot = Some(snapshot);
+        self.loading = false;
+        self.error = None;
+    }
+
+    fn clear_connection(&mut self) {
+        self.snapshot = None;
+        self.previous = None;
+        self.cpu_usage = None;
+        self.network_rx_per_second = None;
+        self.network_tx_per_second = None;
+        self.monitoring = false;
+        self.loading = false;
+        self.error = None;
+    }
 }
 
 impl SftpBrowserPlacement {
@@ -1188,6 +1273,7 @@ impl RemCmdApp {
             right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
             right_sidebar_resize: None,
             right_sidebar_transition_id: 0,
+            right_sidebar_view: RightSidebarView::Sftp,
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
@@ -1412,11 +1498,64 @@ impl RemCmdApp {
         self.right_sidebar_transition_id += 1;
         self.right_sidebar_resize = None;
         if self.right_sidebar_open
+            && self.right_sidebar_view == RightSidebarView::Sftp
             && let Some(session_id) = self.active_session_id
         {
             self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
         }
+        self.sync_performance_monitoring();
         cx.notify();
+    }
+
+    fn set_right_sidebar_view(&mut self, view: RightSidebarView, cx: &mut Context<Self>) {
+        self.right_sidebar_view = view;
+        if view == RightSidebarView::Sftp
+            && let Some(session_id) = self.active_session_id
+        {
+            self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
+        }
+        self.sync_performance_monitoring();
+        cx.notify();
+    }
+
+    fn sync_performance_monitoring(&mut self) {
+        let target_session = (self.right_sidebar_open
+            && self.right_sidebar_view == RightSidebarView::Performance)
+            .then_some(self.active_session_id)
+            .flatten();
+
+        for session in &mut self.sessions {
+            let should_monitor = target_session == Some(session.id)
+                && session.connection_state == SessionState::Connected
+                && session.connection_handle.is_some();
+            if session.performance.monitoring == should_monitor {
+                continue;
+            }
+
+            let result = session
+                .connection_handle
+                .as_ref()
+                .map(|handle| handle.set_performance_monitoring(should_monitor));
+            match result {
+                Some(Ok(())) => {
+                    session.performance.monitoring = should_monitor;
+                    session.performance.loading =
+                        should_monitor && session.performance.snapshot.is_none();
+                    if should_monitor {
+                        session.performance.error = None;
+                    }
+                }
+                Some(Err(error)) => {
+                    session.performance.monitoring = false;
+                    session.performance.loading = false;
+                    session.performance.error = Some(error.to_string());
+                }
+                None => {
+                    session.performance.monitoring = false;
+                    session.performance.loading = false;
+                }
+            }
+        }
     }
 
     fn set_active_tab_view(
@@ -2140,7 +2279,7 @@ impl RemCmdApp {
         if profile_changed {
             self.load_editor_for_selected_profile(cx);
         }
-        if self.right_sidebar_open {
+        if self.right_sidebar_open && self.right_sidebar_view == RightSidebarView::Sftp {
             self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
         }
         if self
@@ -2149,6 +2288,7 @@ impl RemCmdApp {
         {
             self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Center, cx);
         }
+        self.sync_performance_monitoring();
         true
     }
 
@@ -2294,6 +2434,7 @@ impl RemCmdApp {
                 self.set_active_pane(pane_id, cx);
             }
         }
+        self.sync_performance_monitoring();
         true
     }
 
@@ -2329,6 +2470,7 @@ impl RemCmdApp {
                 .filter(|replacement| *replacement != session_id);
         }
 
+        self.sync_performance_monitoring();
         true
     }
 
@@ -2646,6 +2788,7 @@ impl RemCmdApp {
         if let Some(tab_id) = tab_id {
             self.activate_tab_in_window(tab_id, window, cx);
         }
+        self.sync_performance_monitoring();
         cx.notify();
     }
 
@@ -2670,6 +2813,7 @@ impl RemCmdApp {
         self.load_editor_for_selected_profile(cx);
         self.persist_profiles();
 
+        self.sync_performance_monitoring();
         cx.notify();
     }
 
@@ -3963,7 +4107,8 @@ impl RemCmdApp {
                     terminal.remote_cwd = Some(path);
                 }
                 if self.active_session_id == Some(session_id) {
-                    if self.right_sidebar_open {
+                    if self.right_sidebar_open && self.right_sidebar_view == RightSidebarView::Sftp
+                    {
                         self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
                     }
                     if self.active_tab_view() == TerminalTabView::Files {
@@ -4124,6 +4269,7 @@ impl RemCmdApp {
                         session.sftp.stop_loading();
                         session.sidebar_sftp.stop_loading();
                         session.transfers.fail_pending("SSH connection closed");
+                        session.performance.clear_connection();
                         if previous_state == SessionState::Disconnecting
                             && session.terminal_end_reason.is_none()
                         {
@@ -4139,6 +4285,7 @@ impl RemCmdApp {
                 } else if close_when_disconnected {
                     self.remove_session(session_id, cx);
                 }
+                self.sync_performance_monitoring();
 
                 true
             }
@@ -4165,6 +4312,7 @@ impl RemCmdApp {
                     session.sftp.stop_loading();
                     session.sidebar_sftp.stop_loading();
                     session.transfers.fail_pending("SSH connection failed");
+                    session.performance.clear_connection();
                     (profile_id, credential, session.close_when_disconnected)
                 };
 
@@ -4172,6 +4320,7 @@ impl RemCmdApp {
                     self.remove_session(session_id, cx);
                     return;
                 }
+                self.sync_performance_monitoring();
 
                 let authentication_error = error.to_string();
                 let prompted_for_credential =
@@ -4320,6 +4469,19 @@ impl RemCmdApp {
                 }
                 true
             }
+            ConnectionEvent::PerformanceSnapshot(snapshot) => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.performance.update(snapshot, Instant::now());
+                }
+                true
+            }
+            ConnectionEvent::PerformanceFailed(error) => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.performance.loading = false;
+                    session.performance.error = Some(error.to_string());
+                }
+                true
+            }
             ConnectionEvent::Resized(size) => {
                 let dimensions_changed = self
                     .session_mut(session_id)
@@ -4458,6 +4620,9 @@ impl Render for RemCmdApp {
             ),
         );
         root = root.child(self.render_titlebar_tabs(window, cx));
+        if self.right_sidebar_open {
+            root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, cx));
+        }
         if self.left_sidebar_progress > 0.0 {
             root = root.child(self.render_sidebar_resize_handle(rendered_left_sidebar_width, cx));
         }
@@ -4642,7 +4807,7 @@ impl RemCmdApp {
         }
 
         let right_sidebar = self
-            .render_titlebar_sidebar_button("toggle_right_sidebar", false, "Toggle SFTP sidebar")
+            .render_titlebar_sidebar_button("toggle_right_sidebar", false, "Toggle right sidebar")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)));
 
         div()
@@ -4693,6 +4858,96 @@ impl RemCmdApp {
                 spread_radius: px(-1.5),
             },
         ]
+    }
+
+    fn render_right_sidebar_titlebar(
+        &self,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut tabs = div()
+            .id("right_sidebar_titlebar_tabs")
+            .relative()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .max_w(px(280.0))
+            .items_center()
+            .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
+            .p(px(3.0))
+            .rounded_full()
+            .border_1()
+            .border_color(self.theme.titlebar_tab_group_border)
+            .bg(self.theme.transparent)
+            .shadow(vec![BoxShadow {
+                color: self.theme.titlebar_tab_group_shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(8.0),
+                spread_radius: px(-4.0),
+            }]);
+
+        for (view, label, icon_name) in [
+            (RightSidebarView::Sftp, "SFTP", IconName::Folder),
+            (
+                RightSidebarView::Performance,
+                "Performance",
+                IconName::Performance,
+            ),
+        ] {
+            let selected = self.right_sidebar_view == view;
+            let hover = if selected {
+                self.theme.titlebar_tab_selected_hover_bg
+            } else {
+                self.theme.titlebar_tab_hover_bg
+            };
+            let pressed = self.theme.titlebar_tab_pressed_bg;
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("right-sidebar-tab-{label}")))
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.0))
+                    .h(px(TITLEBAR_TAB_HEIGHT))
+                    .px_2()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .active(move |this| this.bg(pressed))
+                    .when(selected, |this| {
+                        this.border_1()
+                            .border_color(self.theme.titlebar_tab_border)
+                            .bg(self.theme.titlebar_tab_selected_bg)
+                            .shadow(vec![BoxShadow {
+                                color: self.theme.titlebar_tab_shadow,
+                                offset: point(px(0.0), px(1.0)),
+                                blur_radius: px(3.0),
+                                spread_radius: px(-1.0),
+                            }])
+                    })
+                    .child(icon(icon_name, self.theme, IconTone::Default, 14.0))
+                    .child(div().min_w(px(0.0)).truncate().text_sm().child(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_right_sidebar_view(view, cx);
+                    })),
+            );
+        }
+
+        div()
+            .id("right_sidebar_titlebar")
+            .absolute()
+            .top(px(-1.0))
+            .right_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(width))
+            .h(px(TITLEBAR_HEIGHT))
+            .px_3()
+            .child(tabs)
     }
 
     fn terminal_tab_title(&self, tab: &TerminalTab) -> String {
@@ -6212,9 +6467,315 @@ impl RemCmdApp {
             )
     }
 
+    fn render_server_performance(&self, session_id: SessionId) -> AnyElement {
+        let Some(session) = self.session(session_id) else {
+            return div().into_any_element();
+        };
+        if session.connection_state != SessionState::Connected {
+            return div()
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_sm()
+                .text_color(self.theme.text_muted)
+                .child(self.render_sidebar_icon(IconName::Performance, 20.0))
+                .child("Connect to monitor this server")
+                .into_any_element();
+        }
+
+        let performance = &session.performance;
+        let Some(snapshot) = performance.snapshot.as_ref() else {
+            let message = performance
+                .error
+                .as_deref()
+                .unwrap_or("Collecting server metrics...");
+            return div()
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_3()
+                .text_center()
+                .text_sm()
+                .text_color(if performance.error.is_some() {
+                    self.theme.error_text
+                } else {
+                    self.theme.text_muted
+                })
+                .child(self.render_sidebar_icon(IconName::Performance, 20.0))
+                .child(message.to_owned())
+                .into_any_element();
+        };
+
+        let cpu_usage = performance.cpu_usage.unwrap_or(0.0);
+        let memory_used = snapshot
+            .memory_total_bytes
+            .saturating_sub(snapshot.memory_available_bytes);
+        let memory_usage = percent(memory_used, snapshot.memory_total_bytes);
+        let disk = snapshot
+            .disk_total_bytes
+            .zip(snapshot.disk_available_bytes)
+            .filter(|(total, available)| *total > 0 && available <= total);
+        let status_color = if performance.error.is_some() {
+            self.theme.status_warn
+        } else {
+            self.theme.status_ok
+        };
+
+        let mut content = div()
+            .id("server_performance")
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .pt_2()
+                    .pb_3()
+                    .child(div().size(px(7.0)).rounded_full().bg(status_color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(snapshot.hostname.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(self.theme.text_muted)
+                            .child(if performance.error.is_some() {
+                                "Retrying"
+                            } else {
+                                "Live, 2s"
+                            }),
+                    ),
+            )
+            .child(self.render_performance_meter(
+                "CPU",
+                cpu_usage,
+                if performance.cpu_usage.is_some() {
+                    format!("{cpu_usage:.0}%")
+                } else {
+                    "Collecting".into()
+                },
+                self.theme.accent,
+            ))
+            .child(self.render_performance_meter(
+                "Memory",
+                memory_usage,
+                format!(
+                    "{} / {}",
+                    format_remote_size(memory_used),
+                    format_remote_size(snapshot.memory_total_bytes)
+                ),
+                if memory_usage >= 85.0 {
+                    self.theme.status_warn
+                } else {
+                    self.theme.accent
+                },
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .gap_2()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_sm()
+                            .child("Load average")
+                            .child(div().text_color(self.theme.text_muted).child(format!(
+                                "{:.2}  {:.2}  {:.2}",
+                                snapshot.load_one_milli as f32 / 1000.0,
+                                snapshot.load_five_milli as f32 / 1000.0,
+                                snapshot.load_fifteen_milli as f32 / 1000.0,
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.theme.text_faint)
+                            .child(format!(
+                                "1m / 5m / 15m, {} logical CPUs",
+                                snapshot.cpu_count
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .gap_2()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Network"),
+                    )
+                    .child(
+                        self.render_performance_value_row(
+                            "Download",
+                            performance
+                                .network_rx_per_second
+                                .map(format_byte_rate)
+                                .unwrap_or_else(|| "Collecting".into()),
+                        ),
+                    )
+                    .child(
+                        self.render_performance_value_row(
+                            "Upload",
+                            performance
+                                .network_tx_per_second
+                                .map(format_byte_rate)
+                                .unwrap_or_else(|| "Collecting".into()),
+                        ),
+                    ),
+            );
+
+        if let Some((disk_total, disk_available)) = disk {
+            let disk_used = disk_total.saturating_sub(disk_available);
+            let disk_usage = percent(disk_used, disk_total);
+            content = content.child(self.render_performance_meter(
+                "Root disk",
+                disk_usage,
+                format!(
+                    "{} / {}",
+                    format_remote_size(disk_used),
+                    format_remote_size(disk_total)
+                ),
+                if disk_usage >= 90.0 {
+                    self.theme.danger
+                } else {
+                    self.theme.accent
+                },
+            ));
+        }
+
+        content
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .gap_2()
+                    .py_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("System"),
+                    )
+                    .child(self.render_performance_value_row(
+                        "Uptime",
+                        format_uptime(snapshot.uptime_seconds),
+                    )),
+            )
+            .when_some(performance.error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(self.theme.error_text)
+                        .child(error.clone()),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_performance_meter(
+        &self,
+        label: &'static str,
+        value: f32,
+        detail: String,
+        color: gpui::Hsla,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .gap_2()
+            .py_3()
+            .border_b_1()
+            .border_color(self.theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_sm()
+                    .child(label)
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(self.theme.text_muted)
+                            .child(detail),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(4.0))
+                    .w_full()
+                    .overflow_hidden()
+                    .rounded_full()
+                    .bg(self.theme.control_bg)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(value.clamp(0.0, 100.0) / 100.0))
+                            .rounded_full()
+                            .bg(color),
+                    ),
+            )
+    }
+
+    fn render_performance_value_row(&self, label: &'static str, value: String) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .text_sm()
+            .child(div().text_color(self.theme.text_muted).child(label))
+            .child(div().min_w(px(0.0)).truncate().child(value))
+    }
+
     fn render_right_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let content = if let Some(session_id) = self.active_session_id {
-            self.render_sftp_browser(session_id, SftpBrowserPlacement::Sidebar, cx)
+            match self.right_sidebar_view {
+                RightSidebarView::Sftp => {
+                    self.render_sftp_browser(session_id, SftpBrowserPlacement::Sidebar, cx)
+                }
+                RightSidebarView::Performance => self
+                    .render_server_performance(session_id)
+                    .into_any_element(),
+            }
         } else {
             div()
                 .flex()
@@ -6225,7 +6786,13 @@ impl RemCmdApp {
                 .gap_2()
                 .text_sm()
                 .text_color(self.theme.text_muted)
-                .child(self.render_sidebar_icon(IconName::Folder, 20.0))
+                .child(self.render_sidebar_icon(
+                    match self.right_sidebar_view {
+                        RightSidebarView::Sftp => IconName::Folder,
+                        RightSidebarView::Performance => IconName::Performance,
+                    },
+                    20.0,
+                ))
                 .child("No active terminal")
                 .into_any_element()
         };
@@ -6250,18 +6817,6 @@ impl RemCmdApp {
                 blur_radius: px(4.0),
                 spread_radius: px(-2.0),
             }])
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .h(px(36.0))
-                    .px_1()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(self.render_sidebar_icon(IconName::Folder, 17.0))
-                    .child("SFTP"),
-            )
             .child(content)
     }
 
@@ -8079,6 +8634,33 @@ fn format_remote_size(bytes: u64) -> String {
     }
 }
 
+fn format_byte_rate(bytes_per_second: f64) -> String {
+    let bytes = bytes_per_second.max(0.0) as u64;
+    format!("{}/s", format_remote_size(bytes))
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = seconds % 86_400 / 3_600;
+    let minutes = seconds % 3_600 / 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn percent(used: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        used.min(total) as f32 / total as f32 * 100.0
+    }
+}
+
 fn titlebar_active_tab_basis(track_width: f32, tab_count: usize, expanded_width: f32) -> f32 {
     if tab_count <= 1 {
         return 0.0;
@@ -8349,6 +8931,32 @@ mod tests {
     }
 
     #[test]
+    fn performance_state_calculates_cpu_and_network_deltas() {
+        let started = Instant::now();
+        let mut performance = ServerPerformanceState::default();
+        performance.update(performance_snapshot(1_000, 700, 1_000, 2_000), started);
+        performance.update(
+            performance_snapshot(1_200, 750, 5_000, 8_000),
+            started + Duration::from_secs(2),
+        );
+
+        assert_eq!(performance.cpu_usage, Some(75.0));
+        assert_eq!(performance.network_rx_per_second, Some(2_000.0));
+        assert_eq!(performance.network_tx_per_second, Some(3_000.0));
+        assert!(!performance.loading);
+        assert!(performance.error.is_none());
+    }
+
+    #[test]
+    fn performance_formatting_uses_compact_units() {
+        assert_eq!(format_byte_rate(1536.0), "1.5 KB/s");
+        assert_eq!(format_uptime(61), "1m");
+        assert_eq!(format_uptime(90_061), "1d 1h 1m");
+        assert_eq!(percent(3, 4), 75.0);
+        assert_eq!(percent(1, 0), 0.0);
+    }
+
+    #[test]
     fn center_and_sidebar_sftp_requests_are_isolated() {
         let mut center = SftpBrowserState::default();
         let mut sidebar = SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
@@ -8418,6 +9026,30 @@ mod tests {
             "/home/test/notes.txt"
         );
         assert_eq!(remote_file_name("/home/test/notes.txt"), "notes.txt");
+    }
+
+    fn performance_snapshot(
+        cpu_total: u64,
+        cpu_idle: u64,
+        network_rx_bytes: u64,
+        network_tx_bytes: u64,
+    ) -> ServerPerformanceSnapshot {
+        ServerPerformanceSnapshot {
+            hostname: "demo".into(),
+            cpu_total,
+            cpu_idle,
+            cpu_count: 4,
+            memory_total_bytes: 8 * 1024 * 1024 * 1024,
+            memory_available_bytes: 4 * 1024 * 1024 * 1024,
+            load_one_milli: 100,
+            load_five_milli: 200,
+            load_fifteen_milli: 300,
+            network_rx_bytes,
+            network_tx_bytes,
+            disk_total_bytes: Some(100 * 1024 * 1024 * 1024),
+            disk_available_bytes: Some(50 * 1024 * 1024 * 1024),
+            uptime_seconds: 3_600,
+        }
     }
 
     #[test]

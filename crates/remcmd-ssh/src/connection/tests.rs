@@ -46,6 +46,9 @@ fn connection_handle_forwards_commands() {
         .cancel_transfer(11)
         .expect("transfer cancellation should be sent");
     handle
+        .set_performance_monitoring(true)
+        .expect("performance monitoring should be sent");
+    handle
         .trust_host_key()
         .expect("host key trust should be sent");
     handle
@@ -110,6 +113,10 @@ fn connection_handle_forwards_commands() {
             .try_recv()
             .expect("transfer cancellation command"),
         ConnectionCommand::CancelTransfer { transfer_id: 11 }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("performance command"),
+        ConnectionCommand::SetPerformanceMonitoring(true)
     );
     assert_eq!(
         host_key_decision_rx.try_recv().expect("trust decision"),
