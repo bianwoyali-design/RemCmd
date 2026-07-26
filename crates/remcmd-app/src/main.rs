@@ -4944,10 +4944,23 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(width))
             .h(px(TITLEBAR_HEIGHT))
             .px_3()
+            .overflow_hidden()
             .child(tabs)
+            .with_animation(
+                SharedString::from(format!(
+                    "right-sidebar-titlebar-{}",
+                    self.right_sidebar_transition_id
+                )),
+                Animation::new(if self.right_sidebar_transition_id == 0 {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(180)
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| this.w(px(width * delta)).opacity(delta),
+            )
     }
 
     fn terminal_tab_title(&self, tab: &TerminalTab) -> String {
