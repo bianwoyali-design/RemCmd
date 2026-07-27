@@ -113,7 +113,7 @@ impl IconName {
             Self::ArrowLeft => r#"<path d="M15.25 3.5 7.75 12l7.5 8.5"/>"#,
             Self::ArrowUp => r#"<path d="m3.5 15.25 8.5-7.5 8.5 7.5"/>"#,
             Self::Cancel => r#"<path d="m5.5 5.5 13 13"/><path d="m18.5 5.5-13 13"/>"#,
-            Self::Check => r#"<path d="m4.75 12.5 4.5 4.5 10-10"/>"#,
+            Self::Check => r#"<path d="m4.75 12.5 4.5 4.5 10-10" stroke-width="1.9"/>"#,
             Self::ClosePane => {
                 r#"<rect x="2" y="4" width="20" height="16" rx="3"/><path d="M15 4v16"/><path d="m17.2 9.7 2.6 2.6m0-2.6-2.6 2.6" stroke-width="0.9"/>"#
             }
@@ -150,7 +150,7 @@ impl IconName {
                 r#"<path d="M3 18.5h18"/><path d="m4.5 15 4-4 3 2.75 5.25-7.25 2.75 2.25"/><circle cx="4.5" cy="15" r="0.75" fill="currentColor" stroke="none"/><circle cx="8.5" cy="11" r="0.75" fill="currentColor" stroke="none"/><circle cx="11.5" cy="13.75" r="0.75" fill="currentColor" stroke="none"/><circle cx="16.75" cy="6.5" r="0.75" fill="currentColor" stroke="none"/><circle cx="19.5" cy="8.75" r="0.75" fill="currentColor" stroke="none"/>"#
             }
             Self::Picker => {
-                r#"<path d="m8.25 9.75 3.75-3.5 3.75 3.5"/><path d="m8.25 14.25 3.75 3.5 3.75-3.5"/>"#
+                r#"<path d="m8.25 9.75 3.75-3.5 3.75 3.5" stroke-width="1.9"/><path d="m8.25 14.25 3.75 3.5 3.75-3.5" stroke-width="1.9"/>"#
             }
             Self::Reconnect => {
                 r#"<path d="M19.5 8.25A8.25 8.25 0 1 0 19.75 15.25"/><path d="M19.5 3.75v4.5H15"/>"#
