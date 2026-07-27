@@ -9146,67 +9146,62 @@ impl RemCmdApp {
             }));
         }
 
-        let mut browser =
-            div()
-                .id(SharedString::from(format!("sftp_browser_{element_suffix}")))
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .mt_4()
-                .overflow_hidden()
-                .rounded_md()
-                .border_1()
-                .border_color(self.theme.border)
-                .bg(self.theme.panel_bg)
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        if let Some(session) = this.session_mut(session_id) {
-                            let browser = session.sftp_browser_mut(placement);
-                            browser.selected_paths.clear();
-                            browser.selection_anchor = None;
-                        }
-                        this.sftp_context_menu = Some(SftpContextMenu {
-                            session_id,
-                            placement,
-                            position: event.position,
-                        });
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_1()
-                        .h(px(40.0))
-                        .px_2()
-                        .border_b_1()
-                        .border_color(self.theme.border)
-                        .child(parent_button)
-                        .child(refresh_button)
-                        .child(upload_button)
-                        .child(download_button)
-                        .child(delete_button)
-                        .child(
-                            div().flex_1().min_w(px(0.0)).ml_2().child(
-                                self.render_sftp_breadcrumbs(session_id, placement, &path, cx),
-                            ),
+        let mut browser = div()
+            .id(SharedString::from(format!("sftp_browser_{element_suffix}")))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .mt_4()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.panel_bg)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(session) = this.session_mut(session_id) {
+                        let browser = session.sftp_browser_mut(placement);
+                        browser.selected_paths.clear();
+                        browser.selection_anchor = None;
+                    }
+                    this.sftp_context_menu = Some(SftpContextMenu {
+                        session_id,
+                        placement,
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .h(px(40.0))
+                    .px_2()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(parent_button)
+                    .child(refresh_button)
+                    .child(upload_button)
+                    .child(download_button)
+                    .child(delete_button)
+                    .child(div().flex_1())
+                    .when(loading && loaded, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(self.theme.text_muted)
+                                .child("Loading..."),
                         )
-                        .when(loading && loaded, |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .text_sm()
-                                    .text_color(self.theme.text_muted)
-                                    .child("Loading..."),
-                            )
-                        }),
-                );
+                    }),
+            );
 
         if let Some(error) = error {
             browser = browser.child(
@@ -9226,6 +9221,20 @@ impl RemCmdApp {
         browser
             .child(list)
             .child(self.render_sftp_transfer_queue(session_id, placement, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(32.0))
+                    .min_w(px(0.0))
+                    .px_2()
+                    .overflow_hidden()
+                    .border_t_1()
+                    .border_color(self.theme.border)
+                    .bg(self.theme.surface_bg)
+                    .child(self.render_sftp_breadcrumbs(session_id, placement, &path, cx)),
+            )
             .into_any_element()
     }
 
