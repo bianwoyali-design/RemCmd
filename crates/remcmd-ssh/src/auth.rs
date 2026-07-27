@@ -7,6 +7,9 @@ use secrecy::SecretString;
 /// This type intentionally does not implement Serialize, Deserialize,
 /// Debug, or Clone to reduce accidental credential exposure.
 pub enum AuthMethod {
+    /// Request SSH access without a password, key, or agent.
+    None,
+
     /// Authenticate with the account password.
     Password { password: SecretString },
 

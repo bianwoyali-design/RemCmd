@@ -457,7 +457,7 @@ async fn shell_integration_preserves_native_shell_and_stays_hidden() {
     {
         let state = state.lock().expect("test state lock");
         assert!(state.shell_requested);
-        assert_eq!(state.pty_modes, vec![(Pty::ECHO, 0)]);
+        assert!(state.pty_modes.is_empty());
         let integration_input = String::from_utf8_lossy(&state.integration_input);
         assert!(integration_input.contains("7;file://%s"));
         assert!(!integration_input.contains("remcmd-shell-start"));

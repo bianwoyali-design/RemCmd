@@ -2,17 +2,26 @@
 ///
 /// The shell-specific branches preserve prompt variables and startup files so
 /// prompt engines such as Starship keep their native initialization order. An
-/// unsupported shell may reject this first line, but the independent ready line
-/// still restores echo and leaves the terminal usable without cwd events.
+/// unsupported POSIX-compatible shell skips both branches and continues to the
+/// independent ready line without requiring utilities such as `stty`.
 pub(crate) fn install_command(ready_command: &str) -> String {
+    let bash_command = shell_single_quote(BASH_INSTALL_COMMAND);
+    let zsh_command = shell_single_quote(ZSH_INSTALL_COMMAND);
+    let ash_command = shell_single_quote(ASH_INSTALL_COMMAND);
     format!(
-        " stty -echo; if [[ -n ${{BASH_VERSION-}} ]]; then {BASH_INSTALL_COMMAND}; elif [[ -n ${{ZSH_VERSION-}} ]]; then {ZSH_INSTALL_COMMAND}; fi\r {ready_command}"
+        " if [ -n \"${{BASH_VERSION-}}\" ]; then eval {bash_command}; fi\r if [ -n \"${{ZSH_VERSION-}}\" ]; then eval {zsh_command}; fi\r case \"${{0##*/}}\" in *ash) eval {ash_command};; esac\r {ready_command}"
     )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 const BASH_INSTALL_COMMAND: &str = r#"__remcmd_report_cwd(){ if [[ ${__remcmd_last_cwd-} != "$PWD" ]]; then __remcmd_last_cwd=$PWD; printf '\033]7;file://%s\007' "$PWD"; fi; }; if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then PROMPT_COMMAND+=(__remcmd_report_cwd); else PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__remcmd_report_cwd"; fi; __remcmd_last_cwd=$PWD"#;
 
 const ZSH_INSTALL_COMMAND: &str = r#"autoload -Uz add-zsh-hook; __remcmd_report_cwd(){ if [[ ${__remcmd_last_cwd-} != "$PWD" ]]; then __remcmd_last_cwd=$PWD; builtin printf '\033]7;file://%s\007' "$PWD"; fi; }; add-zsh-hook chpwd __remcmd_report_cwd; add-zsh-hook precmd __remcmd_report_cwd; __remcmd_last_cwd=$PWD"#;
+
+const ASH_INSTALL_COMMAND: &str = r#"__remcmd_report_cwd(){ if [ "${__remcmd_last_cwd-}" != "$PWD" ]; then __remcmd_last_cwd=$PWD; printf '\033]7;file://%s\007' "$PWD"; fi; }; cd(){ command cd "$@" && __remcmd_report_cwd; }; __remcmd_last_cwd=$PWD"#;
 
 #[cfg(test)]
 mod tests {
@@ -22,7 +31,11 @@ mod tests {
 
     #[test]
     fn hooks_report_cwd_without_replacing_prompt_or_startup_files() {
-        for command in [BASH_INSTALL_COMMAND, ZSH_INSTALL_COMMAND] {
+        for command in [
+            BASH_INSTALL_COMMAND,
+            ZSH_INSTALL_COMMAND,
+            ASH_INSTALL_COMMAND,
+        ] {
             assert!(command.contains("7;file://%s"));
             assert!(!command.contains("PS1"));
             assert!(!command.contains("PROMPT="));
@@ -36,7 +49,7 @@ mod tests {
 
     #[test]
     fn generated_hooks_pass_native_syntax_checks() {
-        let combined = install_command("stty echo").replace('\r', "\n");
+        let combined = install_command(":").replace('\r', "\n");
         assert_shell_syntax("/bin/bash", BASH_INSTALL_COMMAND);
         assert_shell_syntax("/bin/bash", &combined);
 
@@ -44,6 +57,7 @@ mod tests {
             assert_shell_syntax("/bin/zsh", ZSH_INSTALL_COMMAND);
             assert_shell_syntax("/bin/zsh", &combined);
         }
+        assert_shell_syntax("/bin/sh", ASH_INSTALL_COMMAND);
     }
 
     #[test]
@@ -55,6 +69,7 @@ mod tests {
             let zsh_script = format!("{ZSH_INSTALL_COMMAND}; cd /tmp");
             assert_cwd_report("/bin/zsh", &zsh_script);
         }
+        assert_cwd_report("/bin/sh", &format!("{ASH_INSTALL_COMMAND}; cd /tmp"));
     }
 
     #[test]
@@ -70,6 +85,39 @@ mod tests {
             assert_install_command("/bin/zsh", &command);
             assert_cwd_report("/bin/zsh", &format!("{command}; cd /tmp"));
         }
+    }
+
+    #[test]
+    fn generated_install_command_dispatches_to_ash_hook() {
+        let command = install_command(":").replace('\r', "\n");
+        let script = format!("unset BASH_VERSION ZSH_VERSION; {command}; cd /tmp");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script, "ash"])
+            .output()
+            .expect("POSIX shell should start");
+
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"7;file:///tmp".len())
+                .any(|window| window == b"7;file:///tmp")
+        );
+    }
+
+    #[test]
+    fn unsupported_posix_shell_reaches_ready_line_without_stty() {
+        let command = install_command("printf 'remcmd-ready'").replace('\r', "\n");
+        let script = format!("unset BASH_VERSION ZSH_VERSION; {command}");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script, "sh"])
+            .output()
+            .expect("POSIX shell should start");
+
+        assert!(output.status.success());
+        assert!(output.stdout.ends_with(b"remcmd-ready"));
+        assert!(!command.contains("stty"));
+        assert!(command.starts_with(" if ["));
     }
 
     fn assert_shell_syntax(shell: &str, script: &str) {

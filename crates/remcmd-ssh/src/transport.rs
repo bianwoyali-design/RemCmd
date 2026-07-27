@@ -29,6 +29,7 @@ const SHELL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
+const SFTP_AVAILABILITY_COMMAND: &str = r#"if command -v sftp-server >/dev/null 2>&1 || [ -x /usr/libexec/openssh/sftp-server ] || [ -x /usr/libexec/sftp-server ] || [ -x /usr/lib/openssh/sftp-server ] || [ -x /usr/lib/ssh/sftp-server ] || [ -x /usr/lib64/ssh/sftp-server ]; then printf 'available\n'; elif grep -Eqs '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+internal-sftp([[:space:]]|$)' /etc/ssh/sshd_config 2>/dev/null || grep -ERqs '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+internal-sftp([[:space:]]|$)' /etc/ssh/sshd_config.d 2>/dev/null; then printf 'available\n'; else printf 'unavailable\n'; fi"#;
 
 /// Receives asynchronous events from one russh client connection.
 struct ClientHandler {
@@ -241,6 +242,21 @@ impl SshTransport {
         timeout: Duration,
     ) -> Result<(), SshError> {
         match auth {
+            AuthMethod::None => {
+                let authentication = handle.authenticate_none(username);
+                let result = tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+                    .map_err(SshError::from)?;
+
+                Self::validate_authentication_result(result, username)
+            }
+
             AuthMethod::Password { password } => {
                 // Reading SecretString requires an explicit ExposeSecret call.
                 let authentication =
@@ -551,6 +567,11 @@ impl SshTransport {
         .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening SFTP timed out"))?
     }
 
+    pub(crate) async fn check_sftp_availability(&self) -> Result<bool, SshError> {
+        let output = self.execute(SFTP_AVAILABILITY_COMMAND).await?;
+        parse_sftp_availability(&output)
+    }
+
     pub(crate) async fn execute(&self, command: &str) -> Result<Vec<u8>, SshError> {
         tokio::time::timeout(EXEC_TIMEOUT, async {
             let mut channel = self
@@ -573,7 +594,7 @@ impl SshTransport {
                     ChannelMsg::Failure => {
                         return Err(SshError::new(
                             SshErrorKind::Protocol,
-                            "remote server rejected performance command",
+                            "remote server rejected command",
                         ));
                     }
                     ChannelMsg::Data { data } => {
@@ -596,7 +617,7 @@ impl SshTransport {
             if !accepted {
                 return Err(SshError::new(
                     SshErrorKind::Protocol,
-                    "remote server did not accept performance command",
+                    "remote server did not accept command",
                 ));
             }
             if exit_status.unwrap_or(0) != 0 {
@@ -604,7 +625,7 @@ impl SshTransport {
                 return Err(SshError::new(
                     SshErrorKind::Protocol,
                     if message.is_empty() {
-                        "remote performance command failed".to_owned()
+                        "remote command failed".to_owned()
                     } else {
                         message
                     },
@@ -614,7 +635,7 @@ impl SshTransport {
             Ok(stdout)
         })
         .await
-        .map_err(|_| SshError::new(SshErrorKind::Timeout, "performance sampling timed out"))?
+        .map_err(|_| SshError::new(SshErrorKind::Timeout, "remote command timed out"))?
     }
 
     /// Sends a protocol-level disconnect request to the server.
@@ -647,6 +668,17 @@ fn append_command_output(output: &mut Vec<u8>, data: &[u8]) -> Result<(), SshErr
     }
     output.extend_from_slice(data);
     Ok(())
+}
+
+fn parse_sftp_availability(output: &[u8]) -> Result<bool, SshError> {
+    match output {
+        b"available\n" => Ok(true),
+        b"unavailable\n" => Ok(false),
+        _ => Err(SshError::new(
+            SshErrorKind::Protocol,
+            "remote server returned an invalid SFTP availability response",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -871,6 +903,30 @@ mod tests {
 
         assert_eq!(error.kind(), SshErrorKind::Authentication);
         assert_eq!(error.message(), "authentication failed for user tester");
+    }
+
+    #[test]
+    fn parses_sftp_availability_probe_responses() {
+        assert!(parse_sftp_availability(b"available\n").unwrap());
+        assert!(!parse_sftp_availability(b"unavailable\n").unwrap());
+
+        let error = parse_sftp_availability(b"unexpected\n").unwrap_err();
+        assert_eq!(error.kind(), SshErrorKind::Protocol);
+    }
+
+    #[test]
+    fn sftp_probe_covers_common_server_layouts() {
+        for path in [
+            "/usr/libexec/openssh/sftp-server",
+            "/usr/libexec/sftp-server",
+            "/usr/lib/openssh/sftp-server",
+            "/usr/lib/ssh/sftp-server",
+            "/usr/lib64/ssh/sftp-server",
+        ] {
+            assert!(SFTP_AVAILABILITY_COMMAND.contains(path));
+        }
+        assert!(SFTP_AVAILABILITY_COMMAND.contains("/etc/ssh/sshd_config.d"));
+        assert!(!SFTP_AVAILABILITY_COMMAND.contains("sshd_config.d/*.conf"));
     }
 
     #[tokio::test]

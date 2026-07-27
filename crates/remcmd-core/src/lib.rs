@@ -110,6 +110,8 @@ pub enum AuthConfig {
     #[default]
     Password,
 
+    None,
+
     PrivateKey {
         path: PathBuf,
     },
@@ -202,5 +204,17 @@ mod tests {
             Some(20 * 1024 * 1024)
         );
         assert_eq!(TransferSettings::default().bytes_per_second(), None);
+    }
+
+    #[test]
+    fn no_password_authentication_survives_json_round_trip() {
+        let mut profile = ConnectionProfile::new("server-1", "Server", "host", 22, "user");
+        profile.auth = AuthConfig::None;
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let decoded: ConnectionProfile = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.auth, AuthConfig::None);
+        assert!(json.contains(r#""type":"none""#));
     }
 }
