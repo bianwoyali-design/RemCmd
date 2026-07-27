@@ -8238,6 +8238,7 @@ impl RemCmdApp {
 
         let mut new_file = self.render_sftp_context_menu_item(
             "sftp-context-new-file",
+            IconName::File,
             "New File",
             IconTone::Default,
             connected,
@@ -8255,6 +8256,7 @@ impl RemCmdApp {
         }
         let mut new_folder = self.render_sftp_context_menu_item(
             "sftp-context-new-folder",
+            IconName::Folder,
             "New Folder",
             IconTone::Default,
             connected,
@@ -8272,6 +8274,7 @@ impl RemCmdApp {
         }
         let mut copy_path = self.render_sftp_context_menu_item(
             "sftp-context-copy-path",
+            IconName::Copy,
             "Copy Path",
             IconTone::Default,
             !entries.is_empty(),
@@ -8283,6 +8286,7 @@ impl RemCmdApp {
         }
         let mut view = self.render_sftp_context_menu_item(
             "sftp-context-view",
+            IconName::View,
             "View",
             IconTone::Default,
             single_file.is_some(),
@@ -8294,6 +8298,7 @@ impl RemCmdApp {
         }
         let mut edit = self.render_sftp_context_menu_item(
             "sftp-context-edit",
+            IconName::Edit,
             "Edit",
             IconTone::Default,
             single_file.is_some(),
@@ -8305,6 +8310,7 @@ impl RemCmdApp {
         }
         let mut download = self.render_sftp_context_menu_item(
             "sftp-context-download",
+            IconName::Download,
             "Download",
             IconTone::Default,
             can_download,
@@ -8316,6 +8322,7 @@ impl RemCmdApp {
         }
         let mut delete = self.render_sftp_context_menu_item(
             "sftp-context-delete",
+            IconName::Delete,
             "Delete",
             IconTone::Danger,
             connected && !entries.is_empty(),
@@ -8361,33 +8368,103 @@ impl RemCmdApp {
     fn render_sftp_context_menu_item(
         &self,
         id: &'static str,
+        icon_name: IconName,
         label: &'static str,
         tone: IconTone,
         enabled: bool,
     ) -> gpui::Stateful<gpui::Div> {
-        let hover = self.theme.accent;
-        let pressed = self.theme.accent_hover;
+        let (hover, pressed) = match tone {
+            IconTone::Danger => (self.theme.danger, self.theme.danger_hover),
+            IconTone::Accent | IconTone::Default => (self.theme.accent, self.theme.accent_hover),
+        };
         let on_accent = self.theme.on_accent;
+        let base_color = match tone {
+            IconTone::Danger => self.theme.danger,
+            IconTone::Accent => self.theme.accent,
+            IconTone::Default => self.theme.text_primary,
+        };
+        let hover_group = SharedString::from(format!("{id}-hover"));
         div()
             .id(id)
             .flex()
             .items_center()
+            .gap_2()
             .h(px(28.0))
             .px_2()
             .rounded_md()
             .text_sm()
-            .text_color(match tone {
-                IconTone::Danger => self.theme.danger,
-                IconTone::Accent => self.theme.accent,
-                IconTone::Default => self.theme.text_primary,
-            })
             .when(enabled, |this| {
-                this.cursor_pointer()
-                    .hover(move |this| this.bg(hover).text_color(on_accent))
-                    .active(move |this| this.bg(pressed).text_color(on_accent))
+                this.group(hover_group.clone())
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .active(move |this| this.bg(pressed))
             })
             .when(!enabled, |this| this.opacity(0.45))
-            .child(label)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .relative()
+                    .items_center()
+                    .justify_center()
+                    .size(px(16.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size_full()
+                            .when(enabled, |this| {
+                                this.group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                            })
+                            .child(icon_with_color(icon_name, base_color, 14.0)),
+                    )
+                    .when(enabled, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size_full()
+                                .opacity(0.0)
+                                .group_hover(hover_group.clone(), |style| style.opacity(1.0))
+                                .child(icon_with_color(icon_name, on_accent, 14.0)),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .h_full()
+                    .child(
+                        div()
+                            .absolute()
+                            .flex()
+                            .items_center()
+                            .size_full()
+                            .text_color(base_color)
+                            .when(enabled, |this| {
+                                this.group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                            })
+                            .child(label),
+                    )
+                    .when(enabled, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .flex()
+                                .items_center()
+                                .size_full()
+                                .opacity(0.0)
+                                .text_color(on_accent)
+                                .group_hover(hover_group, |style| style.opacity(1.0))
+                                .child(label),
+                        )
+                    }),
+            )
     }
 
     fn render_sftp_context_menu_separator(&self) -> gpui::Div {
