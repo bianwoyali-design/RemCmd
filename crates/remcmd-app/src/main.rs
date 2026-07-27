@@ -209,6 +209,7 @@ struct TerminalSession {
     terminal_scroll_accumulator: f32,
     terminal_resize_task: Option<Task<()>>,
     connection_credential: Option<ConnectionCredential>,
+    sftp_availability: SftpAvailability,
     sftp: SftpBrowserState,
     sidebar_sftp: SftpBrowserState,
     transfers: SftpTransferQueue,
@@ -234,6 +235,7 @@ impl TerminalSession {
             terminal_scroll_accumulator: 0.0,
             terminal_resize_task: None,
             connection_credential: None,
+            sftp_availability: SftpAvailability::Checking,
             sftp: SftpBrowserState::default(),
             sidebar_sftp: SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START),
             transfers: SftpTransferQueue::default(),
@@ -297,7 +299,7 @@ impl Render for CommandTooltip {
             .rounded_md()
             .border_1()
             .border_color(self.theme.border)
-            .bg(self.theme.modal_bg)
+            .bg(self.theme.sidebar_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(3.0)),
@@ -530,6 +532,14 @@ enum TerminalTabView {
 enum SftpBrowserPlacement {
     Center,
     Sidebar,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum SftpAvailability {
+    #[default]
+    Checking,
+    Available,
+    Unavailable(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2035,7 +2045,12 @@ impl RemCmdApp {
         placement: SftpBrowserPlacement,
         cx: &mut Context<Self>,
     ) {
-        let Some((path, needs_load)) = self.session(session_id).map(|session| {
+        let Some((path, needs_load)) = self.session(session_id).and_then(|session| {
+            if session.connection_state == SessionState::Connected
+                && session.sftp_availability != SftpAvailability::Available
+            {
+                return None;
+            }
             let path = session
                 .terminal
                 .as_ref()
@@ -2045,7 +2060,7 @@ impl RemCmdApp {
             let editor_closed =
                 placement == SftpBrowserPlacement::Sidebar || session.sftp.file.is_none();
             let needs_load = editor_closed && browser.needs_request(&path);
-            (path, needs_load)
+            Some((path, needs_load))
         }) else {
             return;
         };
@@ -2123,6 +2138,18 @@ impl RemCmdApp {
         path: String,
         cx: &mut Context<Self>,
     ) {
+        let capability_blocks_request = self.session(session_id).is_some_and(|session| {
+            session.connection_state == SessionState::Connected
+                && session.sftp_availability != SftpAvailability::Available
+        });
+        if capability_blocks_request {
+            if let Some(session) = self.session_mut(session_id) {
+                session.sftp_browser_mut(placement).loading = false;
+            }
+            cx.notify();
+            return;
+        }
+
         let handle = self.session(session_id).and_then(|session| {
             (session.connection_state == SessionState::Connected)
                 .then(|| session.connection_handle.clone())
@@ -4341,6 +4368,7 @@ impl RemCmdApp {
         session.sftp = SftpBrowserState::default();
         session.sidebar_sftp =
             SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
+        session.sftp_availability = SftpAvailability::Checking;
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -5234,6 +5262,7 @@ impl RemCmdApp {
                         session.terminal_resize_task = None;
                         session.connection_handle = None;
                         session.connection_credential = None;
+                        session.sftp_availability = SftpAvailability::Checking;
                         session.sftp.stop_loading();
                         session.sidebar_sftp.stop_loading();
                         session.transfers.fail_pending("SSH connection closed");
@@ -5430,6 +5459,32 @@ impl RemCmdApp {
                     session.transfers.mark_cancelled(transfer_id);
                 }
                 self.start_queued_sftp_transfers(cx);
+                true
+            }
+            ConnectionEvent::SftpAvailabilityChanged { available, message } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.sftp_availability = if available {
+                        SftpAvailability::Available
+                    } else {
+                        SftpAvailability::Unavailable(
+                            message.unwrap_or_else(|| "SFTP is unavailable on this server".into()),
+                        )
+                    };
+                    if !available {
+                        session.sftp.stop_loading();
+                        session.sidebar_sftp.stop_loading();
+                    }
+                }
+
+                if available && self.active_session_id == Some(session_id) {
+                    if self.right_sidebar_open && self.right_sidebar_view == RightSidebarView::Sftp
+                    {
+                        self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
+                    }
+                    if self.active_tab_view() == TerminalTabView::Files {
+                        self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Center, cx);
+                    }
+                }
                 true
             }
             ConnectionEvent::SftpFailed {
@@ -6898,7 +6953,7 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border)
-            .bg(self.theme.modal_bg)
+            .bg(self.theme.sidebar_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(8.0)),
@@ -7054,7 +7109,7 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border)
-            .bg(self.theme.modal_bg)
+            .bg(self.theme.sidebar_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(8.0)),
@@ -7403,13 +7458,8 @@ impl RemCmdApp {
                     })),
             );
 
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
+        self.glass_sidebar_surface()
             .w(px(width))
-            .h_full()
-            .bg(self.theme.sidebar_bg)
             .px_3()
             .pb_4()
             .pt(px(TITLEBAR_HEIGHT))
@@ -7472,6 +7522,16 @@ impl RemCmdApp {
             )
             .child(connection_tree)
             .child(settings_footer)
+    }
+
+    fn glass_sidebar_surface(&self) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .min_w(px(0.0))
+            .h_full()
+            .bg(self.theme.sidebar_bg)
     }
 
     fn render_sidebar_resize_handle(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8043,26 +8103,12 @@ impl RemCmdApp {
                 .into_any_element()
         };
 
-        div()
+        self.glass_sidebar_surface()
             .id("right_sidebar")
-            .flex()
-            .flex_col()
-            .flex_none()
             .w(px(width))
-            .min_w(px(0.0))
-            .h_full()
             .pt(px(TITLEBAR_HEIGHT))
             .px_3()
             .pb_3()
-            .border_l_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(-1.0), px(0.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .child(content)
     }
 
@@ -8250,7 +8296,13 @@ impl RemCmdApp {
     }
 
     fn detail_panel_shell(&self) -> gpui::Div {
-        div()
+        let mut shadows = vec![BoxShadow {
+            color: self.theme.shadow,
+            offset: point(px(-1.0), px(0.0)),
+            blur_radius: px(4.0),
+            spread_radius: px(-2.0),
+        }];
+        let mut panel = div()
             .flex()
             .flex_col()
             .flex_1()
@@ -8261,13 +8313,19 @@ impl RemCmdApp {
             .pt(px(TITLEBAR_HEIGHT))
             .bg(self.theme.panel_bg)
             .border_l_1()
-            .border_color(self.theme.border_strong)
-            .shadow(vec![BoxShadow {
+            .border_color(self.theme.border_strong);
+
+        if self.right_sidebar_open {
+            panel = panel.border_r_1();
+            shadows.push(BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(-1.0), px(0.0)),
+                offset: point(px(1.0), px(0.0)),
                 blur_radius: px(4.0),
                 spread_radius: px(-2.0),
-            }])
+            });
+        }
+
+        panel.shadow(shadows)
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -8423,7 +8481,7 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.modal_bg)
+            .bg(self.theme.sidebar_bg)
             .text_sm()
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
@@ -8808,7 +8866,7 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.context_menu_bg)
+            .bg(self.theme.sidebar_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(1.0)),
@@ -8991,7 +9049,7 @@ impl RemCmdApp {
                     .rounded_lg()
                     .border_1()
                     .border_color(self.theme.border_strong)
-                    .bg(self.theme.modal_bg)
+                    .bg(self.theme.sidebar_bg)
                     .shadow(vec![BoxShadow {
                         color: self.theme.shadow,
                         offset: point(px(0.0), px(6.0)),
@@ -9031,6 +9089,20 @@ impl RemCmdApp {
         };
         if placement == SftpBrowserPlacement::Center && session.sftp.file.is_some() {
             return self.render_sftp_file(session_id, cx);
+        }
+        if session.connection_state == SessionState::Connected {
+            match &session.sftp_availability {
+                SftpAvailability::Checking => {
+                    return self.render_sftp_availability_hint(
+                        "Checking SFTP availability...",
+                        "Remote files will appear when the server check completes.",
+                    );
+                }
+                SftpAvailability::Unavailable(message) => {
+                    return self.render_sftp_availability_hint("SFTP unavailable", message.clone());
+                }
+                SftpAvailability::Available => {}
+            }
         }
         let browser_state = session.sftp_browser(placement);
         let path = browser_state.path.clone();
@@ -9255,6 +9327,34 @@ impl RemCmdApp {
                     .border_color(self.theme.border)
                     .bg(self.theme.surface_bg)
                     .child(self.render_sftp_breadcrumbs(session_id, placement, &path, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_sftp_availability_hint(
+        &self,
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_4()
+            .text_center()
+            .child(self.render_sidebar_icon(IconName::Folder, 22.0))
+            .child(div().font_weight(FontWeight::MEDIUM).child(title.into()))
+            .child(
+                div()
+                    .max_w(px(420.0))
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child(message.into()),
             )
             .into_any_element()
     }

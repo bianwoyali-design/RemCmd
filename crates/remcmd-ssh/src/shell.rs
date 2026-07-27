@@ -1,10 +1,10 @@
-use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty, client};
+use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client};
 
 use crate::{SshError, SshErrorKind, shell_integration};
 
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
 const INTEGRATION_READY_MARKER: &[u8] = b"\x1b]777;remcmd-shell-ready\x07";
-const INTEGRATION_READY_COMMAND: &str = "stty echo; printf '\\033]777;remcmd-shell-ready\\007'; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
+const INTEGRATION_READY_COMMAND: &str = "printf '\\033]777;remcmd-shell-ready\\007'; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
 
 /// Dimensions reported to the remote pseudo-terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,12 +93,6 @@ impl SshShell {
             .await
             .map_err(SshError::from)?;
 
-        let terminal_modes = if install_cwd_hook {
-            vec![(Pty::ECHO, 0)]
-        } else {
-            Vec::new()
-        };
-
         channel
             .request_pty(
                 true,
@@ -107,7 +101,7 @@ impl SshShell {
                 size.rows,
                 size.pixel_width,
                 size.pixel_height,
-                &terminal_modes,
+                &[],
             )
             .await
             .map_err(SshError::from)?;

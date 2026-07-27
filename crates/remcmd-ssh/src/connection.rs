@@ -165,6 +165,12 @@ pub enum ConnectionEvent {
         error: SshError,
     },
 
+    /// Reports whether the server exposes an SFTP subsystem before the UI uses it.
+    SftpAvailabilityChanged {
+        available: bool,
+        message: Option<String>,
+    },
+
     /// Reports one sample from the independent server performance channel.
     PerformanceSnapshot(ServerPerformanceSnapshot),
 
@@ -726,6 +732,9 @@ async fn run_connection(
     let transport = Arc::new(transport);
     let mut pending_command = None;
     let mut sftp_worker = None;
+    let mut sftp_available = None;
+    let mut sftp_probe_pending = true;
+    let mut sftp_probe = Box::pin(transport.check_sftp_availability());
     let mut performance_monitor = None;
 
     loop {
@@ -734,6 +743,33 @@ async fn run_connection(
         } else {
             tokio::select! {
                 command = commands.recv() => command,
+                availability = &mut sftp_probe, if sftp_probe_pending => {
+                    sftp_probe_pending = false;
+                    let (available, message) = match availability {
+                        Ok(true) => (true, None),
+                        Ok(false) => (
+                            false,
+                            Some("SFTP is not installed or configured on this server".into()),
+                        ),
+                        Err(error) => (
+                            false,
+                            Some(format!("Could not verify SFTP availability: {error}")),
+                        ),
+                    };
+                    sftp_available = Some(available);
+                    if events
+                        .send(ConnectionEvent::SftpAvailabilityChanged {
+                            available,
+                            message,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        close_resources(&transport, Some(&writer)).await;
+                        return;
+                    }
+                    continue;
+                }
                 shell_event = reader.next_event() => {
                     let is_closed = matches!(&shell_event, ShellEvent::Closed);
 
@@ -790,6 +826,30 @@ async fn run_connection(
                 }
             }
             Some(ConnectionCommand::ReadDirectory { request_id, path }) => {
+                if sftp_available != Some(true) {
+                    let error = SshError::new(
+                        SshErrorKind::Sftp,
+                        if sftp_probe_pending {
+                            "SFTP availability is still being checked"
+                        } else {
+                            "SFTP is unavailable on this server"
+                        },
+                    );
+                    if events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path,
+                            operation: SftpOperation::ReadDirectory,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        close_resources(&transport, Some(&writer)).await;
+                        return;
+                    }
+                    continue;
+                }
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(session) => {
