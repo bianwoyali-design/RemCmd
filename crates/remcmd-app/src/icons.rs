@@ -153,7 +153,7 @@ impl IconName {
                 r#"<path d="M6.5 2.5H14L19.5 8v12a1.5 1.5 0 0 1-1.5 1.5H6.5a2 2 0 0 1-2-2v-15a2 2 0 0 1 2-2Z"/><path d="M14 2.5V8h5.5"/><path d="M8 12h8m-8 3h8m-8 3h5.5" stroke-width="0.7"/>"#
             }
             Self::Folder => {
-                r#"<path d="M3 6.5h5.75L11 8.75h9.5a1.5 1.5 0 0 1 1.5 1.5V19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8.5a2 2 0 0 1 2-2Z"/><path d="M2 11.25h20" stroke-width="0.7"/>"#
+                r#"<path d="M3 5h5.75L11 7.25h9.5a1.5 1.5 0 0 1 1.5 1.5v8.75a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/><path d="M2 9.75h20" stroke-width="0.7"/>"#
             }
             Self::ForgetCredential => {
                 r#"<circle cx="7.5" cy="14" r="4"/><path d="M11.5 14h9m-3 0v3m-3-3v2"/><circle cx="18" cy="5.5" r="3"/><path d="M16.5 5.5h3" stroke-width="1.1"/>"#
