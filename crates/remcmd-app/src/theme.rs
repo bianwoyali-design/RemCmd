@@ -97,8 +97,8 @@ impl Theme {
             sidebar_bg: alpha(0x212121e8),
             panel_bg: opaque(0x181818),
             surface_bg: alpha(0xffffff12),
-            modal_bg: opaque(0x242424),
-            context_menu_bg: alpha(0x2b2b2bf2),
+            modal_bg: alpha(0x212121e8),
+            context_menu_bg: alpha(0x212121e8),
             overlay_bg: alpha(0x0000008f),
             transparent: alpha(0x00000000),
             shadow: alpha(0x00000042),
@@ -157,8 +157,8 @@ impl Theme {
             sidebar_bg: alpha(0xf1f1f3e8),
             panel_bg: opaque(0xffffff),
             surface_bg: alpha(0x00000008),
-            modal_bg: opaque(0xffffff),
-            context_menu_bg: alpha(0xf5f5f7f2),
+            modal_bg: alpha(0xf1f1f3e8),
+            context_menu_bg: alpha(0xf1f1f3e8),
             overlay_bg: alpha(0x00000059),
             transparent: alpha(0x00000000),
             shadow: alpha(0x00000024),
@@ -364,6 +364,14 @@ mod tests {
         for theme in [Theme::light(), Theme::dark()] {
             assert_eq!(theme.accent, expected);
             assert_eq!(theme.button_primary_bg, expected);
+        }
+    }
+
+    #[test]
+    fn glass_surfaces_share_the_sidebar_tint() {
+        for theme in [Theme::light(), Theme::dark()] {
+            assert_eq!(theme.modal_bg, theme.sidebar_bg);
+            assert_eq!(theme.context_menu_bg, theme.sidebar_bg);
         }
     }
 }

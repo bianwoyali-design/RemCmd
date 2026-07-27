@@ -241,6 +241,21 @@ impl SshTransport {
         timeout: Duration,
     ) -> Result<(), SshError> {
         match auth {
+            AuthMethod::None => {
+                let authentication = handle.authenticate_none(username);
+                let result = tokio::time::timeout(timeout, authentication)
+                    .await
+                    .map_err(|_| {
+                        SshError::new(
+                            SshErrorKind::Timeout,
+                            format!("authentication for user {username} timed out"),
+                        )
+                    })?
+                    .map_err(SshError::from)?;
+
+                Self::validate_authentication_result(result, username)
+            }
+
             AuthMethod::Password { password } => {
                 // Reading SecretString requires an explicit ExposeSecret call.
                 let authentication =

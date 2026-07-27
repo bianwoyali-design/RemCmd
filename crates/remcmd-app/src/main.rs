@@ -1534,6 +1534,7 @@ struct ProfileEditor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProfileAuthKind {
+    None,
     Password,
     PrivateKey,
     Agent,
@@ -1542,6 +1543,7 @@ enum ProfileAuthKind {
 impl ProfileAuthKind {
     fn from_config(config: &AuthConfig) -> Self {
         match config {
+            AuthConfig::None => Self::None,
             AuthConfig::Password => Self::Password,
             AuthConfig::PrivateKey { .. } => Self::PrivateKey,
             AuthConfig::Agent => Self::Agent,
@@ -1550,6 +1552,7 @@ impl ProfileAuthKind {
 
     fn into_config(self, private_key_path: &str) -> Result<AuthConfig, &'static str> {
         match self {
+            Self::None => Ok(AuthConfig::None),
             Self::Password => Ok(AuthConfig::Password),
             Self::PrivateKey => {
                 let path = private_key_path.trim();
@@ -3572,7 +3575,7 @@ impl RemCmdApp {
         let auth_kind = ProfileAuthKind::from_config(&profile.auth);
         let private_key_path = match &profile.auth {
             AuthConfig::PrivateKey { path } => path.to_string_lossy().into_owned(),
-            AuthConfig::Password | AuthConfig::Agent => String::new(),
+            AuthConfig::None | AuthConfig::Password | AuthConfig::Agent => String::new(),
         };
 
         self.editor = Some(ProfileEditor {
@@ -3716,7 +3719,7 @@ impl RemCmdApp {
         let kind = match editor.auth_kind {
             ProfileAuthKind::Password => CredentialKind::Password,
             ProfileAuthKind::PrivateKey => CredentialKind::PrivateKeyPassphrase,
-            ProfileAuthKind::Agent => return,
+            ProfileAuthKind::None | ProfileAuthKind::Agent => return,
         };
 
         self.form_error = None;
@@ -4159,6 +4162,11 @@ impl RemCmdApp {
         }
 
         match &profile.auth {
+            AuthConfig::None => {
+                if self.activate_session_in_window(session_id, window, cx) {
+                    self.start_connection(session_id, profile, AuthMethod::None, None, cx);
+                }
+            }
             AuthConfig::Password => {
                 self.lookup_credential_and_connect(
                     session_id,
@@ -4497,7 +4505,7 @@ impl RemCmdApp {
             .find(|profile| profile.id == profile_id)
             .and_then(|profile| match &profile.auth {
                 AuthConfig::PrivateKey { path } => Some(path.clone()),
-                AuthConfig::Password | AuthConfig::Agent => None,
+                AuthConfig::None | AuthConfig::Password | AuthConfig::Agent => None,
             })
         else {
             return false;
@@ -7365,9 +7373,13 @@ impl RemCmdApp {
             self.theme.list_hover_bg
         };
         let settings_footer = div()
+            .flex()
+            .flex_col()
             .flex_none()
+            .w(px(width))
+            .ml(px(-12.0))
             .mt_3()
-            .pt_3()
+            .pt_2()
             .border_t_1()
             .border_color(self.theme.border)
             .child(
@@ -7376,8 +7388,8 @@ impl RemCmdApp {
                     .flex()
                     .items_center()
                     .gap(px(10.0))
-                    .w_full()
-                    .h(px(34.0))
+                    .h(px(30.0))
+                    .mx_3()
                     .px_2()
                     .rounded_md()
                     .bg(settings_background)
@@ -8142,9 +8154,13 @@ impl RemCmdApp {
                                 self.render_private_key_row(editor.private_key_path.clone(), cx),
                             )
                         })
-                        .when(editor.auth_kind != ProfileAuthKind::Agent, |this| {
-                            this.child(self.render_saved_credential_row(cx))
-                        })
+                        .when(
+                            matches!(
+                                editor.auth_kind,
+                                ProfileAuthKind::Password | ProfileAuthKind::PrivateKey
+                            ),
+                            |this| this.child(self.render_saved_credential_row(cx)),
+                        )
                         .when_some(self.form_error.as_ref(), |this, error| {
                             this.child(
                                 div()
@@ -9133,6 +9149,11 @@ impl RemCmdApp {
             }));
         }
         let can_delete = connected && !loading && !selected_entries.is_empty();
+        let browser_background = if placement == SftpBrowserPlacement::Sidebar {
+            self.theme.transparent
+        } else {
+            self.theme.panel_bg
+        };
         let mut delete_button = self.render_icon_button(
             SharedString::from(format!("sftp_delete_selected_{element_suffix}")),
             IconName::Delete,
@@ -9158,7 +9179,7 @@ impl RemCmdApp {
             .rounded_md()
             .border_1()
             .border_color(self.theme.border)
-            .bg(self.theme.panel_bg)
+            .bg(browser_background)
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -10130,6 +10151,13 @@ impl RemCmdApp {
                     .border_1()
                     .border_color(self.theme.border)
                     .bg(self.theme.control_bg)
+                    .child(self.render_auth_method_option(
+                        "auth_none",
+                        "No Password",
+                        ProfileAuthKind::None,
+                        selected,
+                        cx,
+                    ))
                     .child(self.render_auth_method_option(
                         "auth_password",
                         "Password",
@@ -11546,6 +11574,10 @@ mod tests {
     #[test]
     fn profile_auth_kind_reflects_saved_configuration() {
         assert_eq!(
+            ProfileAuthKind::from_config(&AuthConfig::None),
+            ProfileAuthKind::None
+        );
+        assert_eq!(
             ProfileAuthKind::from_config(&AuthConfig::Password),
             ProfileAuthKind::Password
         );
@@ -11581,6 +11613,10 @@ mod tests {
 
     #[test]
     fn password_and_agent_authentication_do_not_use_the_key_path() {
+        assert_eq!(
+            ProfileAuthKind::None.into_config("ignored"),
+            Ok(AuthConfig::None)
+        );
         assert_eq!(
             ProfileAuthKind::Password.into_config("ignored"),
             Ok(AuthConfig::Password)
