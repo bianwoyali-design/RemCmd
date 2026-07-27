@@ -7611,41 +7611,22 @@ impl RemCmdApp {
                         .flex_none()
                         .flex_wrap()
                         .items_center()
-                        .justify_between()
-                        .gap_2()
+                        .justify_start()
+                        .gap_1()
+                        .child(self.render_workspace_controls(cx))
+                        .child(self.render_pane_controls(cx))
+                        .child(self.render_connection_controls(cx))
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(120.0))
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(profile.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_none()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_end()
-                                .gap_2()
-                                .child(self.render_workspace_controls(cx))
-                                .child(self.render_pane_controls(cx))
-                                .child(self.render_connection_controls(cx))
-                                .child(
-                                    self.render_icon_button(
-                                        "delete_connection",
-                                        IconName::Delete,
-                                        "Delete",
-                                        IconTone::Danger,
-                                        true,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.delete_selected_profile(cx);
-                                        },
-                                    )),
-                                ),
+                            self.render_icon_button(
+                                "delete_connection",
+                                IconName::Delete,
+                                "Delete",
+                                IconTone::Danger,
+                                true,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.delete_selected_profile(cx);
+                            })),
                         ),
                 );
 
@@ -9516,8 +9497,8 @@ impl RemCmdApp {
             .flex_none()
             .flex_wrap()
             .items_center()
-            .justify_end()
-            .gap_2()
+            .justify_start()
+            .gap_1()
             .child(
                 div()
                     .min_w(px(0.0))
@@ -9561,18 +9542,7 @@ impl RemCmdApp {
             SessionState::Failed => "Failed",
         };
 
-        let Some(profile_id) = session.map(|session| session.profile_id.as_str()) else {
-            return state.into();
-        };
-
-        let profile_name = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .map(|profile| profile.name.as_str())
-            .unwrap_or(profile_id);
-
-        format!("{state} - {profile_name}")
+        state.into()
     }
 
     fn render_auth_method_row(
