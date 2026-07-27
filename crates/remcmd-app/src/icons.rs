@@ -15,9 +15,11 @@ pub(crate) enum IconName {
     ClosePane,
     Collapse,
     Connect,
+    Copy,
     Delete,
     Download,
     Disconnect,
+    Edit,
     Expand,
     File,
     Folder,
@@ -35,6 +37,7 @@ pub(crate) enum IconName {
     SplitRight,
     Terminal,
     Upload,
+    View,
 }
 
 impl IconName {
@@ -48,9 +51,11 @@ impl IconName {
             Self::ClosePane => "icons/close-pane.svg",
             Self::Collapse => "icons/collapse.svg",
             Self::Connect => "icons/connect.svg",
+            Self::Copy => "icons/copy.svg",
             Self::Delete => "icons/delete.svg",
             Self::Download => "icons/download.svg",
             Self::Disconnect => "icons/disconnect.svg",
+            Self::Edit => "icons/edit.svg",
             Self::Expand => "icons/expand.svg",
             Self::File => "icons/file.svg",
             Self::Folder => "icons/folder.svg",
@@ -68,6 +73,7 @@ impl IconName {
             Self::SplitRight => "icons/split-right.svg",
             Self::Terminal => "icons/terminal.svg",
             Self::Upload => "icons/upload.svg",
+            Self::View => "icons/view.svg",
         }
     }
 
@@ -81,9 +87,11 @@ impl IconName {
             "icons/close-pane.svg" => Self::ClosePane,
             "icons/collapse.svg" => Self::Collapse,
             "icons/connect.svg" => Self::Connect,
+            "icons/copy.svg" => Self::Copy,
             "icons/delete.svg" => Self::Delete,
             "icons/download.svg" => Self::Download,
             "icons/disconnect.svg" => Self::Disconnect,
+            "icons/edit.svg" => Self::Edit,
             "icons/expand.svg" => Self::Expand,
             "icons/file.svg" => Self::File,
             "icons/folder.svg" => Self::Folder,
@@ -101,6 +109,7 @@ impl IconName {
             "icons/split-right.svg" => Self::SplitRight,
             "icons/terminal.svg" => Self::Terminal,
             "icons/upload.svg" => Self::Upload,
+            "icons/view.svg" => Self::View,
             _ => return None,
         })
     }
@@ -121,6 +130,9 @@ impl IconName {
             Self::Connect => {
                 r#"<path d="M3 12h13.5"/><path d="m12.5 8 4 4-4 4"/><rect x="16.5" y="4" width="4.5" height="16" rx="2.25"/>"#
             }
+            Self::Copy => {
+                r#"<rect x="7.5" y="7.5" width="13" height="13" rx="2.25"/><path d="M16.5 7.5V5.75A2.25 2.25 0 0 0 14.25 3.5h-8.5A2.25 2.25 0 0 0 3.5 5.75v8.5a2.25 2.25 0 0 0 2.25 2.25H7.5"/>"#
+            }
             Self::Delete => {
                 r#"<path d="M3.5 7h17"/>
                 <path d="m5.75 7 .5 11.5c.05 1.15 1 2 2.15 2h7.2c1.15 0 2.1-.85 2.15-2l.5-11.5"/>
@@ -132,6 +144,9 @@ impl IconName {
             }
             Self::Disconnect => {
                 r#"<rect x="3" y="4" width="4.5" height="16" rx="2.25"/><path d="M7.5 12H21"/><path d="m17 8 4 4-4 4"/>"#
+            }
+            Self::Edit => {
+                r#"<path d="m13.75 5.25 5 5"/><path d="m4.25 19.75 1.2-4.7L15.9 4.6a2.1 2.1 0 0 1 2.95 0l.55.55a2.1 2.1 0 0 1 0 2.95L8.95 18.55l-4.7 1.2Z"/><path d="m5.45 15.05 3.5 3.5"/>"#
             }
             Self::Expand => r#"<path d="m9.25 6.5 5.5 5.5-5.5 5.5"/>"#,
             Self::File => {
@@ -190,6 +205,9 @@ impl IconName {
             }
             Self::Upload => {
                 r#"<path d="M12 14.25V3.5"/><path d="m7.75 7.75 4.25-4.25 4.25 4.25"/><path d="M4 15.5v3A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-3"/>"#
+            }
+            Self::View => {
+                r#"<path d="M2.75 12s3.25-6 9.25-6 9.25 6 9.25 6-3.25 6-9.25 6-9.25-6-9.25-6Z"/><circle cx="12" cy="12" r="2.75"/>"#
             }
         }
     }
@@ -255,8 +273,11 @@ mod tests {
 
         assert!(assets.load("icons/add.svg").unwrap().is_some());
         assert!(assets.load("icons/check.svg").unwrap().is_some());
+        assert!(assets.load("icons/copy.svg").unwrap().is_some());
+        assert!(assets.load("icons/edit.svg").unwrap().is_some());
         assert!(assets.load("icons/performance.svg").unwrap().is_some());
         assert!(assets.load("icons/picker.svg").unwrap().is_some());
+        assert!(assets.load("icons/view.svg").unwrap().is_some());
         assert!(assets.load("icons/unknown.svg").unwrap().is_none());
     }
 }
