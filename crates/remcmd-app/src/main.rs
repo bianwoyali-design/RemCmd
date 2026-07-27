@@ -5726,18 +5726,32 @@ impl RemCmdApp {
             .filter(|candidate| candidate.profile_id == tab.profile_id)
             .count()
             + 1;
-        let sftp_path = self
+        let active_session = self
             .pane(tab.active_pane_id)
-            .and_then(|pane| self.session(pane.session_id))
+            .and_then(|pane| self.session(pane.session_id));
+        let profile_id = active_session
+            .map(|session| session.profile_id.as_str())
+            .unwrap_or(&tab.profile_id);
+        let server_name = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| profile.name.as_str())
+            .unwrap_or("Server");
+        let sftp_path = active_session
             .filter(|session| session.sftp.loaded)
             .map(|session| session.sftp.display_path());
-        let remote_cwd = self
-            .pane(tab.active_pane_id)
-            .and_then(|pane| self.session(pane.session_id))
+        let remote_cwd = active_session
             .and_then(|session| session.terminal.as_ref())
             .and_then(|terminal| terminal.remote_cwd.as_deref());
 
-        workspace_tab_title(tab.view, terminal_number, sftp_path, remote_cwd)
+        workspace_tab_title(
+            server_name,
+            tab.view,
+            terminal_number,
+            sftp_path,
+            remote_cwd,
+        )
     }
 
     fn animate_titlebar_right_edge(
@@ -9919,17 +9933,19 @@ fn estimated_titlebar_label_width(label: &str) -> f32 {
 }
 
 fn workspace_tab_title(
+    server_name: &str,
     view: TerminalTabView,
     terminal_number: usize,
     sftp_path: Option<&str>,
     remote_cwd: Option<&str>,
 ) -> String {
-    match view {
+    let path = match view {
         TerminalTabView::Terminal => remote_cwd
             .map(str::to_owned)
             .unwrap_or_else(|| format!("Terminal {terminal_number}")),
         TerminalTabView::Files => sftp_path.or(remote_cwd).unwrap_or("Files").to_owned(),
-    }
+    };
+    format!("{server_name} - {path}")
 }
 
 fn remote_parent_path(path: &str) -> Option<String> {
@@ -10503,24 +10519,43 @@ mod tests {
     fn tab_title_prefers_the_path_for_its_active_view() {
         assert_eq!(
             workspace_tab_title(
+                "Demo Server",
                 TerminalTabView::Files,
                 1,
                 Some("/home/test"),
                 Some("/ignored")
             ),
-            "/home/test"
+            "Demo Server - /home/test"
         );
         assert_eq!(
-            workspace_tab_title(TerminalTabView::Files, 1, None, Some("/var/log")),
-            "/var/log"
+            workspace_tab_title(
+                "Demo Server",
+                TerminalTabView::Files,
+                1,
+                None,
+                Some("/var/log")
+            ),
+            "Demo Server - /var/log"
         );
         assert_eq!(
-            workspace_tab_title(TerminalTabView::Terminal, 2, Some("/ignored"), None),
-            "Terminal 2"
+            workspace_tab_title(
+                "Demo Server",
+                TerminalTabView::Terminal,
+                2,
+                Some("/ignored"),
+                None
+            ),
+            "Demo Server - Terminal 2"
         );
         assert_eq!(
-            workspace_tab_title(TerminalTabView::Terminal, 2, None, Some("/srv/app")),
-            "/srv/app"
+            workspace_tab_title(
+                "Demo Server",
+                TerminalTabView::Terminal,
+                2,
+                None,
+                Some("/srv/app")
+            ),
+            "Demo Server - /srv/app"
         );
     }
 
