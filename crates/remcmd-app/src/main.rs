@@ -643,6 +643,7 @@ struct SftpBrowserState {
     selected_paths: Vec<String>,
     selection_anchor: Option<String>,
     scroll_handle: UniformListScrollHandle,
+    breadcrumb_scroll_handle: ScrollHandle,
 }
 
 #[derive(Clone)]
@@ -671,6 +672,7 @@ impl Default for SftpBrowserState {
             selected_paths: Vec::new(),
             selection_anchor: None,
             scroll_handle: UniformListScrollHandle::new(),
+            breadcrumb_scroll_handle: ScrollHandle::new(),
         }
     }
 }
@@ -719,6 +721,7 @@ impl SftpBrowserState {
             return false;
         }
 
+        let breadcrumb_count = remote_breadcrumbs(&directory.path).len();
         self.path = directory.path;
         self.entries = directory.entries;
         self.loading = false;
@@ -726,6 +729,8 @@ impl SftpBrowserState {
         self.error = None;
         self.active_request_id = None;
         self.resolved_source_path = self.active_request_path.take();
+        self.breadcrumb_scroll_handle
+            .scroll_to_item(breadcrumb_count.saturating_mul(2).saturating_sub(2));
         true
     }
 
@@ -8705,14 +8710,30 @@ impl RemCmdApp {
         placement: SftpBrowserPlacement,
         path: &str,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         let hover = self.theme.control_hover_bg;
         let pressed = self.theme.control_pressed_bg;
+        let scroll_handle = self
+            .session(session_id)
+            .map(|session| {
+                session
+                    .sftp_browser(placement)
+                    .breadcrumb_scroll_handle
+                    .clone()
+            })
+            .unwrap_or_default();
         let mut breadcrumbs = div()
+            .id(SharedString::from(format!(
+                "sftp-breadcrumbs-{}",
+                placement.element_suffix()
+            )))
             .flex()
+            .flex_1()
+            .w_full()
             .min_w(px(0.0))
             .items_center()
-            .overflow_hidden()
+            .overflow_x_scroll()
+            .track_scroll(&scroll_handle)
             .font_family(TERMINAL_FONT_FAMILY)
             .text_sm();
         for (index, (label, target)) in remote_breadcrumbs(path).into_iter().enumerate() {
