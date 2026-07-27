@@ -8338,12 +8338,12 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.modal_bg)
+            .bg(self.theme.context_menu_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(0.0), px(4.0)),
-                blur_radius: px(16.0),
-                spread_radius: px(-3.0),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
             }])
             .occlude()
             .child(new_file)
@@ -8365,8 +8365,9 @@ impl RemCmdApp {
         tone: IconTone,
         enabled: bool,
     ) -> gpui::Stateful<gpui::Div> {
-        let hover = self.theme.control_hover_bg;
-        let pressed = self.theme.control_pressed_bg;
+        let hover = self.theme.accent;
+        let pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
         div()
             .id(id)
             .flex()
@@ -8382,8 +8383,8 @@ impl RemCmdApp {
             })
             .when(enabled, |this| {
                 this.cursor_pointer()
-                    .hover(move |this| this.bg(hover))
-                    .active(move |this| this.bg(pressed))
+                    .hover(move |this| this.bg(hover).text_color(on_accent))
+                    .active(move |this| this.bg(pressed).text_color(on_accent))
             })
             .when(!enabled, |this| this.opacity(0.45))
             .child(label)
