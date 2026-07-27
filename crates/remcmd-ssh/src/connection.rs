@@ -11,9 +11,9 @@ use remcmd_core::ConnectionProfile;
 use tokio::{runtime::Handle, sync::mpsc};
 
 use crate::{
-    AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteFile, SessionState, SftpOperation,
-    SftpTransferDirection, ShellEvent, SshError, SshErrorKind, SshSession, SshShellWriter,
-    SshTransport, TransferRateLimiter,
+    AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteDirectoryTree, RemoteFile,
+    RemoteFileKind, SessionState, SftpOperation, SftpTransferDirection, ShellEvent, SshError,
+    SshErrorKind, SshSession, SshShellWriter, SshTransport, TransferRateLimiter,
     host_key::HostKeyDecision,
     performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
     sftp::SftpWorkerHandle,
@@ -37,6 +37,9 @@ pub enum ConnectionCommand {
     /// Reads one remote directory through an SFTP subsystem channel.
     ReadDirectory { request_id: u64, path: String },
 
+    /// Recursively lists regular files and directories below one remote path.
+    ReadDirectoryTree { request_id: u64, path: String },
+
     /// Reads one remote file through an SFTP subsystem channel.
     ReadFile { request_id: u64, path: String },
 
@@ -47,6 +50,15 @@ pub enum ConnectionCommand {
         expected_contents: Vec<u8>,
         contents: Vec<u8>,
     },
+
+    /// Creates one empty remote file without replacing an existing item.
+    CreateFile { request_id: u64, path: String },
+
+    /// Creates remote directories in parent-first order.
+    CreateDirectories { request_id: u64, paths: Vec<String> },
+
+    /// Recursively deletes remote files and directories.
+    DeletePaths { request_id: u64, paths: Vec<String> },
 
     /// Copies one local file to a remote SFTP path.
     UploadFile {
@@ -95,11 +107,30 @@ pub enum ConnectionEvent {
         directory: RemoteDirectory,
     },
 
+    /// Returns one recursively enumerated remote directory tree.
+    DirectoryTreeRead {
+        request_id: u64,
+        tree: RemoteDirectoryTree,
+    },
+
     /// Returns one canonical remote path and its file contents.
     FileRead { request_id: u64, file: RemoteFile },
 
     /// Confirms that a remote file was replaced and returns its saved contents.
     FileWritten { request_id: u64, file: RemoteFile },
+
+    /// Confirms that one new remote file was created.
+    PathCreated {
+        request_id: u64,
+        path: String,
+        kind: RemoteFileKind,
+    },
+
+    /// Confirms that the requested remote directories exist.
+    DirectoriesCreated { request_id: u64, paths: Vec<String> },
+
+    /// Confirms recursive deletion of the requested remote paths.
+    PathsDeleted { request_id: u64, paths: Vec<String> },
 
     /// Reports incremental bytes copied by an SFTP transfer.
     TransferProgress {
@@ -174,6 +205,18 @@ impl ConnectionHandle {
         })
     }
 
+    /// Requests a recursive remote directory listing through this SSH connection.
+    pub fn read_directory_tree(
+        &self,
+        request_id: u64,
+        path: impl Into<String>,
+    ) -> Result<(), SshError> {
+        self.send(ConnectionCommand::ReadDirectoryTree {
+            request_id,
+            path: path.into(),
+        })
+    }
+
     /// Requests one remote file through this SSH connection.
     pub fn read_file(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
         self.send(ConnectionCommand::ReadFile {
@@ -196,6 +239,24 @@ impl ConnectionHandle {
             expected_contents,
             contents,
         })
+    }
+
+    /// Creates one empty remote file without overwriting an existing item.
+    pub fn create_file(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
+        self.send(ConnectionCommand::CreateFile {
+            request_id,
+            path: path.into(),
+        })
+    }
+
+    /// Creates remote directories in parent-first order.
+    pub fn create_directories(&self, request_id: u64, paths: Vec<String>) -> Result<(), SshError> {
+        self.send(ConnectionCommand::CreateDirectories { request_id, paths })
+    }
+
+    /// Recursively deletes remote files and directories.
+    pub fn delete_paths(&self, request_id: u64, paths: Vec<String>) -> Result<(), SshError> {
+        self.send(ConnectionCommand::DeletePaths { request_id, paths })
     }
 
     /// Queues a local file upload through this SSH connection.
@@ -401,8 +462,12 @@ where
                     }
                     Some(
                         ConnectionCommand::ReadDirectory { .. }
+                        | ConnectionCommand::ReadDirectoryTree { .. }
                         | ConnectionCommand::ReadFile { .. }
                         | ConnectionCommand::WriteFile { .. }
+                        | ConnectionCommand::CreateFile { .. }
+                        | ConnectionCommand::CreateDirectories { .. }
+                        | ConnectionCommand::DeletePaths { .. }
                         | ConnectionCommand::UploadFile { .. }
                         | ConnectionCommand::DownloadFile { .. }
                         | ConnectionCommand::CancelTransfer { .. }
@@ -445,8 +510,12 @@ async fn wait_for_host_key_decision(
                     }
                     Some(
                         ConnectionCommand::ReadDirectory { .. }
+                        | ConnectionCommand::ReadDirectoryTree { .. }
                         | ConnectionCommand::ReadFile { .. }
                         | ConnectionCommand::WriteFile { .. }
+                        | ConnectionCommand::CreateFile { .. }
+                        | ConnectionCommand::CreateDirectories { .. }
+                        | ConnectionCommand::DeletePaths { .. }
                         | ConnectionCommand::UploadFile { .. }
                         | ConnectionCommand::DownloadFile { .. }
                         | ConnectionCommand::CancelTransfer { .. }
@@ -765,6 +834,51 @@ async fn run_connection(
                     return;
                 }
             }
+            Some(ConnectionCommand::ReadDirectoryTree { request_id, path }) => {
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path,
+                                    operation: SftpOperation::ReadDirectoryTree,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) = worker.read_directory_tree(request_id, path.clone())
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path,
+                            operation: SftpOperation::ReadDirectoryTree,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
             Some(ConnectionCommand::ReadFile { request_id, path }) => {
                 if sftp_worker.is_none() {
                     match transport.open_sftp().await {
@@ -852,6 +966,143 @@ async fn run_connection(
                             request_id,
                             path,
                             operation: SftpOperation::WriteFile,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::CreateFile { request_id, path }) => {
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path,
+                                    operation: SftpOperation::CreateFile,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) = worker.create_file(request_id, path.clone())
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path,
+                            operation: SftpOperation::CreateFile,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::CreateDirectories { request_id, paths }) => {
+                let error_path = paths.first().cloned().unwrap_or_default();
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path: error_path,
+                                    operation: SftpOperation::CreateDirectory,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) = worker.create_directories(request_id, paths)
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path: error_path,
+                            operation: SftpOperation::CreateDirectory,
+                            error,
+                        })
+                        .await
+                        .is_err()
+                {
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::DeletePaths { request_id, paths }) => {
+                let error_path = paths.first().cloned().unwrap_or_default();
+                if sftp_worker.is_none() {
+                    match transport.open_sftp().await {
+                        Ok(session) => {
+                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
+                                session,
+                                events.clone(),
+                                transfer_rate_limiter.clone(),
+                            ));
+                        }
+                        Err(error) => {
+                            if events
+                                .send(ConnectionEvent::SftpFailed {
+                                    request_id,
+                                    path: error_path,
+                                    operation: SftpOperation::DeletePaths,
+                                    error,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                close_resources(&transport, Some(&writer)).await;
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(worker) = sftp_worker.as_ref()
+                    && let Err(error) = worker.delete_paths(request_id, paths)
+                    && events
+                        .send(ConnectionEvent::SftpFailed {
+                            request_id,
+                            path: error_path,
+                            operation: SftpOperation::DeletePaths,
                             error,
                         })
                         .await

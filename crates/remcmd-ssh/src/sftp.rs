@@ -9,7 +9,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use russh_sftp::{client::SftpSession, protocol::FileType};
+use russh_sftp::{
+    client::SftpSession,
+    protocol::{FileType, OpenFlags},
+};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::{
     fs,
@@ -66,8 +69,12 @@ impl Default for TransferRateLimiter {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SftpOperation {
     ReadDirectory,
+    ReadDirectoryTree,
     ReadFile,
     WriteFile,
+    CreateFile,
+    CreateDirectory,
+    DeletePaths,
     UploadFile,
     DownloadFile,
     CancelTransfer,
@@ -103,6 +110,13 @@ pub struct RemoteDirectory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteDirectoryTree {
+    pub root: String,
+    pub directories: Vec<String>,
+    pub files: Vec<RemoteFileEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteFile {
     pub path: String,
     pub contents: Vec<u8>,
@@ -110,6 +124,10 @@ pub struct RemoteFile {
 
 enum SftpCommand {
     ReadDirectory {
+        request_id: u64,
+        path: String,
+    },
+    ReadDirectoryTree {
         request_id: u64,
         path: String,
     },
@@ -122,6 +140,18 @@ enum SftpCommand {
         path: String,
         expected_contents: Vec<u8>,
         contents: Vec<u8>,
+    },
+    CreateFile {
+        request_id: u64,
+        path: String,
+    },
+    CreateDirectories {
+        request_id: u64,
+        paths: Vec<String>,
+    },
+    DeletePaths {
+        request_id: u64,
+        paths: Vec<String>,
     },
     UploadFile {
         transfer_id: u64,
@@ -179,6 +209,21 @@ impl SftpWorkerHandle {
                             break;
                         }
                     }
+                    SftpCommand::ReadDirectoryTree { request_id, path } => {
+                        let event = match read_directory_tree(&session, path.clone()).await {
+                            Ok(tree) => ConnectionEvent::DirectoryTreeRead { request_id, tree },
+                            Err(error) => ConnectionEvent::SftpFailed {
+                                request_id,
+                                path,
+                                operation: SftpOperation::ReadDirectoryTree,
+                                error,
+                            },
+                        };
+
+                        if events.send(event).await.is_err() {
+                            break;
+                        }
+                    }
                     SftpCommand::ReadFile { request_id, path } => {
                         let event = match read_file(&session, path.clone()).await {
                             Ok(file) => ConnectionEvent::FileRead { request_id, file },
@@ -186,6 +231,57 @@ impl SftpWorkerHandle {
                                 request_id,
                                 path,
                                 operation: SftpOperation::ReadFile,
+                                error,
+                            },
+                        };
+
+                        if events.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    SftpCommand::CreateFile { request_id, path } => {
+                        let event = match create_file(&session, path.clone()).await {
+                            Ok(path) => ConnectionEvent::PathCreated {
+                                request_id,
+                                path,
+                                kind: RemoteFileKind::File,
+                            },
+                            Err(error) => ConnectionEvent::SftpFailed {
+                                request_id,
+                                path,
+                                operation: SftpOperation::CreateFile,
+                                error,
+                            },
+                        };
+
+                        if events.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    SftpCommand::CreateDirectories { request_id, paths } => {
+                        let error_path = paths.first().cloned().unwrap_or_default();
+                        let event = match create_directories(&session, paths.clone()).await {
+                            Ok(()) => ConnectionEvent::DirectoriesCreated { request_id, paths },
+                            Err(error) => ConnectionEvent::SftpFailed {
+                                request_id,
+                                path: error_path,
+                                operation: SftpOperation::CreateDirectory,
+                                error,
+                            },
+                        };
+
+                        if events.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    SftpCommand::DeletePaths { request_id, paths } => {
+                        let error_path = paths.first().cloned().unwrap_or_default();
+                        let event = match delete_paths(&session, &paths).await {
+                            Ok(()) => ConnectionEvent::PathsDeleted { request_id, paths },
+                            Err(error) => ConnectionEvent::SftpFailed {
+                                request_id,
+                                path: error_path,
+                                operation: SftpOperation::DeletePaths,
                                 error,
                             },
                         };
@@ -344,6 +440,16 @@ impl SftpWorkerHandle {
             .map_err(|_| SshError::new(SshErrorKind::Sftp, "SFTP directory worker is not running"))
     }
 
+    pub(crate) fn read_directory_tree(
+        &self,
+        request_id: u64,
+        path: String,
+    ) -> Result<(), SshError> {
+        self.command_tx
+            .send(SftpCommand::ReadDirectoryTree { request_id, path })
+            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SFTP directory worker is not running"))
+    }
+
     pub(crate) fn read_file(&self, request_id: u64, path: String) -> Result<(), SshError> {
         self.command_tx
             .send(SftpCommand::ReadFile { request_id, path })
@@ -365,6 +471,28 @@ impl SftpWorkerHandle {
                 contents,
             })
             .map_err(|_| SshError::new(SshErrorKind::Sftp, "SFTP file worker is not running"))
+    }
+
+    pub(crate) fn create_file(&self, request_id: u64, path: String) -> Result<(), SshError> {
+        self.command_tx
+            .send(SftpCommand::CreateFile { request_id, path })
+            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SFTP file worker is not running"))
+    }
+
+    pub(crate) fn create_directories(
+        &self,
+        request_id: u64,
+        paths: Vec<String>,
+    ) -> Result<(), SshError> {
+        self.command_tx
+            .send(SftpCommand::CreateDirectories { request_id, paths })
+            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SFTP directory worker is not running"))
+    }
+
+    pub(crate) fn delete_paths(&self, request_id: u64, paths: Vec<String>) -> Result<(), SshError> {
+        self.command_tx
+            .send(SftpCommand::DeletePaths { request_id, paths })
+            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SFTP delete worker is not running"))
     }
 
     pub(crate) fn upload_file(
@@ -1003,6 +1131,168 @@ async fn read_directory(session: &SftpSession, path: String) -> Result<RemoteDir
     Ok(RemoteDirectory { path, entries })
 }
 
+async fn read_directory_tree(
+    session: &SftpSession,
+    path: String,
+) -> Result<RemoteDirectoryTree, SshError> {
+    let root = session.canonicalize(path).await.map_err(SshError::from)?;
+    let mut pending = vec![root.clone()];
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+
+    while let Some(directory) = pending.pop() {
+        let entries = session.read_dir(directory).await.map_err(SshError::from)?;
+        for entry in entries {
+            let metadata = entry.metadata();
+            match remote_file_kind(entry.file_type()) {
+                RemoteFileKind::Directory => {
+                    let path = entry.path();
+                    directories.push(path.clone());
+                    pending.push(path);
+                }
+                RemoteFileKind::File | RemoteFileKind::Other if metadata.size.is_some() => {
+                    files.push(RemoteFileEntry {
+                        name: entry.file_name(),
+                        path: entry.path(),
+                        kind: RemoteFileKind::File,
+                        size: metadata.size,
+                        modified: metadata.mtime,
+                    });
+                }
+                RemoteFileKind::File | RemoteFileKind::Symlink | RemoteFileKind::Other => {}
+            }
+        }
+    }
+    directories.sort_by(|left, right| {
+        remote_path_depth(left)
+            .cmp(&remote_path_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(RemoteDirectoryTree {
+        root,
+        directories,
+        files,
+    })
+}
+
+async fn create_file(session: &SftpSession, path: String) -> Result<String, SshError> {
+    let mut file = session
+        .open_with_flags(
+            path.clone(),
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+        )
+        .await
+        .map_err(SshError::from)?;
+    file.sync_all().await.map_err(SshError::from)?;
+    file.shutdown()
+        .await
+        .map_err(|error| transfer_io_error("closing new remote file", error))?;
+    session.canonicalize(path).await.map_err(SshError::from)
+}
+
+async fn create_directories(session: &SftpSession, mut paths: Vec<String>) -> Result<(), SshError> {
+    paths.sort_by(|left, right| {
+        remote_path_depth(left)
+            .cmp(&remote_path_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+    paths.dedup();
+
+    for path in paths {
+        if session
+            .try_exists(path.clone())
+            .await
+            .map_err(SshError::from)?
+        {
+            let metadata = session
+                .symlink_metadata(path)
+                .await
+                .map_err(SshError::from)?;
+            if !metadata.file_type().is_dir() {
+                return Err(SshError::new(
+                    SshErrorKind::Sftp,
+                    "Cannot create a directory over an existing remote file",
+                ));
+            }
+            continue;
+        }
+        session.create_dir(path).await.map_err(SshError::from)?;
+    }
+    Ok(())
+}
+
+async fn delete_paths(session: &SftpSession, paths: &[String]) -> Result<(), SshError> {
+    enum DeleteStep {
+        Inspect(String),
+        RemoveDirectory(String),
+    }
+
+    for requested_path in paths {
+        let path = session
+            .canonicalize(requested_path.clone())
+            .await
+            .map_err(SshError::from)?;
+        if path == "/" {
+            return Err(SshError::new(
+                SshErrorKind::Sftp,
+                "Refusing to delete the remote root directory",
+            ));
+        }
+
+        let mut pending = vec![DeleteStep::Inspect(path)];
+        while let Some(step) = pending.pop() {
+            match step {
+                DeleteStep::Inspect(path) => {
+                    let metadata =
+                        session
+                            .symlink_metadata(path.clone())
+                            .await
+                            .map_err(|error| {
+                                SshError::new(
+                                    SshErrorKind::Sftp,
+                                    format!("reading metadata for {path}: {error}"),
+                                )
+                            })?;
+                    if metadata.file_type().is_dir() {
+                        let entries = session.read_dir(path.clone()).await.map_err(|error| {
+                            SshError::new(
+                                SshErrorKind::Sftp,
+                                format!("reading directory {path}: {error}"),
+                            )
+                        })?;
+                        pending.push(DeleteStep::RemoveDirectory(path));
+                        pending.extend(
+                            entries
+                                .map(|entry| DeleteStep::Inspect(entry.path()))
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev(),
+                        );
+                    } else {
+                        session.remove_file(path.clone()).await.map_err(|error| {
+                            SshError::new(
+                                SshErrorKind::Sftp,
+                                format!("deleting file {path}: {error}"),
+                            )
+                        })?;
+                    }
+                }
+                DeleteStep::RemoveDirectory(path) => {
+                    session.remove_dir(path.clone()).await.map_err(|error| {
+                        SshError::new(
+                            SshErrorKind::Sftp,
+                            format!("deleting directory {path}: {error}"),
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn read_file(session: &SftpSession, path: String) -> Result<RemoteFile, SshError> {
     let path = session.canonicalize(path).await.map_err(SshError::from)?;
     let metadata = session
@@ -1075,6 +1365,12 @@ fn file_too_large_error() -> SshError {
     )
 }
 
+fn remote_path_depth(path: &str) -> usize {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .count()
+}
+
 fn remote_file_kind(kind: FileType) -> RemoteFileKind {
     match kind {
         FileType::Dir => RemoteFileKind::Directory,
@@ -1105,7 +1401,7 @@ const fn file_kind_rank(kind: RemoteFileKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::{Arc, Mutex},
     };
 
@@ -1196,7 +1492,8 @@ mod tests {
     }
 
     struct TestSftpServer {
-        directory_read: bool,
+        directory_reads: HashSet<String>,
+        directories: Arc<Mutex<HashSet<String>>>,
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         read_offsets: Arc<Mutex<Vec<u64>>>,
     }
@@ -1206,7 +1503,11 @@ mod tests {
             let files =
                 HashMap::from([("/home/test/notes.txt".into(), b"original contents".to_vec())]);
             Self {
-                directory_read: false,
+                directory_reads: HashSet::new(),
+                directories: Arc::new(Mutex::new(HashSet::from([
+                    "/home/test".into(),
+                    "/home/test/projects".into(),
+                ]))),
                 files: Arc::new(Mutex::new(files)),
                 read_offsets: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1241,6 +1542,27 @@ mod tests {
         }
 
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            if self.directories.lock().unwrap().contains(&path) {
+                let mut attrs = FileAttributes::default();
+                attrs.set_dir(true);
+                return Ok(Attrs { id, attrs });
+            }
+            let files = self.files.lock().unwrap();
+            let Some(contents) = files.get(&path) else {
+                return Err(StatusCode::NoSuchFile);
+            };
+            let mut attrs = FileAttributes::default();
+            attrs.set_regular(true);
+            attrs.size = Some(contents.len() as u64);
+            Ok(Attrs { id, attrs })
+        }
+
+        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            if self.directories.lock().unwrap().contains(&path) {
+                let mut attrs = FileAttributes::default();
+                attrs.set_dir(true);
+                return Ok(Attrs { id, attrs });
+            }
             let files = self.files.lock().unwrap();
             let Some(contents) = files.get(&path) else {
                 return Err(StatusCode::NoSuchFile);
@@ -1259,7 +1581,10 @@ mod tests {
             _attrs: FileAttributes,
         ) -> Result<Handle, Self::Error> {
             let mut files = self.files.lock().unwrap();
-            if flags.contains(OpenFlags::TRUNCATE) {
+            if flags.contains(OpenFlags::EXCLUDE) && files.contains_key(&filename) {
+                return Err(StatusCode::Failure);
+            }
+            if flags.contains(OpenFlags::TRUNCATE) || flags.contains(OpenFlags::CREATE) {
                 files.insert(filename.clone(), Vec::new());
             } else if !files.contains_key(&filename) {
                 return Err(StatusCode::NoSuchFile);
@@ -1317,6 +1642,42 @@ mod tests {
             Ok(ok_status(id))
         }
 
+        async fn mkdir(
+            &mut self,
+            id: u32,
+            path: String,
+            _attrs: FileAttributes,
+        ) -> Result<Status, Self::Error> {
+            let mut directories = self.directories.lock().unwrap();
+            if !directories.insert(path) {
+                return Err(StatusCode::Failure);
+            }
+            Ok(ok_status(id))
+        }
+
+        async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            if self
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|file| file.starts_with(&prefix))
+                || self
+                    .directories
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|directory| directory != &path && directory.starts_with(&prefix))
+            {
+                return Err(StatusCode::Failure);
+            }
+            if !self.directories.lock().unwrap().remove(&path) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            Ok(ok_status(id))
+        }
+
         async fn rename(
             &mut self,
             id: u32,
@@ -1332,30 +1693,51 @@ mod tests {
         }
 
         async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-            self.directory_read = false;
+            if !self.directories.lock().unwrap().contains(&path) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            self.directory_reads.remove(&path);
             Ok(Handle { id, handle: path })
         }
 
-        async fn readdir(&mut self, id: u32, _handle: String) -> Result<Name, Self::Error> {
-            if self.directory_read {
+        async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+            if !self.directory_reads.insert(handle.clone()) {
                 return Err(StatusCode::Eof);
             }
-            self.directory_read = true;
 
-            let mut directory = FileAttributes::default();
-            directory.set_dir(true);
-            let mut file = FileAttributes::default();
-            file.set_regular(true);
-            file.size = Some(1536);
-            file.mtime = Some(1_700_000_000);
+            let prefix = format!("{}/", handle.trim_end_matches('/'));
+            let mut files = self
+                .directories
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|path| {
+                    let name = path.strip_prefix(&prefix)?;
+                    (!name.is_empty() && !name.contains('/')).then(|| {
+                        let mut attrs = FileAttributes::default();
+                        attrs.set_dir(true);
+                        File::new(name, attrs)
+                    })
+                })
+                .collect::<Vec<_>>();
+            files.extend(
+                self.files
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(path, contents)| {
+                        let name = path.strip_prefix(&prefix)?;
+                        (!name.is_empty() && !name.contains('/')).then(|| {
+                            let mut attrs = FileAttributes::default();
+                            attrs.set_regular(true);
+                            attrs.size = Some(contents.len() as u64);
+                            attrs.mtime = Some(1_700_000_000);
+                            File::new(name, attrs)
+                        })
+                    }),
+            );
 
-            Ok(Name {
-                id,
-                files: vec![
-                    File::new("notes.txt", file),
-                    File::new("projects", directory),
-                ],
-            })
+            Ok(Name { id, files })
         }
 
         async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
@@ -1389,8 +1771,102 @@ mod tests {
         assert_eq!(directory.entries[0].name, "projects");
         assert_eq!(directory.entries[0].kind, RemoteFileKind::Directory);
         assert_eq!(directory.entries[1].path, "/home/test/notes.txt");
-        assert_eq!(directory.entries[1].size, Some(1536));
+        assert_eq!(
+            directory.entries[1].size,
+            Some(b"original contents".len() as u64)
+        );
         assert_eq!(directory.entries[1].modified, Some(1_700_000_000));
+    }
+
+    #[tokio::test]
+    async fn recursively_reads_regular_files_and_preserves_empty_directories() {
+        let server = TestSftpServer::default();
+        server
+            .directories
+            .lock()
+            .unwrap()
+            .insert("/home/test/projects/src".into());
+        server.files.lock().unwrap().extend([
+            ("/home/test/projects/todo.txt".into(), b"todo".to_vec()),
+            (
+                "/home/test/projects/src/main.rs".into(),
+                b"fn main() {}".to_vec(),
+            ),
+        ]);
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        server::run(server_stream, server).await;
+        let session = SftpSession::new(client_stream).await.unwrap();
+
+        let tree = read_directory_tree(&session, "/home/test".into())
+            .await
+            .unwrap();
+
+        assert_eq!(tree.root, "/home/test");
+        assert_eq!(
+            tree.directories,
+            vec![
+                "/home/test/projects".to_owned(),
+                "/home/test/projects/src".to_owned()
+            ]
+        );
+        assert_eq!(
+            tree.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/home/test/notes.txt",
+                "/home/test/projects/src/main.rs",
+                "/home/test/projects/todo.txt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_and_recursively_deletes_remote_items() {
+        let server = TestSftpServer::default();
+        let directories = server.directories.clone();
+        let files = server.files.clone();
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        server::run(server_stream, server).await;
+        let session = SftpSession::new(client_stream).await.unwrap();
+
+        create_directories(
+            &session,
+            vec!["/home/test/new/nested".into(), "/home/test/new".into()],
+        )
+        .await
+        .unwrap();
+        let path = create_file(&session, "/home/test/new/nested/empty.txt".into())
+            .await
+            .unwrap();
+
+        assert_eq!(path, "/home/test/new/nested/empty.txt");
+        assert!(files.lock().unwrap().contains_key(&path));
+        assert!(
+            create_file(&session, "/home/test/new/nested/empty.txt".into())
+                .await
+                .is_err()
+        );
+        assert!(
+            directories
+                .lock()
+                .unwrap()
+                .contains("/home/test/new/nested")
+        );
+
+        delete_paths(&session, &["/home/test/new".into()])
+            .await
+            .unwrap();
+
+        assert!(!files.lock().unwrap().contains_key(&path));
+        assert!(
+            !directories
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.starts_with("/home/test/new"))
+        );
     }
 
     #[tokio::test]

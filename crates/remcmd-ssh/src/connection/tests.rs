@@ -21,14 +21,29 @@ fn connection_handle_forwards_commands() {
         .read_directory(7, "/home/test")
         .expect("directory request should be sent");
     handle
-        .read_file(8, "/home/test/notes.txt")
+        .read_directory_tree(8, "/home/test/projects")
+        .expect("directory tree request should be sent");
+    handle
+        .read_file(9, "/home/test/notes.txt")
         .expect("file request should be sent");
     handle
-        .write_file(9, "/home/test/notes.txt", b"old".to_vec(), b"new".to_vec())
+        .write_file(10, "/home/test/notes.txt", b"old".to_vec(), b"new".to_vec())
         .expect("file write should be sent");
     handle
+        .create_file(11, "/home/test/new.txt")
+        .expect("file creation should be sent");
+    handle
+        .create_directories(
+            12,
+            vec!["/home/test/new".into(), "/home/test/new/nested".into()],
+        )
+        .expect("directory creation should be sent");
+    handle
+        .delete_paths(13, vec!["/home/test/old".into()])
+        .expect("recursive deletion should be sent");
+    handle
         .upload_file(
-            10,
+            14,
             PathBuf::from("/tmp/upload.txt"),
             "/home/test/upload.txt",
             false,
@@ -36,14 +51,14 @@ fn connection_handle_forwards_commands() {
         .expect("upload should be sent");
     handle
         .download_file(
-            11,
+            15,
             "/home/test/download.txt",
             PathBuf::from("/tmp/download.txt"),
             true,
         )
         .expect("download should be sent");
     handle
-        .cancel_transfer(11)
+        .cancel_transfer(15)
         .expect("transfer cancellation should be sent");
     handle
         .set_performance_monitoring(true)
@@ -75,25 +90,53 @@ fn connection_handle_forwards_commands() {
         }
     );
     assert_eq!(
+        command_rx.try_recv().expect("directory tree command"),
+        ConnectionCommand::ReadDirectoryTree {
+            request_id: 8,
+            path: "/home/test/projects".into(),
+        }
+    );
+    assert_eq!(
         command_rx.try_recv().expect("file command"),
         ConnectionCommand::ReadFile {
-            request_id: 8,
+            request_id: 9,
             path: "/home/test/notes.txt".into(),
         }
     );
     assert_eq!(
         command_rx.try_recv().expect("file write command"),
         ConnectionCommand::WriteFile {
-            request_id: 9,
+            request_id: 10,
             path: "/home/test/notes.txt".into(),
             expected_contents: b"old".to_vec(),
             contents: b"new".to_vec(),
         }
     );
     assert_eq!(
+        command_rx.try_recv().expect("file creation command"),
+        ConnectionCommand::CreateFile {
+            request_id: 11,
+            path: "/home/test/new.txt".into(),
+        }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("directory creation command"),
+        ConnectionCommand::CreateDirectories {
+            request_id: 12,
+            paths: vec!["/home/test/new".into(), "/home/test/new/nested".into()],
+        }
+    );
+    assert_eq!(
+        command_rx.try_recv().expect("recursive deletion command"),
+        ConnectionCommand::DeletePaths {
+            request_id: 13,
+            paths: vec!["/home/test/old".into()],
+        }
+    );
+    assert_eq!(
         command_rx.try_recv().expect("upload command"),
         ConnectionCommand::UploadFile {
-            transfer_id: 10,
+            transfer_id: 14,
             local_path: PathBuf::from("/tmp/upload.txt"),
             remote_path: "/home/test/upload.txt".into(),
             overwrite: false,
@@ -102,7 +145,7 @@ fn connection_handle_forwards_commands() {
     assert_eq!(
         command_rx.try_recv().expect("download command"),
         ConnectionCommand::DownloadFile {
-            transfer_id: 11,
+            transfer_id: 15,
             remote_path: "/home/test/download.txt".into(),
             local_path: PathBuf::from("/tmp/download.txt"),
             overwrite: true,
@@ -112,7 +155,7 @@ fn connection_handle_forwards_commands() {
         command_rx
             .try_recv()
             .expect("transfer cancellation command"),
-        ConnectionCommand::CancelTransfer { transfer_id: 11 }
+        ConnectionCommand::CancelTransfer { transfer_id: 15 }
     );
     assert_eq!(
         command_rx.try_recv().expect("performance command"),

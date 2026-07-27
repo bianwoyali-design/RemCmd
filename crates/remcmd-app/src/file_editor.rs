@@ -87,10 +87,19 @@ pub struct FileEditor {
     scroll_handle: ScrollHandle,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
+    read_only: bool,
 }
 
 impl FileEditor {
     pub fn new(cx: &mut Context<Self>, content: String) -> Self {
+        Self::with_read_only(cx, content, false)
+    }
+
+    pub fn new_read_only(cx: &mut Context<Self>, content: String) -> Self {
+        Self::with_read_only(cx, content, true)
+    }
+
+    fn with_read_only(cx: &mut Context<Self>, content: String, read_only: bool) -> Self {
         let (line_count, content_width) = content_metrics(&content);
         Self {
             focus_handle: cx.focus_handle(),
@@ -108,6 +117,7 @@ impl FileEditor {
             scroll_handle: ScrollHandle::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            read_only,
         }
     }
 
@@ -266,6 +276,9 @@ impl FileEditor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if let Some(snapshot) = self.undo_stack.pop() {
             self.redo_stack.push(self.snapshot());
             self.restore(snapshot, cx);
@@ -273,6 +286,9 @@ impl FileEditor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if let Some(snapshot) = self.redo_stack.pop() {
             self.undo_stack.push(self.snapshot());
             self.restore(snapshot, cx);
@@ -280,7 +296,9 @@ impl FileEditor {
     }
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(FileEditorEvent::SaveRequested);
+        if !self.read_only {
+            cx.emit(FileEditorEvent::SaveRequested);
+        }
     }
 
     fn on_mouse_down(
@@ -551,6 +569,9 @@ impl EntityInputHandler for FileEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -580,6 +601,9 @@ impl EntityInputHandler for FileEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))

@@ -35,32 +35,31 @@ mod private_key_picker;
 mod macos_symbols;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use directories::UserDirs;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render,
-    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Task, Timer, TitlebarOptions,
-    UTF16Selection, UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, img,
-    point, prelude::*, px, rgb, size, uniform_list,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
+    Task, Timer, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowOptions, canvas, deferred,
+    div, ease_in_out, ease_out_quint, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use secrecy::SecretString;
 
 use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
-    RemoteDirectory, RemoteFile, RemoteFileEntry, RemoteFileKind, ServerPerformanceSnapshot,
-    SessionState, SftpOperation, SftpTransferDirection, ShellEvent, SshConnection, SshErrorKind,
-    TransferRateLimiter,
+    RemoteDirectory, RemoteDirectoryTree, RemoteFile, RemoteFileEntry, RemoteFileKind,
+    ServerPerformanceSnapshot, SessionState, SftpOperation, SftpTransferDirection, ShellEvent,
+    SshConnection, SshErrorKind, TransferRateLimiter,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -111,6 +110,7 @@ const TERMINAL_FONT_FAMILY: &str = "DejaVu Sans Mono";
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
 gpui::actions!(settings_selector, [CancelSettingsSelector]);
+gpui::actions!(sftp_create_prompt, [SubmitSftpCreate, CancelSftpCreate]);
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -157,6 +157,8 @@ struct RemCmdApp {
     transfer_settings: TransferSettings,
     transfer_rate_limiter: Arc<TransferRateLimiter>,
     next_transfer_session_cursor: usize,
+    sftp_context_menu: Option<SftpContextMenu>,
+    sftp_create_prompt: Option<SftpCreatePrompt>,
     open_settings_selector: Option<SettingsSelector>,
     settings_focus_handle: FocusHandle,
     theme: Theme,
@@ -634,7 +636,19 @@ struct SftpBrowserState {
     active_request_id: Option<u64>,
     active_request_path: Option<String>,
     resolved_source_path: Option<String>,
+    tree_entries: HashMap<String, Vec<RemoteFileEntry>>,
+    expanded_paths: HashSet<String>,
+    tree_requests: HashMap<u64, String>,
+    pending_download_trees: HashMap<u64, PathBuf>,
+    selected_paths: Vec<String>,
+    selection_anchor: Option<String>,
     scroll_handle: UniformListScrollHandle,
+}
+
+#[derive(Clone)]
+struct SftpTreeRow {
+    entry: RemoteFileEntry,
+    depth: usize,
 }
 
 impl Default for SftpBrowserState {
@@ -650,6 +664,12 @@ impl Default for SftpBrowserState {
             active_request_id: None,
             active_request_path: None,
             resolved_source_path: None,
+            tree_entries: HashMap::new(),
+            expanded_paths: HashSet::new(),
+            tree_requests: HashMap::new(),
+            pending_download_trees: HashMap::new(),
+            selected_paths: Vec::new(),
+            selection_anchor: None,
             scroll_handle: UniformListScrollHandle::new(),
         }
     }
@@ -679,10 +699,22 @@ impl SftpBrowserState {
         self.loading = true;
         self.error = None;
         self.file = None;
+        self.tree_entries.clear();
+        self.expanded_paths.clear();
+        self.tree_requests.clear();
+        self.selected_paths.clear();
+        self.selection_anchor = None;
         request_id
     }
 
     fn complete_request(&mut self, request_id: u64, directory: RemoteDirectory) -> bool {
+        if let Some(requested_path) = self.tree_requests.remove(&request_id) {
+            self.expanded_paths.remove(&requested_path);
+            self.expanded_paths.insert(directory.path.clone());
+            self.tree_entries.insert(directory.path, directory.entries);
+            self.error = None;
+            return true;
+        }
         if self.active_request_id != Some(request_id) {
             return false;
         }
@@ -698,6 +730,15 @@ impl SftpBrowserState {
     }
 
     fn fail_request(&mut self, request_id: u64, error: String) -> bool {
+        if let Some(path) = self.tree_requests.remove(&request_id) {
+            self.expanded_paths.remove(&path);
+            self.error = Some(error);
+            return true;
+        }
+        if self.pending_download_trees.remove(&request_id).is_some() {
+            self.error = Some(error);
+            return true;
+        }
         if self.active_request_id != Some(request_id) {
             return false;
         }
@@ -706,6 +747,8 @@ impl SftpBrowserState {
         self.error = Some(error);
         self.active_request_id = None;
         self.active_request_path = None;
+        self.tree_requests.clear();
+        self.pending_download_trees.clear();
         true
     }
 
@@ -727,7 +770,152 @@ impl SftpBrowserState {
         request_id
     }
 
-    fn begin_file_request(&mut self, path: String) -> u64 {
+    fn begin_tree_request(&mut self, path: String) -> u64 {
+        let request_id = self.next_request_id();
+        self.tree_requests.insert(request_id, path.clone());
+        self.expanded_paths.insert(path);
+        self.error = None;
+        request_id
+    }
+
+    fn begin_download_tree(&mut self, destination: PathBuf) -> u64 {
+        let request_id = self.next_request_id();
+        self.pending_download_trees.insert(request_id, destination);
+        request_id
+    }
+
+    fn take_download_tree_destination(&mut self, request_id: u64) -> Option<PathBuf> {
+        self.pending_download_trees.remove(&request_id)
+    }
+
+    fn visible_rows(&self, tree: bool) -> Vec<SftpTreeRow> {
+        if !tree {
+            return self
+                .entries
+                .iter()
+                .cloned()
+                .map(|entry| SftpTreeRow { entry, depth: 0 })
+                .collect();
+        }
+
+        let mut rows = Vec::new();
+        let mut pending = self
+            .entries
+            .iter()
+            .rev()
+            .cloned()
+            .map(|entry| SftpTreeRow { entry, depth: 0 })
+            .collect::<Vec<_>>();
+        while let Some(row) = pending.pop() {
+            let path = row.entry.path.clone();
+            let depth = row.depth;
+            rows.push(row);
+            if self.expanded_paths.contains(&path)
+                && let Some(children) = self.tree_entries.get(&path)
+            {
+                pending.extend(children.iter().rev().cloned().map(|entry| SftpTreeRow {
+                    entry,
+                    depth: depth + 1,
+                }));
+            }
+        }
+        rows
+    }
+
+    fn selected_entries(&self) -> Vec<RemoteFileEntry> {
+        self.selected_paths
+            .iter()
+            .filter_map(|path| self.entry(path).cloned())
+            .collect()
+    }
+
+    fn entry(&self, path: &str) -> Option<&RemoteFileEntry> {
+        self.entries
+            .iter()
+            .chain(self.tree_entries.values().flatten())
+            .find(|entry| entry.path == path)
+    }
+
+    fn select_path(&mut self, path: &str, modifiers: gpui::Modifiers, tree: bool) {
+        let visible_paths = self
+            .visible_rows(tree)
+            .into_iter()
+            .map(|row| row.entry.path)
+            .collect::<Vec<_>>();
+        let Some(clicked_index) = visible_paths.iter().position(|candidate| candidate == path)
+        else {
+            return;
+        };
+
+        if modifiers.shift {
+            let anchor_index = self
+                .selection_anchor
+                .as_ref()
+                .and_then(|anchor| {
+                    visible_paths
+                        .iter()
+                        .position(|candidate| candidate == anchor)
+                })
+                .unwrap_or(clicked_index);
+            let range = anchor_index.min(clicked_index)..=anchor_index.max(clicked_index);
+            if !modifiers.secondary() {
+                self.selected_paths.clear();
+            }
+            for index in range {
+                let path = &visible_paths[index];
+                if !self.selected_paths.contains(path) {
+                    self.selected_paths.push(path.clone());
+                }
+            }
+        } else if modifiers.secondary() {
+            if let Some(index) = self
+                .selected_paths
+                .iter()
+                .position(|candidate| candidate == path)
+            {
+                self.selected_paths.remove(index);
+            } else {
+                self.selected_paths.push(path.to_owned());
+            }
+            self.selection_anchor = Some(path.to_owned());
+        } else {
+            self.selected_paths.clear();
+            self.selected_paths.push(path.to_owned());
+            self.selection_anchor = Some(path.to_owned());
+        }
+    }
+
+    fn select_for_context_menu(&mut self, path: &str) {
+        if !self.selected_paths.iter().any(|selected| selected == path) {
+            self.selected_paths.clear();
+            self.selected_paths.push(path.to_owned());
+            self.selection_anchor = Some(path.to_owned());
+        }
+    }
+
+    fn remove_paths(&mut self, paths: &[String]) {
+        self.selected_paths
+            .retain(|selected| !paths.iter().any(|path| selected == path));
+        self.tree_entries.retain(|path, _| {
+            !paths
+                .iter()
+                .any(|deleted| path == deleted || remote_path_is_descendant(deleted, path))
+        });
+        for entries in self.tree_entries.values_mut() {
+            entries.retain(|entry| {
+                !paths
+                    .iter()
+                    .any(|path| entry.path == *path || remote_path_is_descendant(path, &entry.path))
+            });
+        }
+        self.entries.retain(|entry| {
+            !paths
+                .iter()
+                .any(|path| entry.path == *path || remote_path_is_descendant(path, &entry.path))
+        });
+    }
+
+    fn begin_file_request(&mut self, path: String, editable: bool) -> u64 {
         let request_id = self.next_request_id();
         self.file = Some(SftpFileState {
             path,
@@ -737,6 +925,7 @@ impl SftpBrowserState {
             loading: true,
             saving: false,
             error: None,
+            editable,
             read_request_id: Some(request_id),
             write_request_id: None,
         });
@@ -768,8 +957,12 @@ impl SftpBrowserState {
                 file.error = Some(error);
             }
             SftpOperation::ReadDirectory
+            | SftpOperation::ReadDirectoryTree
             | SftpOperation::ReadFile
             | SftpOperation::WriteFile
+            | SftpOperation::CreateFile
+            | SftpOperation::CreateDirectory
+            | SftpOperation::DeletePaths
             | SftpOperation::UploadFile
             | SftpOperation::DownloadFile
             | SftpOperation::CancelTransfer => {}
@@ -792,8 +985,29 @@ struct SftpFileState {
     loading: bool,
     saving: bool,
     error: Option<String>,
+    editable: bool,
     read_request_id: Option<u64>,
     write_request_id: Option<u64>,
+}
+
+struct SftpContextMenu {
+    session_id: SessionId,
+    placement: SftpBrowserPlacement,
+    position: gpui::Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SftpCreateKind {
+    File,
+    Directory,
+}
+
+struct SftpCreatePrompt {
+    session_id: SessionId,
+    placement: SftpBrowserPlacement,
+    kind: SftpCreateKind,
+    input: Entity<TextField>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1034,6 +1248,9 @@ impl SftpTransferQueue {
 
 impl SftpFileState {
     fn is_dirty(&self, cx: &App) -> bool {
+        if !self.editable {
+            return false;
+        }
         self.editor
             .as_ref()
             .zip(self.text_format)
@@ -1043,6 +1260,9 @@ impl SftpFileState {
     }
 
     fn edited_contents(&self, cx: &App) -> Option<Vec<u8>> {
+        if !self.editable {
+            return None;
+        }
         self.editor
             .as_ref()
             .zip(self.text_format)
@@ -1301,6 +1521,8 @@ impl RemCmdApp {
             transfer_settings,
             transfer_rate_limiter,
             next_transfer_session_cursor: 0,
+            sftp_context_menu: None,
+            sftp_create_prompt: None,
             open_settings_selector: None,
             settings_focus_handle,
             theme,
@@ -1688,6 +1910,100 @@ impl RemCmdApp {
         self.request_sftp_directory(session_id, placement, path, cx);
     }
 
+    fn refresh_sftp_directory_for_session(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .session(session_id)
+            .map(|session| session.sftp_browser(placement).path.clone());
+        if let Some(path) = path {
+            self.request_sftp_directory(session_id, placement, path, cx);
+        }
+    }
+
+    fn toggle_remote_tree_directory(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let expanded = self.session(session_id).is_some_and(|session| {
+            session
+                .sftp_browser(placement)
+                .expanded_paths
+                .contains(&path)
+        });
+        if expanded {
+            if let Some(session) = self.session_mut(session_id) {
+                session
+                    .sftp_browser_mut(placement)
+                    .expanded_paths
+                    .remove(&path);
+            }
+            cx.notify();
+            return;
+        }
+        self.expand_remote_tree_directory(session_id, placement, path, cx);
+    }
+
+    fn expand_remote_tree_directory(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let cached = self.session(session_id).is_some_and(|session| {
+            session
+                .sftp_browser(placement)
+                .tree_entries
+                .contains_key(&path)
+        });
+        let expanded = self.session(session_id).is_some_and(|session| {
+            session
+                .sftp_browser(placement)
+                .expanded_paths
+                .contains(&path)
+        });
+        if expanded {
+            return;
+        }
+        if cached {
+            if let Some(session) = self.session_mut(session_id) {
+                session
+                    .sftp_browser_mut(placement)
+                    .expanded_paths
+                    .insert(path);
+            }
+            cx.notify();
+            return;
+        }
+
+        let handle = self
+            .session(session_id)
+            .and_then(|session| session.connection_handle.clone());
+        let Some(handle) = handle else {
+            return;
+        };
+        let request_id = self
+            .session_mut(session_id)
+            .expect("SFTP session should still exist")
+            .sftp_browser_mut(placement)
+            .begin_tree_request(path.clone());
+        if let Err(error) = handle.read_directory(request_id, path)
+            && let Some(session) = self.session_mut(session_id)
+        {
+            session
+                .sftp_browser_mut(placement)
+                .fail_request(request_id, error.to_string());
+        }
+        cx.notify();
+    }
+
     fn open_remote_directory(
         &mut self,
         placement: SftpBrowserPlacement,
@@ -1714,7 +2030,7 @@ impl RemCmdApp {
         self.request_sftp_directory(session_id, placement, parent, cx);
     }
 
-    fn open_remote_file(&mut self, path: String, cx: &mut Context<Self>) {
+    fn open_remote_file(&mut self, path: String, editable: bool, cx: &mut Context<Self>) {
         let Some(session_id) = self.active_session_id else {
             return;
         };
@@ -1731,7 +2047,7 @@ impl RemCmdApp {
             .session_mut(session_id)
             .expect("SFTP session should still exist")
             .sftp
-            .begin_file_request(path.clone());
+            .begin_file_request(path.clone(), editable);
         if let Some(tab_id) = self.active_tab_id
             && let Some(tab) = self.tab_mut(tab_id)
         {
@@ -1754,17 +2070,24 @@ impl RemCmdApp {
         file: RemoteFile,
         cx: &mut Context<Self>,
     ) {
-        let is_current = self
+        let editable = self
             .session(session_id)
             .and_then(|session| session.sftp.file.as_ref())
-            .is_some_and(|state| state.read_request_id == Some(request_id));
-        if !is_current {
+            .filter(|state| state.read_request_id == Some(request_id))
+            .map(|state| state.editable);
+        let Some(editable) = editable else {
             return;
-        }
+        };
 
         let decoded = RemoteTextFormat::decode(&file.contents);
         let editor = decoded.as_ref().map(|(_, text)| {
-            let editor = cx.new(|cx| FileEditor::new(cx, text.clone()));
+            let editor = cx.new(|cx| {
+                if editable {
+                    FileEditor::new(cx, text.clone())
+                } else {
+                    FileEditor::new_read_only(cx, text.clone())
+                }
+            });
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             cx.subscribe(&editor, move |this, _, event, cx| match event {
                 FileEditorEvent::SaveRequested => this.save_remote_file(session_id, cx),
@@ -1913,22 +2236,55 @@ impl RemCmdApp {
         };
         let selected_paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: true,
             prompt: Some("Upload".into()),
         });
+        let runtime = cx.global::<SshRuntime>().handle();
 
         cx.spawn(async move |this, cx| match selected_paths.await {
             Ok(Ok(Some(paths))) => {
+                let plan = runtime
+                    .spawn_blocking(move || build_local_upload_plan(&paths, &remote_directory))
+                    .await;
                 let _ = this.update(cx, |this, cx| {
-                    for local_path in paths {
-                        let Some(file_name) = local_path.file_name() else {
-                            continue;
+                    let Ok(Ok(plan)) = plan else {
+                        let message = match plan {
+                            Ok(Err(error)) => error.to_string(),
+                            Err(error) => error.to_string(),
+                            Ok(Ok(_)) => unreachable!(),
                         };
-                        let remote_path = remote_join_path(
-                            &remote_directory,
-                            file_name.to_string_lossy().as_ref(),
-                        );
+                        if let Some(session) = this.session_mut(session_id) {
+                            session.sftp_browser_mut(placement).error =
+                                Some(format!("Failed to prepare upload: {message}"));
+                        }
+                        cx.notify();
+                        return;
+                    };
+
+                    if !plan.directories.is_empty() {
+                        let request_id = this
+                            .session_mut(session_id)
+                            .map(|session| session.sftp_browser_mut(placement).next_request_id());
+                        let create_result = request_id
+                            .zip(
+                                this.session(session_id)
+                                    .and_then(|session| session.connection_handle.clone()),
+                            )
+                            .map(|(request_id, handle)| {
+                                handle.create_directories(request_id, plan.directories)
+                            });
+                        if !matches!(create_result, Some(Ok(()))) {
+                            if let Some(session) = this.session_mut(session_id) {
+                                session.sftp_browser_mut(placement).error =
+                                    Some("Failed to queue remote directory creation".into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                    }
+
+                    for (local_path, remote_path) in plan.files {
                         this.enqueue_sftp_transfer(
                             session_id,
                             SftpTransferDirection::Upload,
@@ -1954,29 +2310,70 @@ impl RemCmdApp {
         .detach();
     }
 
-    fn choose_sftp_download(
+    fn choose_sftp_downloads(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
-        remote_path: String,
+        entries: Vec<RemoteFileEntry>,
         cx: &mut Context<Self>,
     ) {
-        let directory = default_download_directory();
-        let suggested_name = remote_file_name(&remote_path).to_owned();
-        let selected_path = cx.prompt_for_new_path(&directory, Some(&suggested_name));
+        if entries.is_empty() {
+            return;
+        }
+        let entries = collapse_nested_remote_entries(entries);
+        let browser_root = self
+            .session(session_id)
+            .map(|session| session.sftp_browser(placement).path.clone())
+            .unwrap_or_else(|| ".".into());
+        let selected_paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Download".into()),
+        });
 
-        cx.spawn(async move |this, cx| match selected_path.await {
-            Ok(Ok(Some(local_path))) => {
-                let overwrite = local_path.exists();
+        cx.spawn(async move |this, cx| match selected_paths.await {
+            Ok(Ok(Some(paths))) => {
+                let Some(destination) = paths.into_iter().next() else {
+                    return;
+                };
                 let _ = this.update(cx, |this, cx| {
-                    this.enqueue_sftp_transfer(
-                        session_id,
-                        SftpTransferDirection::Download,
-                        local_path,
-                        remote_path,
-                        overwrite,
-                        cx,
-                    );
+                    let handle = this
+                        .session(session_id)
+                        .and_then(|session| session.connection_handle.clone());
+                    let Some(handle) = handle else {
+                        return;
+                    };
+
+                    for entry in entries {
+                        let local_path = remote_relative_path(&browser_root, &entry.path)
+                            .map(|relative| join_remote_relative(&destination, relative))
+                            .unwrap_or_else(|| destination.join(&entry.name));
+                        if entry.kind == RemoteFileKind::Directory {
+                            let request_id = this
+                                .session_mut(session_id)
+                                .expect("SFTP session should still exist")
+                                .sftp_browser_mut(placement)
+                                .begin_download_tree(local_path);
+                            if let Err(error) =
+                                handle.read_directory_tree(request_id, entry.path.clone())
+                                && let Some(session) = this.session_mut(session_id)
+                            {
+                                session
+                                    .sftp_browser_mut(placement)
+                                    .fail_request(request_id, error.to_string());
+                            }
+                        } else if entry.kind == RemoteFileKind::File {
+                            this.enqueue_sftp_transfer(
+                                session_id,
+                                SftpTransferDirection::Download,
+                                local_path,
+                                entry.path,
+                                false,
+                                cx,
+                            );
+                        }
+                    }
                 });
             }
             Ok(Ok(None)) | Err(_) => {}
@@ -1984,13 +2381,266 @@ impl RemCmdApp {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(session) = this.session_mut(session_id) {
                         session.sftp_browser_mut(placement).error =
-                            Some(format!("Failed to open download picker: {error}"));
+                            Some(format!("Failed to open download destination: {error}"));
                     }
                     cx.notify();
                 });
             }
         })
         .detach();
+    }
+
+    fn complete_directory_tree_download(
+        &mut self,
+        session_id: SessionId,
+        request_id: u64,
+        tree: RemoteDirectoryTree,
+        cx: &mut Context<Self>,
+    ) {
+        let placement = sftp_browser_placement_for_request(request_id);
+        let destination = self.session_mut(session_id).and_then(|session| {
+            session
+                .sftp_browser_mut(placement)
+                .take_download_tree_destination(request_id)
+        });
+        let Some(destination) = destination else {
+            return;
+        };
+        let runtime = cx.global::<SshRuntime>().handle();
+
+        cx.spawn(async move |this, cx| {
+            let plan = runtime
+                .spawn_blocking(move || build_remote_download_plan(tree, destination))
+                .await;
+            let _ = this.update(cx, |this, cx| match plan {
+                Ok(Ok(plan)) => {
+                    for (local_path, remote_path) in plan {
+                        this.enqueue_sftp_transfer(
+                            session_id,
+                            SftpTransferDirection::Download,
+                            local_path,
+                            remote_path,
+                            false,
+                            cx,
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    if let Some(session) = this.session_mut(session_id) {
+                        session.sftp_browser_mut(placement).error =
+                            Some(format!("Failed to prepare recursive download: {error}"));
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    if let Some(session) = this.session_mut(session_id) {
+                        session.sftp_browser_mut(placement).error =
+                            Some(format!("Recursive download task failed: {error}"));
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn selected_sftp_entries(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+    ) -> Vec<RemoteFileEntry> {
+        self.session(session_id)
+            .map(|session| session.sftp_browser(placement).selected_entries())
+            .unwrap_or_default()
+    }
+
+    fn download_selected_sftp_entries(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.selected_sftp_entries(session_id, placement);
+        self.sftp_context_menu = None;
+        self.choose_sftp_downloads(session_id, placement, entries, cx);
+    }
+
+    fn open_selected_sftp_file(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self
+            .selected_sftp_entries(session_id, placement)
+            .into_iter()
+            .next()
+            .filter(|entry| entry.kind == RemoteFileKind::File);
+        self.sftp_context_menu = None;
+        if let Some(entry) = entry {
+            self.open_remote_file(entry.path, editable, cx);
+        }
+    }
+
+    fn copy_selected_sftp_paths(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self
+            .selected_sftp_entries(session_id, placement)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        if !paths.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+        }
+        self.sftp_context_menu = None;
+        cx.notify();
+    }
+
+    fn delete_selected_sftp_entries(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries =
+            collapse_nested_remote_entries(self.selected_sftp_entries(session_id, placement));
+        if entries.is_empty() {
+            return;
+        }
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let message = if paths.len() == 1 {
+            format!("Delete {}?", entries[0].name)
+        } else {
+            format!("Delete {} selected items?", paths.len())
+        };
+        self.sftp_context_menu = None;
+        let answer = window.prompt(
+            PromptLevel::Critical,
+            &message,
+            Some("Directories and their contents will be deleted recursively."),
+            &[PromptButton::new("Delete"), PromptButton::cancel("Cancel")],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                let handle = this
+                    .session(session_id)
+                    .and_then(|session| session.connection_handle.clone());
+                let Some(handle) = handle else {
+                    return;
+                };
+                let request_id = this
+                    .session_mut(session_id)
+                    .expect("SFTP session should still exist")
+                    .sftp_browser_mut(placement)
+                    .next_request_id();
+                if let Err(error) = handle.delete_paths(request_id, paths)
+                    && let Some(session) = this.session_mut(session_id)
+                {
+                    session.sftp_browser_mut(placement).error = Some(error.to_string());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_sftp_create_prompt(
+        &mut self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        kind: SftpCreateKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            TextField::new(
+                cx,
+                "",
+                match kind {
+                    SftpCreateKind::File => "File name",
+                    SftpCreateKind::Directory => "Folder name",
+                },
+            )
+        });
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        input.focus_handle(cx).focus(window);
+        self.sftp_context_menu = None;
+        self.sftp_create_prompt = Some(SftpCreatePrompt {
+            session_id,
+            placement,
+            kind,
+            input,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_sftp_create(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.sftp_create_prompt.as_ref() else {
+            return;
+        };
+        let name = prompt.input.read(cx).text().trim().to_owned();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            if let Some(prompt) = self.sftp_create_prompt.as_mut() {
+                prompt.error = Some("Enter a valid name without path separators".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        let session_id = prompt.session_id;
+        let placement = prompt.placement;
+        let kind = prompt.kind;
+        let directory = self
+            .session(session_id)
+            .map(|session| session.sftp_browser(placement).path.clone())
+            .unwrap_or_else(|| ".".into());
+        let path = remote_join_path(&directory, &name);
+        let handle = self
+            .session(session_id)
+            .and_then(|session| session.connection_handle.clone());
+        let Some(handle) = handle else {
+            return;
+        };
+        let request_id = self
+            .session_mut(session_id)
+            .expect("SFTP session should still exist")
+            .sftp_browser_mut(placement)
+            .next_request_id();
+        let result = match kind {
+            SftpCreateKind::File => handle.create_file(request_id, path),
+            SftpCreateKind::Directory => handle.create_directories(request_id, vec![path]),
+        };
+        match result {
+            Ok(()) => {
+                self.sftp_create_prompt = None;
+            }
+            Err(error) => {
+                if let Some(prompt) = self.sftp_create_prompt.as_mut() {
+                    prompt.error = Some(error.to_string());
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn enqueue_sftp_transfer(
@@ -4402,12 +5052,45 @@ impl RemCmdApp {
                 }
                 true
             }
+            ConnectionEvent::DirectoryTreeRead { request_id, tree } => {
+                self.complete_directory_tree_download(session_id, request_id, tree, cx);
+                true
+            }
             ConnectionEvent::FileRead { request_id, file } => {
                 self.complete_remote_file_read(session_id, request_id, file, cx);
                 true
             }
             ConnectionEvent::FileWritten { request_id, file } => {
                 self.complete_remote_file_write(session_id, request_id, file);
+                true
+            }
+            ConnectionEvent::PathCreated {
+                request_id,
+                path,
+                kind,
+            } => {
+                let placement = sftp_browser_placement_for_request(request_id);
+                self.refresh_sftp_directory_for_session(session_id, placement, cx);
+                if kind == RemoteFileKind::File && self.active_session_id == Some(session_id) {
+                    self.open_remote_file(path, true, cx);
+                }
+                true
+            }
+            ConnectionEvent::DirectoriesCreated {
+                request_id,
+                paths: _,
+            } => {
+                let placement = sftp_browser_placement_for_request(request_id);
+                self.refresh_sftp_directory_for_session(session_id, placement, cx);
+                true
+            }
+            ConnectionEvent::PathsDeleted { request_id, paths } => {
+                let placement = sftp_browser_placement_for_request(request_id);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.sftp.remove_paths(&paths);
+                    session.sidebar_sftp.remove_paths(&paths);
+                }
+                self.refresh_sftp_directory_for_session(session_id, placement, cx);
                 true
             }
             ConnectionEvent::TransferProgress {
@@ -4464,12 +5147,26 @@ impl RemCmdApp {
                                 .fail_request(request_id, error.to_string());
                             false
                         }
+                        SftpOperation::ReadDirectoryTree => {
+                            let placement = sftp_browser_placement_for_request(request_id);
+                            session
+                                .sftp_browser_mut(placement)
+                                .fail_request(request_id, error.to_string());
+                            false
+                        }
                         SftpOperation::ReadFile | SftpOperation::WriteFile => {
                             session.sftp.fail_file_request(
                                 request_id,
                                 operation,
                                 error.to_string(),
                             );
+                            false
+                        }
+                        SftpOperation::CreateFile
+                        | SftpOperation::CreateDirectory
+                        | SftpOperation::DeletePaths => {
+                            let placement = sftp_browser_placement_for_request(request_id);
+                            session.sftp_browser_mut(placement).error = Some(error.to_string());
                             false
                         }
                         SftpOperation::UploadFile
@@ -4666,6 +5363,35 @@ impl Render for RemCmdApp {
                     ),
             );
         }
+        if self.sftp_context_menu.is_some() {
+            root = root
+                .child(
+                    div()
+                        .id("sftp_context_menu_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.sftp_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.sftp_context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(deferred(self.render_sftp_context_menu(window, cx)).with_priority(20));
+        }
 
         if self
             .active_session()
@@ -4679,6 +5405,12 @@ impl Render for RemCmdApp {
             }
 
             root = root.child(self.render_credential_prompt(cx));
+        } else if let Some(prompt) = self.sftp_create_prompt.as_ref() {
+            let focus_handle = prompt.input.focus_handle(cx);
+            if !focus_handle.is_focused(window) {
+                window.focus(&focus_handle);
+            }
+            root = root.child(self.render_sftp_create_prompt(cx));
         } else if should_focus_terminal
             && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
             && !focus_handle.is_focused(window)
@@ -7475,6 +8207,273 @@ impl RemCmdApp {
             .child(files_button)
     }
 
+    fn render_sftp_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu_state) = self.sftp_context_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let session_id = menu_state.session_id;
+        let placement = menu_state.placement;
+        let entries = self.selected_sftp_entries(session_id, placement);
+        let connected = self
+            .session(session_id)
+            .is_some_and(|session| session.connection_state == SessionState::Connected);
+        let single_file = (entries.len() == 1 && entries[0].kind == RemoteFileKind::File)
+            .then(|| entries[0].clone());
+        let can_download = connected
+            && entries.iter().any(|entry| {
+                matches!(entry.kind, RemoteFileKind::File | RemoteFileKind::Directory)
+            });
+        let viewport = window.viewport_size();
+        let left = f32::from(menu_state.position.x)
+            .min((f32::from(viewport.width) - 196.0).max(8.0))
+            .max(8.0);
+        let top = f32::from(menu_state.position.y)
+            .min((f32::from(viewport.height) - 286.0).max(8.0))
+            .max(8.0);
+
+        let mut new_file = self.render_sftp_context_menu_item(
+            "sftp-context-new-file",
+            "New File",
+            IconTone::Default,
+            connected,
+        );
+        if connected {
+            new_file = new_file.on_click(cx.listener(move |this, _, window, cx| {
+                this.open_sftp_create_prompt(
+                    session_id,
+                    placement,
+                    SftpCreateKind::File,
+                    window,
+                    cx,
+                );
+            }));
+        }
+        let mut new_folder = self.render_sftp_context_menu_item(
+            "sftp-context-new-folder",
+            "New Folder",
+            IconTone::Default,
+            connected,
+        );
+        if connected {
+            new_folder = new_folder.on_click(cx.listener(move |this, _, window, cx| {
+                this.open_sftp_create_prompt(
+                    session_id,
+                    placement,
+                    SftpCreateKind::Directory,
+                    window,
+                    cx,
+                );
+            }));
+        }
+        let mut copy_path = self.render_sftp_context_menu_item(
+            "sftp-context-copy-path",
+            "Copy Path",
+            IconTone::Default,
+            !entries.is_empty(),
+        );
+        if !entries.is_empty() {
+            copy_path = copy_path.on_click(cx.listener(move |this, _, _, cx| {
+                this.copy_selected_sftp_paths(session_id, placement, cx);
+            }));
+        }
+        let mut view = self.render_sftp_context_menu_item(
+            "sftp-context-view",
+            "View",
+            IconTone::Default,
+            single_file.is_some(),
+        );
+        if single_file.is_some() {
+            view = view.on_click(cx.listener(move |this, _, _, cx| {
+                this.open_selected_sftp_file(session_id, placement, false, cx);
+            }));
+        }
+        let mut edit = self.render_sftp_context_menu_item(
+            "sftp-context-edit",
+            "Edit",
+            IconTone::Default,
+            single_file.is_some(),
+        );
+        if single_file.is_some() {
+            edit = edit.on_click(cx.listener(move |this, _, _, cx| {
+                this.open_selected_sftp_file(session_id, placement, true, cx);
+            }));
+        }
+        let mut download = self.render_sftp_context_menu_item(
+            "sftp-context-download",
+            "Download",
+            IconTone::Default,
+            can_download,
+        );
+        if can_download {
+            download = download.on_click(cx.listener(move |this, _, _, cx| {
+                this.download_selected_sftp_entries(session_id, placement, cx);
+            }));
+        }
+        let mut delete = self.render_sftp_context_menu_item(
+            "sftp-context-delete",
+            "Delete",
+            IconTone::Danger,
+            connected && !entries.is_empty(),
+        );
+        if connected && !entries.is_empty() {
+            delete = delete.on_click(cx.listener(move |this, _, window, cx| {
+                this.delete_selected_sftp_entries(session_id, placement, window, cx);
+            }));
+        }
+
+        div()
+            .id("sftp_context_menu")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(188.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.modal_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(4.0)),
+                blur_radius: px(16.0),
+                spread_radius: px(-3.0),
+            }])
+            .occlude()
+            .child(new_file)
+            .child(new_folder)
+            .child(self.render_sftp_context_menu_separator())
+            .child(copy_path)
+            .child(view)
+            .child(edit)
+            .child(download)
+            .child(self.render_sftp_context_menu_separator())
+            .child(delete)
+            .into_any_element()
+    }
+
+    fn render_sftp_context_menu_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        tone: IconTone,
+        enabled: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let hover = self.theme.control_hover_bg;
+        let pressed = self.theme.control_pressed_bg;
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .h(px(28.0))
+            .px_2()
+            .rounded_md()
+            .text_sm()
+            .text_color(match tone {
+                IconTone::Danger => self.theme.danger,
+                IconTone::Accent => self.theme.accent,
+                IconTone::Default => self.theme.text_primary,
+            })
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .active(move |this| this.bg(pressed))
+            })
+            .when(!enabled, |this| this.opacity(0.45))
+            .child(label)
+    }
+
+    fn render_sftp_context_menu_separator(&self) -> gpui::Div {
+        div().h(px(1.0)).mx_2().my_1().bg(self.theme.border)
+    }
+
+    fn render_sftp_create_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(prompt) = self.sftp_create_prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = match prompt.kind {
+            SftpCreateKind::File => "New File",
+            SftpCreateKind::Directory => "New Folder",
+        };
+        let input = prompt.input.clone();
+        let create = text_button(
+            "submit_sftp_create",
+            "Create",
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.submit_sftp_create(cx)));
+        let cancel = text_button(
+            "cancel_sftp_create",
+            "Cancel",
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sftp_create_prompt = None;
+            cx.notify();
+        }));
+
+        div()
+            .id("sftp_create_prompt_overlay")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(self.theme.overlay_bg)
+            .occlude()
+            .key_context("SftpCreatePrompt")
+            .on_action(cx.listener(|this, _: &SubmitSftpCreate, _, cx| this.submit_sftp_create(cx)))
+            .on_action(cx.listener(|this, _: &CancelSftpCreate, _, cx| {
+                this.sftp_create_prompt = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(self.theme.border_strong)
+                    .bg(self.theme.modal_bg)
+                    .shadow(vec![BoxShadow {
+                        color: self.theme.shadow,
+                        offset: point(px(0.0), px(6.0)),
+                        blur_radius: px(24.0),
+                        spread_radius: px(-5.0),
+                    }])
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(input)
+                    .when_some(prompt.error.as_ref(), |this, error| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(self.theme.error_text)
+                                .child(error.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(cancel)
+                            .child(create),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_sftp_browser(
         &self,
         session_id: SessionId,
@@ -7489,7 +8488,9 @@ impl RemCmdApp {
         }
         let browser_state = session.sftp_browser(placement);
         let path = browser_state.path.clone();
-        let entry_count = browser_state.entries.len();
+        let tree = placement == SftpBrowserPlacement::Sidebar;
+        let entry_count = browser_state.visible_rows(tree).len();
+        let selected_entries = browser_state.selected_entries();
         let scroll_handle = browser_state.scroll_handle.clone();
         let loading = browser_state.loading;
         let loaded = browser_state.loaded;
@@ -7584,53 +8585,98 @@ impl RemCmdApp {
                 this.choose_sftp_uploads(session_id, placement, cx);
             }));
         }
+        let can_download = connected
+            && !loading
+            && selected_entries.iter().any(|entry| {
+                matches!(entry.kind, RemoteFileKind::File | RemoteFileKind::Directory)
+            });
+        let mut download_button = self.render_icon_button(
+            SharedString::from(format!("sftp_download_selected_{element_suffix}")),
+            IconName::Download,
+            "Download selected",
+            IconTone::Default,
+            can_download,
+        );
+        if can_download {
+            download_button = download_button.on_click(cx.listener(move |this, _, _, cx| {
+                this.download_selected_sftp_entries(session_id, placement, cx);
+            }));
+        }
+        let can_delete = connected && !loading && !selected_entries.is_empty();
+        let mut delete_button = self.render_icon_button(
+            SharedString::from(format!("sftp_delete_selected_{element_suffix}")),
+            IconName::Delete,
+            "Delete selected",
+            IconTone::Danger,
+            can_delete,
+        );
+        if can_delete {
+            delete_button = delete_button.on_click(cx.listener(move |this, _, window, cx| {
+                this.delete_selected_sftp_entries(session_id, placement, window, cx);
+            }));
+        }
 
-        let mut browser = div()
-            .id(SharedString::from(format!("sftp_browser_{element_suffix}")))
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .mt_4()
-            .overflow_hidden()
-            .rounded_md()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.panel_bg)
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .h(px(40.0))
-                    .px_2()
-                    .border_b_1()
-                    .border_color(self.theme.border)
-                    .child(parent_button)
-                    .child(refresh_button)
-                    .child(upload_button)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .ml_2()
-                            .truncate()
-                            .font_family(TERMINAL_FONT_FAMILY)
-                            .text_sm()
-                            .child(path),
-                    )
-                    .when(loading && loaded, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_sm()
-                                .text_color(self.theme.text_muted)
-                                .child("Loading..."),
-                        )
+        let mut browser =
+            div()
+                .id(SharedString::from(format!("sftp_browser_{element_suffix}")))
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .mt_4()
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(self.theme.border)
+                .bg(self.theme.panel_bg)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(session) = this.session_mut(session_id) {
+                            let browser = session.sftp_browser_mut(placement);
+                            browser.selected_paths.clear();
+                            browser.selection_anchor = None;
+                        }
+                        this.sftp_context_menu = Some(SftpContextMenu {
+                            session_id,
+                            placement,
+                            position: event.position,
+                        });
+                        cx.notify();
                     }),
-            );
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .h(px(40.0))
+                        .px_2()
+                        .border_b_1()
+                        .border_color(self.theme.border)
+                        .child(parent_button)
+                        .child(refresh_button)
+                        .child(upload_button)
+                        .child(download_button)
+                        .child(delete_button)
+                        .child(
+                            div().flex_1().min_w(px(0.0)).ml_2().child(
+                                self.render_sftp_breadcrumbs(session_id, placement, &path, cx),
+                            ),
+                        )
+                        .when(loading && loaded, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_sm()
+                                    .text_color(self.theme.text_muted)
+                                    .child("Loading..."),
+                            )
+                        }),
+                );
 
         if let Some(error) = error {
             browser = browser.child(
@@ -7653,6 +8699,56 @@ impl RemCmdApp {
             .into_any_element()
     }
 
+    fn render_sftp_breadcrumbs(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let hover = self.theme.control_hover_bg;
+        let pressed = self.theme.control_pressed_bg;
+        let mut breadcrumbs = div()
+            .flex()
+            .min_w(px(0.0))
+            .items_center()
+            .overflow_hidden()
+            .font_family(TERMINAL_FONT_FAMILY)
+            .text_sm();
+        for (index, (label, target)) in remote_breadcrumbs(path).into_iter().enumerate() {
+            if index > 0 {
+                breadcrumbs = breadcrumbs.child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .text_color(self.theme.text_faint)
+                        .child("/"),
+                );
+            }
+            breadcrumbs = breadcrumbs.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "sftp-breadcrumb-{}-{index}",
+                        placement.element_suffix()
+                    )))
+                    .flex_none()
+                    .max_w(px(120.0))
+                    .truncate()
+                    .px_1()
+                    .py(px(2.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .active(move |this| this.bg(pressed))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request_sftp_directory(session_id, placement, target.clone(), cx);
+                    })),
+            );
+        }
+        breadcrumbs
+    }
+
     fn render_sftp_entry_rows(
         &self,
         session_id: SessionId,
@@ -7660,29 +8756,43 @@ impl RemCmdApp {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let Some((entries, connected, loading)) = self.session(session_id).map(|session| {
-            let browser = session.sftp_browser(placement);
-            let entries = browser
-                .entries
-                .get(range)
-                .map_or_else(Vec::new, <[RemoteFileEntry]>::to_vec);
-            (
-                entries,
-                session.connection_state == SessionState::Connected,
-                browser.loading,
-            )
-        }) else {
+        let tree = placement == SftpBrowserPlacement::Sidebar;
+        let Some((tree_rows, selected_paths, connected, loading)) =
+            self.session(session_id).map(|session| {
+                let browser = session.sftp_browser(placement);
+                let tree_rows = browser
+                    .visible_rows(tree)
+                    .get(range)
+                    .map_or_else(Vec::new, <[SftpTreeRow]>::to_vec);
+                (
+                    tree_rows,
+                    browser.selected_paths.clone(),
+                    session.connection_state == SessionState::Connected,
+                    browser.loading,
+                )
+            })
+        else {
             return Vec::new();
         };
         let list_hover = self.theme.list_hover_bg;
         let pressed = self.theme.control_pressed_bg;
+        let selected_background = self.theme.list_selected_bg;
         let element_suffix = placement.element_suffix();
-        let mut rows = Vec::with_capacity(entries.len());
+        let mut rows = Vec::with_capacity(tree_rows.len());
 
-        for entry in entries {
+        for tree_row in tree_rows {
+            let entry = tree_row.entry;
             let is_directory = entry.kind == RemoteFileKind::Directory;
             let is_file = entry.kind == RemoteFileKind::File;
             let entry_path = entry.path.clone();
+            let context_entry_path = entry_path.clone();
+            let is_selected = selected_paths.contains(&entry_path);
+            let is_expanded = self.session(session_id).is_some_and(|session| {
+                session
+                    .sftp_browser(placement)
+                    .expanded_paths
+                    .contains(&entry_path)
+            });
             let icon_name = if is_directory {
                 IconName::Folder
             } else {
@@ -7696,22 +8806,53 @@ impl RemCmdApp {
                     .map(format_remote_size)
                     .unwrap_or_else(|| "-".into())
             };
-            let download_control = if is_file && connected && !loading {
-                let download_path = entry_path.clone();
-                self.render_icon_button(
-                    SharedString::from(format!("sftp-download-{element_suffix}-{}", entry.path)),
-                    IconName::Download,
-                    "Download",
-                    IconTone::Default,
-                    true,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.choose_sftp_download(session_id, placement, download_path.clone(), cx);
-                }))
-                .into_any_element()
+            let disclosure = if tree && is_directory {
+                let disclosure_path = entry_path.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "sftp-disclosure-{element_suffix}-{}",
+                        entry.path
+                    )))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(20.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(list_hover))
+                    .child(icon(
+                        if is_expanded {
+                            IconName::Collapse
+                        } else {
+                            IconName::Expand
+                        },
+                        self.theme,
+                        IconTone::Default,
+                        13.0,
+                    ))
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        if !event.standard_click() || event.click_count() != 1 {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.toggle_remote_tree_directory(
+                            session_id,
+                            placement,
+                            disclosure_path.clone(),
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
+            } else if tree {
+                div().flex_none().size(px(20.0)).into_any_element()
             } else {
-                div().flex_none().size(px(32.0)).into_any_element()
+                div().flex_none().w(px(0.0)).into_any_element()
+            };
+            let row_hover = if is_selected {
+                selected_background
+            } else {
+                list_hover
             };
             let mut row = div()
                 .id(SharedString::from(format!(
@@ -7725,9 +8866,16 @@ impl RemCmdApp {
                 .items_center()
                 .gap_2()
                 .h(px(36.0))
-                .px_3()
+                .pl(px(8.0 + tree_row.depth as f32 * 16.0))
+                .pr_3()
                 .border_b_1()
                 .border_color(self.theme.border)
+                .bg(if is_selected {
+                    selected_background
+                } else {
+                    self.theme.transparent
+                })
+                .child(disclosure)
                 .child(self.render_sidebar_icon(icon_name, 16.0))
                 .child(
                     div()
@@ -7745,18 +8893,57 @@ impl RemCmdApp {
                         .text_sm()
                         .text_color(self.theme.text_muted)
                         .child(size),
-                )
-                .child(download_control);
-            if (is_directory || is_file) && connected && !loading {
+                );
+            if is_directory || is_file {
                 row = row
                     .cursor_pointer()
-                    .hover(move |this| this.bg(list_hover))
+                    .hover(move |this| this.bg(row_hover))
                     .active(move |this| this.bg(pressed))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if is_directory {
-                            this.open_remote_directory(placement, entry_path.clone(), cx);
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(session) = this.session_mut(session_id) {
+                                session
+                                    .sftp_browser_mut(placement)
+                                    .select_for_context_menu(&context_entry_path);
+                            }
+                            this.sftp_context_menu = Some(SftpContextMenu {
+                                session_id,
+                                placement,
+                                position: event.position,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        if !event.standard_click() {
+                            return;
+                        }
+                        if let Some(session) = this.session_mut(session_id) {
+                            session.sftp_browser_mut(placement).select_path(
+                                &entry_path,
+                                event.modifiers(),
+                                tree,
+                            );
+                        }
+                        if event.click_count() >= 2 && connected && !loading {
+                            if is_directory {
+                                if tree {
+                                    this.request_sftp_directory(
+                                        session_id,
+                                        placement,
+                                        entry_path.clone(),
+                                        cx,
+                                    );
+                                } else {
+                                    this.open_remote_directory(placement, entry_path.clone(), cx);
+                                }
+                            } else {
+                                this.open_remote_file(entry_path.clone(), true, cx);
+                            }
                         } else {
-                            this.open_remote_file(entry_path.clone(), cx);
+                            cx.notify();
                         }
                     }));
             }
@@ -7993,6 +9180,7 @@ impl RemCmdApp {
         let editor = file.editor.clone();
         let loading = file.loading;
         let saving = file.saving;
+        let editable = file.editable;
         let error = file.error.clone();
         let binary = !loading && error.is_none() && file.text_format.is_none();
         let dirty = file.is_dirty(cx);
@@ -8025,7 +9213,7 @@ impl RemCmdApp {
             }));
         }
 
-        let can_save = dirty && !saving && connected;
+        let can_save = editable && dirty && !saving && connected;
         let mut save_button = text_button(
             "sftp_save_file",
             if saving { "Saving" } else { "Save" },
@@ -8110,8 +9298,19 @@ impl RemCmdApp {
                                 .child("Modified"),
                         )
                     })
-                    .child(revert_button)
-                    .child(save_button),
+                    .when(!editable, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .mr_2()
+                                .text_sm()
+                                .text_color(self.theme.text_muted)
+                                .child("Read Only"),
+                        )
+                    })
+                    .when(editable, |this| {
+                        this.child(revert_button).child(save_button)
+                    }),
             )
             .when_some(error, |this, error| {
                 this.child(
@@ -8695,11 +9894,164 @@ fn remote_join_path(directory: &str, name: &str) -> String {
     }
 }
 
-fn default_download_directory() -> PathBuf {
-    UserDirs::new()
-        .and_then(|directories| directories.download_dir().map(Path::to_path_buf))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(std::env::temp_dir)
+struct LocalUploadPlan {
+    directories: Vec<String>,
+    files: Vec<(PathBuf, String)>,
+}
+
+fn build_local_upload_plan(
+    selected_paths: &[PathBuf],
+    remote_directory: &str,
+) -> std::io::Result<LocalUploadPlan> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    let mut pending = Vec::new();
+
+    for path in selected_paths {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let remote_path = remote_join_path(remote_directory, name.to_string_lossy().as_ref());
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            directories.push(remote_path.clone());
+            pending.push((path.clone(), remote_path));
+        } else if metadata.is_file() {
+            files.push((path.clone(), remote_path));
+        }
+    }
+
+    while let Some((local_directory, remote_directory)) = pending.pop() {
+        let mut entries = std::fs::read_dir(&local_directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let local_path = entry.path();
+            let metadata = std::fs::symlink_metadata(&local_path)?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let remote_path = remote_join_path(
+                &remote_directory,
+                entry.file_name().to_string_lossy().as_ref(),
+            );
+            if metadata.is_dir() {
+                directories.push(remote_path.clone());
+                pending.push((local_path, remote_path));
+            } else if metadata.is_file() {
+                files.push((local_path, remote_path));
+            }
+        }
+    }
+
+    directories.sort_by(|left, right| {
+        remote_path_depth(left)
+            .cmp(&remote_path_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+    directories.dedup();
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    files.dedup_by(|left, right| left.1 == right.1);
+    Ok(LocalUploadPlan { directories, files })
+}
+
+fn build_remote_download_plan(
+    tree: RemoteDirectoryTree,
+    destination: PathBuf,
+) -> std::io::Result<Vec<(PathBuf, String)>> {
+    std::fs::create_dir_all(&destination)?;
+    for directory in tree.directories {
+        let relative = remote_relative_path(&tree.root, &directory).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote directory escaped its requested root",
+            )
+        })?;
+        std::fs::create_dir_all(join_remote_relative(&destination, relative))?;
+    }
+
+    tree.files
+        .into_iter()
+        .map(|file| {
+            let relative = remote_relative_path(&tree.root, &file.path).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote file escaped its requested root",
+                )
+            })?;
+            let local_path = join_remote_relative(&destination, relative);
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok((local_path, file.path))
+        })
+        .collect()
+}
+
+fn remote_relative_path<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+    if path == root {
+        return Some("");
+    }
+    path.strip_prefix(root.trim_end_matches('/'))?
+        .strip_prefix('/')
+}
+
+fn join_remote_relative(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != "." && *component != "..")
+        .fold(root.to_path_buf(), |path, component| path.join(component))
+}
+
+fn collapse_nested_remote_entries(mut entries: Vec<RemoteFileEntry>) -> Vec<RemoteFileEntry> {
+    entries.sort_by(|left, right| {
+        remote_path_depth(&left.path)
+            .cmp(&remote_path_depth(&right.path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries.dedup_by(|left, right| left.path == right.path);
+    let selected_directories = entries
+        .iter()
+        .filter(|entry| entry.kind == RemoteFileKind::Directory)
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    entries.retain(|entry| {
+        !selected_directories.iter().any(|directory| {
+            directory != &entry.path && remote_path_is_descendant(directory, &entry.path)
+        })
+    });
+    entries
+}
+
+fn remote_path_is_descendant(parent: &str, candidate: &str) -> bool {
+    if parent == candidate {
+        return false;
+    }
+    if parent == "/" {
+        return candidate.starts_with('/') && candidate.len() > 1;
+    }
+    candidate
+        .strip_prefix(parent.trim_end_matches('/'))
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn remote_path_depth(path: &str) -> usize {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .count()
+}
+
+fn remote_breadcrumbs(path: &str) -> Vec<(String, String)> {
+    if !path.starts_with('/') {
+        return vec![(path.to_owned(), path.to_owned())];
+    }
+    let mut breadcrumbs = vec![("/".into(), "/".into())];
+    let mut target = String::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        target.push('/');
+        target.push_str(component);
+        breadcrumbs.push((component.to_owned(), target.clone()));
+    }
+    breadcrumbs
 }
 
 fn format_remote_size(bytes: u64) -> String {
@@ -8927,6 +10279,13 @@ fn bind_settings_selector_keys(cx: &mut App) {
     )]);
 }
 
+fn bind_sftp_create_prompt_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("enter", SubmitSftpCreate, Some("SftpCreatePrompt")),
+        KeyBinding::new("escape", CancelSftpCreate, Some("SftpCreatePrompt")),
+    ]);
+}
+
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
 
@@ -8935,6 +10294,7 @@ fn launch(cx: &mut App) {
     bind_credential_prompt_keys(cx);
     bind_host_key_prompt_keys(cx);
     bind_settings_selector_keys(cx);
+    bind_sftp_create_prompt_keys(cx);
     open_main_window(cx);
     cx.activate(true);
 }
@@ -9111,6 +10471,187 @@ mod tests {
             "/home/test/notes.txt"
         );
         assert_eq!(remote_file_name("/home/test/notes.txt"), "notes.txt");
+    }
+
+    #[test]
+    fn sftp_tree_flattens_only_expanded_directories() {
+        let mut browser = SftpBrowserState {
+            entries: vec![
+                remote_entry("/home/test/projects", RemoteFileKind::Directory),
+                remote_entry("/home/test/notes.txt", RemoteFileKind::File),
+            ],
+            ..SftpBrowserState::default()
+        };
+        browser.tree_entries.insert(
+            "/home/test/projects".into(),
+            vec![
+                remote_entry("/home/test/projects/src", RemoteFileKind::Directory),
+                remote_entry("/home/test/projects/todo.txt", RemoteFileKind::File),
+            ],
+        );
+        browser.expanded_paths.insert("/home/test/projects".into());
+
+        let rows = browser.visible_rows(true);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.entry.path.as_str(), row.depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/home/test/projects", 0),
+                ("/home/test/projects/src", 1),
+                ("/home/test/projects/todo.txt", 1),
+                ("/home/test/notes.txt", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn sftp_tree_selection_supports_ranges_and_secondary_toggle() {
+        let mut browser = SftpBrowserState {
+            entries: vec![
+                remote_entry("/home/test/first", RemoteFileKind::File),
+                remote_entry("/home/test/second", RemoteFileKind::File),
+                remote_entry("/home/test/third", RemoteFileKind::File),
+            ],
+            ..SftpBrowserState::default()
+        };
+
+        browser.select_path("/home/test/first", gpui::Modifiers::default(), true);
+        browser.select_path(
+            "/home/test/third",
+            gpui::Modifiers {
+                shift: true,
+                ..gpui::Modifiers::default()
+            },
+            true,
+        );
+        assert_eq!(
+            browser.selected_paths,
+            vec!["/home/test/first", "/home/test/second", "/home/test/third"]
+        );
+
+        browser.select_path("/home/test/second", secondary_modifiers_for_test(), true);
+        assert_eq!(
+            browser.selected_paths,
+            vec!["/home/test/first", "/home/test/third"]
+        );
+    }
+
+    #[test]
+    fn recursive_operations_drop_children_of_selected_directories() {
+        let entries = collapse_nested_remote_entries(vec![
+            remote_entry("/home/test/projects/src/main.rs", RemoteFileKind::File),
+            remote_entry("/home/test/notes.txt", RemoteFileKind::File),
+            remote_entry("/home/test/projects", RemoteFileKind::Directory),
+            remote_entry("/home/test/projects/src", RemoteFileKind::Directory),
+        ]);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/home/test/notes.txt", "/home/test/projects"]
+        );
+    }
+
+    #[test]
+    fn remote_breadcrumbs_link_every_ancestor() {
+        assert_eq!(
+            remote_breadcrumbs("/home/test/projects"),
+            vec![
+                ("/".into(), "/".into()),
+                ("home".into(), "/home".into()),
+                ("test".into(), "/home/test".into()),
+                ("projects".into(), "/home/test/projects".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recursive_upload_plan_preserves_empty_directories_and_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(project.join("empty")).unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let plan = build_local_upload_plan(std::slice::from_ref(&project), "/home/test").unwrap();
+
+        assert_eq!(
+            plan.directories,
+            vec![
+                "/home/test/project",
+                "/home/test/project/empty",
+                "/home/test/project/src",
+            ]
+        );
+        assert_eq!(
+            plan.files,
+            vec![(
+                project.join("src/main.rs"),
+                "/home/test/project/src/main.rs".into(),
+            )]
+        );
+    }
+
+    #[test]
+    fn recursive_download_plan_creates_empty_directories_and_file_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("project");
+        let plan = build_remote_download_plan(
+            RemoteDirectoryTree {
+                root: "/home/test/project".into(),
+                directories: vec![
+                    "/home/test/project".into(),
+                    "/home/test/project/empty".into(),
+                    "/home/test/project/src".into(),
+                ],
+                files: vec![remote_entry(
+                    "/home/test/project/src/main.rs",
+                    RemoteFileKind::File,
+                )],
+            },
+            destination.clone(),
+        )
+        .unwrap();
+
+        assert!(destination.join("empty").is_dir());
+        assert!(destination.join("src").is_dir());
+        assert_eq!(
+            plan,
+            vec![(
+                destination.join("src/main.rs"),
+                "/home/test/project/src/main.rs".into(),
+            )]
+        );
+    }
+
+    fn remote_entry(path: &str, kind: RemoteFileKind) -> RemoteFileEntry {
+        RemoteFileEntry {
+            name: remote_file_name(path).into(),
+            path: path.into(),
+            kind,
+            size: (kind == RemoteFileKind::File).then_some(12),
+            modified: None,
+        }
+    }
+
+    fn secondary_modifiers_for_test() -> gpui::Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            gpui::Modifiers {
+                platform: true,
+                ..gpui::Modifiers::default()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::default()
+            }
+        }
     }
 
     fn performance_snapshot(
