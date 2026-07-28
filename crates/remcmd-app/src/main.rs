@@ -9745,7 +9745,7 @@ impl RemCmdApp {
         }
 
         let is_open = self.open_settings_selector == Some(selector);
-        let control_width = selector.control_width();
+        let max_control_width = selector.control_width();
         let menu_width = selector.menu_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let mut menu = div()
@@ -9849,7 +9849,7 @@ impl RemCmdApp {
             .group(control_group)
             .flex()
             .flex_none()
-            .w(px(control_width))
+            .max_w(px(max_control_width))
             .items_center()
             .h(px(24.0))
             .pl(px(6.0))
@@ -9866,8 +9866,9 @@ impl RemCmdApp {
             .active(move |this| this.bg(button_pressed))
             .child(
                 div()
-                    .flex_1()
+                    .flex_none()
                     .min_w(px(0.0))
+                    .max_w(px(max_control_width - 33.0))
                     .truncate()
                     .pr(px(4.0))
                     .text_right()
@@ -9882,7 +9883,7 @@ impl RemCmdApp {
             .relative()
             .flex()
             .flex_none()
-            .w(px(control_width))
+            .max_w(px(max_control_width))
             .child(button)
             .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
     }
@@ -9890,7 +9891,7 @@ impl RemCmdApp {
     fn render_terminal_font_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
         let selector = SettingsSelector::TerminalFont;
         let is_open = self.open_settings_selector == Some(selector);
-        let control_width = selector.control_width();
+        let max_control_width = selector.control_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let mut menu = div()
             .id(SharedString::from(format!(
@@ -9988,7 +9989,7 @@ impl RemCmdApp {
             .group(control_group)
             .flex()
             .flex_none()
-            .w(px(control_width))
+            .max_w(px(max_control_width))
             .items_center()
             .h(px(24.0))
             .pl(px(6.0))
@@ -10005,8 +10006,9 @@ impl RemCmdApp {
             .active(move |this| this.bg(button_pressed))
             .child(
                 div()
-                    .flex_1()
+                    .flex_none()
                     .min_w(px(0.0))
+                    .max_w(px(max_control_width - 33.0))
                     .truncate()
                     .pr(px(4.0))
                     .text_right()
@@ -10021,7 +10023,7 @@ impl RemCmdApp {
             .relative()
             .flex()
             .flex_none()
-            .w(px(control_width))
+            .max_w(px(max_control_width))
             .child(button)
             .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
     }
@@ -10711,7 +10713,7 @@ impl RemCmdApp {
             .flex()
             .flex_none()
             .items_center()
-            .w(px(180.0))
+            .max_w(px(180.0))
             .h(px(24.0))
             .pl(px(6.0))
             .pr(px(1.0))
@@ -10727,8 +10729,9 @@ impl RemCmdApp {
             .active(move |this| this.bg(pressed_background))
             .child(
                 div()
-                    .flex_1()
+                    .flex_none()
                     .min_w(px(0.0))
+                    .max_w(px(147.0))
                     .truncate()
                     .pr(px(4.0))
                     .text_right()
@@ -10744,7 +10747,7 @@ impl RemCmdApp {
             .relative()
             .flex()
             .flex_none()
-            .w(px(180.0))
+            .max_w(px(180.0))
             .child(selector_button);
         if prompt.target_menu_open {
             let mut menu = div()
