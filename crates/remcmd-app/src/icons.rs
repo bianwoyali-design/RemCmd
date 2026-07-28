@@ -25,6 +25,7 @@ pub(crate) enum IconName {
     Folder,
     ForgetCredential,
     NewConnection,
+    PanelBottom,
     Performance,
     Picker,
     QuickCommand,
@@ -62,6 +63,7 @@ impl IconName {
             Self::Folder => "icons/folder.svg",
             Self::ForgetCredential => "icons/forget-credential.svg",
             Self::NewConnection => "icons/new-connection.svg",
+            Self::PanelBottom => "icons/panel-bottom.svg",
             Self::Performance => "icons/performance.svg",
             Self::Picker => "icons/picker.svg",
             Self::QuickCommand => "icons/quick-command.svg",
@@ -99,6 +101,7 @@ impl IconName {
             "icons/folder.svg" => Self::Folder,
             "icons/forget-credential.svg" => Self::ForgetCredential,
             "icons/new-connection.svg" => Self::NewConnection,
+            "icons/panel-bottom.svg" => Self::PanelBottom,
             "icons/performance.svg" => Self::Performance,
             "icons/picker.svg" => Self::Picker,
             "icons/quick-command.svg" => Self::QuickCommand,
@@ -163,6 +166,9 @@ impl IconName {
             }
             Self::NewConnection => {
                 r#"<path d="M14.75 5H5.5A2.5 2.5 0 0 0 3 7.5v10A2.5 2.5 0 0 0 5.5 20H16a2.5 2.5 0 0 0 2.5-2.5V9"/><path d="M3 12.5h15.5"/><circle cx="6.5" cy="8.75" r="0.55" fill="currentColor" stroke="none"/><circle cx="6.5" cy="16.25" r="0.55" fill="currentColor" stroke="none"/><circle cx="18.5" cy="5.5" r="3.25"/><path d="M18.5 3.75v3.5M16.75 5.5h3.5" stroke-width="1.1"/>"#
+            }
+            Self::PanelBottom => {
+                r#"<rect x="2" y="4" width="20" height="16" rx="3" stroke-width="1.333" stroke-linejoin="round"/><path d="M2 13.5h20" stroke-width="1.333"/>"#
             }
             Self::Performance => {
                 r#"<path d="M3 18.5h18"/><path d="m4.5 15 4-4 3 2.75 5.25-7.25 2.75 2.25"/><circle cx="4.5" cy="15" r="0.75" fill="currentColor" stroke="none"/><circle cx="8.5" cy="11" r="0.75" fill="currentColor" stroke="none"/><circle cx="11.5" cy="13.75" r="0.75" fill="currentColor" stroke="none"/><circle cx="16.75" cy="6.5" r="0.75" fill="currentColor" stroke="none"/><circle cx="19.5" cy="8.75" r="0.75" fill="currentColor" stroke="none"/>"#
