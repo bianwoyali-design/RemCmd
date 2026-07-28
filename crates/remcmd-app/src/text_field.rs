@@ -688,6 +688,8 @@ impl Element for TextElement {
 
 impl Render for TextField {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+
         div()
             .flex()
             .key_context("TextField")
@@ -710,14 +712,18 @@ impl Render for TextField {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .line_height(px(20.0))
+            .line_height(px(18.0))
             .text_size(px(14.0))
+            .text_color(theme.input_text)
             .w_full()
+            .rounded_full()
+            .bg(theme.input_bg)
+            .overflow_hidden()
             .child(
                 div()
-                    .h(px(32.0))
+                    .h(px(28.0))
                     .w_full()
-                    .px_2()
+                    .px_3()
                     .py_1()
                     .child(TextElement { input: cx.entity() }),
             )

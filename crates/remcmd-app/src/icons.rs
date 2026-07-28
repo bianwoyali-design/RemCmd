@@ -24,11 +24,16 @@ pub(crate) enum IconName {
     File,
     Folder,
     ForgetCredential,
+    Home,
     NewConnection,
+    PanelBottom,
+    Paste,
     Performance,
     Picker,
+    QuickCommand,
     Reconnect,
     Search,
+    SelectAll,
     Server,
     Settings,
     SidebarLeft,
@@ -60,11 +65,16 @@ impl IconName {
             Self::File => "icons/file.svg",
             Self::Folder => "icons/folder.svg",
             Self::ForgetCredential => "icons/forget-credential.svg",
+            Self::Home => "icons/home.svg",
             Self::NewConnection => "icons/new-connection.svg",
+            Self::PanelBottom => "icons/panel-bottom.svg",
+            Self::Paste => "icons/paste.svg",
             Self::Performance => "icons/performance.svg",
             Self::Picker => "icons/picker.svg",
+            Self::QuickCommand => "icons/quick-command.svg",
             Self::Reconnect => "icons/reconnect.svg",
             Self::Search => "icons/search.svg",
+            Self::SelectAll => "icons/select-all.svg",
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
             Self::SidebarLeft => "icons/sidebar-left.svg",
@@ -96,11 +106,16 @@ impl IconName {
             "icons/file.svg" => Self::File,
             "icons/folder.svg" => Self::Folder,
             "icons/forget-credential.svg" => Self::ForgetCredential,
+            "icons/home.svg" => Self::Home,
             "icons/new-connection.svg" => Self::NewConnection,
+            "icons/panel-bottom.svg" => Self::PanelBottom,
+            "icons/paste.svg" => Self::Paste,
             "icons/performance.svg" => Self::Performance,
             "icons/picker.svg" => Self::Picker,
+            "icons/quick-command.svg" => Self::QuickCommand,
             "icons/reconnect.svg" => Self::Reconnect,
             "icons/search.svg" => Self::Search,
+            "icons/select-all.svg" => Self::SelectAll,
             "icons/server.svg" => Self::Server,
             "icons/settings.svg" => Self::Settings,
             "icons/sidebar-left.svg" => Self::SidebarLeft,
@@ -158,8 +173,17 @@ impl IconName {
             Self::ForgetCredential => {
                 r#"<circle cx="7.5" cy="14" r="4"/><path d="M11.5 14h9m-3 0v3m-3-3v2"/><circle cx="18" cy="5.5" r="3"/><path d="M16.5 5.5h3" stroke-width="1.1"/>"#
             }
+            Self::Home => {
+                r#"<path d="m3.25 10.5 8.75-7 8.75 7"/><path d="M5.5 9.25v10.5h13V9.25"/><path d="M9.25 19.75v-6.5h5.5v6.5"/>"#
+            }
             Self::NewConnection => {
                 r#"<path d="M14.75 5H5.5A2.5 2.5 0 0 0 3 7.5v10A2.5 2.5 0 0 0 5.5 20H16a2.5 2.5 0 0 0 2.5-2.5V9"/><path d="M3 12.5h15.5"/><circle cx="6.5" cy="8.75" r="0.55" fill="currentColor" stroke="none"/><circle cx="6.5" cy="16.25" r="0.55" fill="currentColor" stroke="none"/><circle cx="18.5" cy="5.5" r="3.25"/><path d="M18.5 3.75v3.5M16.75 5.5h3.5" stroke-width="1.1"/>"#
+            }
+            Self::PanelBottom => {
+                r#"<rect x="2" y="4" width="20" height="16" rx="3" stroke-width="1.333" stroke-linejoin="round"/><path d="M2 13.5h20" stroke-width="1.333"/>"#
+            }
+            Self::Paste => {
+                r#"<path d="M8 5.5H5.5A2.5 2.5 0 0 0 3 8v11.5A2.5 2.5 0 0 0 5.5 22H15a2.5 2.5 0 0 0 2.5-2.5V17"/><rect x="8" y="2" width="13" height="15" rx="2.5"/><path d="M11 2.25V5h7V2.25" stroke-width="1.1"/>"#
             }
             Self::Performance => {
                 r#"<path d="M3 18.5h18"/><path d="m4.5 15 4-4 3 2.75 5.25-7.25 2.75 2.25"/><circle cx="4.5" cy="15" r="0.75" fill="currentColor" stroke="none"/><circle cx="8.5" cy="11" r="0.75" fill="currentColor" stroke="none"/><circle cx="11.5" cy="13.75" r="0.75" fill="currentColor" stroke="none"/><circle cx="16.75" cy="6.5" r="0.75" fill="currentColor" stroke="none"/><circle cx="19.5" cy="8.75" r="0.75" fill="currentColor" stroke="none"/>"#
@@ -167,11 +191,17 @@ impl IconName {
             Self::Picker => {
                 r#"<path d="m8.25 9.75 3.75-3.5 3.75 3.5" stroke-width="1.9"/><path d="m8.25 14.25 3.75 3.5 3.75-3.5" stroke-width="1.9"/>"#
             }
+            Self::QuickCommand => {
+                r#"<rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="m6.5 8.75 3.25 3.25-3.25 3.25"/><path d="M12.5 15.25h5"/><path d="M15.5 7h3" stroke-width="0.8"/><path d="M17 5.5v3" stroke-width="0.8"/>"#
+            }
             Self::Reconnect => {
                 r#"<path d="M19.5 8.25A8.25 8.25 0 1 0 19.75 15.25"/><path d="M19.5 3.75v4.5H15"/>"#
             }
             Self::Search => {
                 r#"<circle cx="10.25" cy="10.25" r="7.25"/><path d="m15.65 15.65 5.35 5.35"/>"#
+            }
+            Self::SelectAll => {
+                r#"<path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/><rect x="8" y="8" width="8" height="8" rx="1.5"/>"#
             }
             Self::Server => {
                 r#"<rect x="2.5" y="3.5" width="19" height="7" rx="2.25"/><rect x="2.5" y="13.5" width="19" height="7" rx="2.25"/><circle cx="6" cy="7" r="0.65" fill="currentColor" stroke="none"/><circle cx="6" cy="17" r="0.65" fill="currentColor" stroke="none"/><path d="M9.5 7h9m-9 10h9" stroke-width="0.7"/>"#
@@ -275,6 +305,7 @@ mod tests {
         assert!(assets.load("icons/check.svg").unwrap().is_some());
         assert!(assets.load("icons/copy.svg").unwrap().is_some());
         assert!(assets.load("icons/edit.svg").unwrap().is_some());
+        assert!(assets.load("icons/home.svg").unwrap().is_some());
         assert!(assets.load("icons/performance.svg").unwrap().is_some());
         assert!(assets.load("icons/picker.svg").unwrap().is_some());
         assert!(assets.load("icons/view.svg").unwrap().is_some());

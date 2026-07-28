@@ -31,6 +31,7 @@ pub struct TerminalEngine {
     terminal: Term<EventQueue>,
     events: EventQueue,
     size: TerminalSize,
+    config: TerminalConfig,
 }
 
 impl TerminalEngine {
@@ -45,7 +46,7 @@ impl TerminalEngine {
     ) -> Result<Self, InvalidTerminalSize> {
         let size = TerminalSize::new(columns, rows)?;
         let events = EventQueue::default();
-        let terminal = Term::new(map_config(config), &size, events.clone());
+        let terminal = Term::new(map_config(config.clone()), &size, events.clone());
 
         Ok(Self {
             parser: Processor::new(),
@@ -53,6 +54,7 @@ impl TerminalEngine {
             terminal,
             events,
             size,
+            config,
         })
     }
 
@@ -79,7 +81,16 @@ impl TerminalEngine {
     }
 
     pub fn set_config(&mut self, config: TerminalConfig) {
-        self.terminal.set_options(map_config(config));
+        self.terminal.set_options(map_config(config.clone()));
+        self.config = config;
+    }
+
+    pub fn reset(&mut self) {
+        let events = EventQueue::default();
+        self.parser = Processor::new();
+        self.cwd_parser = Osc7Parser::default();
+        self.terminal = Term::new(map_config(self.config.clone()), &self.size, events.clone());
+        self.events = events;
     }
 
     pub fn scroll(&mut self, scroll: Scroll) {
@@ -503,6 +514,34 @@ mod tests {
                 rows: 0,
             })
         );
+    }
+
+    #[test]
+    fn reset_clears_screen_and_parser_state_without_changing_size_or_config() {
+        let config = TerminalConfig {
+            scrollback_lines: 42,
+            kitty_keyboard: true,
+            ..TerminalConfig::default()
+        };
+        let mut terminal =
+            TerminalEngine::with_config(8, 2, config.clone()).expect("valid terminal");
+        terminal.process(b"before\x1b[31m red");
+
+        terminal.reset();
+
+        assert_eq!(terminal.size(), TerminalSize::new(8, 2).unwrap());
+        assert_eq!(terminal.config, config);
+        assert!(
+            terminal
+                .snapshot()
+                .cells
+                .iter()
+                .all(|cell| cell.character == ' ')
+        );
+        assert!(terminal.drain_events().is_empty());
+
+        terminal.process(b"after");
+        assert_eq!(row_text(&terminal.snapshot(), 0), "after");
     }
 
     #[test]

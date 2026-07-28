@@ -45,7 +45,7 @@ use std::{
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
+    FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
     PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
     Task, Timer, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window,
@@ -54,7 +54,10 @@ use gpui::{
 };
 use secrecy::SecretString;
 
-use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
+use remcmd_core::{
+    AuthConfig, ConnectionProfile, TabLayout, TerminalSettings, ThemeMode, TransferSettings,
+};
+use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 #[cfg(test)]
 use remcmd_ssh::LogicalCpuSnapshot;
 use remcmd_ssh::{
@@ -75,6 +78,7 @@ use remcmd_terminal::{
 
 const TERMINAL_COLUMNS: u32 = 80;
 const TERMINAL_ROWS: u32 = 24;
+const LOCAL_PROFILE_ID: &str = "__remcmd_local_terminal__";
 const TERMINAL_CELL_WIDTH: u16 = 8;
 const TERMINAL_CELL_HEIGHT: u16 = 19;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -88,11 +92,15 @@ const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 340.0;
 const RIGHT_SIDEBAR_MIN_WIDTH: f32 = 260.0;
 const RIGHT_SIDEBAR_MAX_WIDTH: f32 = 520.0;
 const MIN_DETAIL_PANEL_WIDTH: f32 = 180.0;
+const BOTTOM_PANEL_DEFAULT_HEIGHT: f32 = 240.0;
+const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
+const BOTTOM_PANEL_MAX_HEIGHT: f32 = 520.0;
+const BOTTOM_PANEL_HEADER_HEIGHT: f32 = 34.0;
 const COLLAPSED_TITLEBAR_LEADING_WIDTH: f32 = 140.0;
 const TITLEBAR_HEIGHT: f32 = 52.0;
 const TITLEBAR_TAB_HEIGHT: f32 = 30.0;
 const TITLEBAR_TAB_GROUP_HEIGHT: f32 = 36.0;
-const TITLEBAR_ACTION_GROUP_WIDTH: f32 = 74.0;
+const TITLEBAR_ACTION_GROUP_WIDTH: f32 = 112.0;
 const TITLEBAR_CONTROL_HOVER_SIZE: f32 = 28.0;
 const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
 const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
@@ -104,16 +112,18 @@ const TITLEBAR_CLOSE_SYMBOL_SIZE: f32 = 12.0;
 const TRAFFIC_LIGHT_INSET_X: f32 = 20.0;
 const TRAFFIC_LIGHT_INSET_Y: f32 = 18.0;
 #[cfg(target_os = "macos")]
-const TERMINAL_FONT_FAMILY: &str = "SF Mono";
+const UI_MONOSPACE_FONT_FAMILY: &str = "Menlo";
 #[cfg(target_os = "windows")]
-const TERMINAL_FONT_FAMILY: &str = "Consolas";
+const UI_MONOSPACE_FONT_FAMILY: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const TERMINAL_FONT_FAMILY: &str = "DejaVu Sans Mono";
+const UI_MONOSPACE_FONT_FAMILY: &str = "DejaVu Sans Mono";
+const TERMINAL_FONT_LINE_HEIGHT_FACTOR: f32 = 19.0 / 14.0;
 
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
 gpui::actions!(settings_selector, [CancelSettingsSelector]);
 gpui::actions!(sftp_create_prompt, [SubmitSftpCreate, CancelSftpCreate]);
+gpui::actions!(quick_command, [SubmitQuickCommand, CancelQuickCommand]);
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -157,11 +167,24 @@ struct RemCmdApp {
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
     tab_layout: TabLayout,
+    terminal_font_family: SharedString,
+    terminal_font_families: Vec<SharedString>,
+    terminal_font_size: u16,
     transfer_settings: TransferSettings,
     transfer_rate_limiter: Arc<TransferRateLimiter>,
     next_transfer_session_cursor: usize,
+    profile_context_menu: Option<ProfileContextMenu>,
     sftp_context_menu: Option<SftpContextMenu>,
+    terminal_context_menu: Option<TerminalContextMenu>,
     sftp_create_prompt: Option<SftpCreatePrompt>,
+    quick_command_prompt: Option<QuickCommandPrompt>,
+    bottom_panel_open: bool,
+    bottom_panel_height: f32,
+    bottom_panel_resize: Option<BottomPanelResize>,
+    quick_terminal_session_id: Option<SessionId>,
+    quick_terminal_focus_handle: FocusHandle,
+    focused_terminal_session_id: Option<SessionId>,
+    profile_auth_selector_open: bool,
     open_settings_selector: Option<SettingsSelector>,
     settings_focus_handle: FocusHandle,
     theme: Theme,
@@ -195,9 +218,11 @@ struct TerminalPane {
 struct TerminalSession {
     id: SessionId,
     profile_id: String,
+    kind: TerminalSessionKind,
     close_when_disconnected: bool,
     connection_state: SessionState,
     connection_handle: Option<ConnectionHandle>,
+    local_terminal_handle: Option<LocalTerminalHandle>,
     connection_error: Option<String>,
     connection_message: Option<String>,
     terminal_end_reason: Option<String>,
@@ -216,14 +241,22 @@ struct TerminalSession {
     performance: ServerPerformanceState,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalSessionKind {
+    Ssh,
+    Local,
+}
+
 impl TerminalSession {
     fn new(id: SessionId, profile_id: String) -> Self {
         Self {
             id,
             profile_id,
+            kind: TerminalSessionKind::Ssh,
             close_when_disconnected: false,
             connection_state: SessionState::Disconnected,
             connection_handle: None,
+            local_terminal_handle: None,
             connection_error: None,
             connection_message: None,
             terminal_end_reason: None,
@@ -240,6 +273,69 @@ impl TerminalSession {
             sidebar_sftp: SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START),
             transfers: SftpTransferQueue::default(),
             performance: ServerPerformanceState::default(),
+        }
+    }
+
+    fn new_local(id: SessionId) -> Self {
+        let mut session = Self::new(id, LOCAL_PROFILE_ID.into());
+        session.kind = TerminalSessionKind::Local;
+        session.sftp_availability =
+            SftpAvailability::Unavailable("SFTP is only available for SSH sessions".into());
+        session
+    }
+
+    fn is_local(&self) -> bool {
+        self.kind == TerminalSessionKind::Local
+    }
+
+    fn write_terminal_input(&self, data: Vec<u8>) -> Result<(), String> {
+        match self.kind {
+            TerminalSessionKind::Ssh => self
+                .connection_handle
+                .as_ref()
+                .ok_or_else(|| "SSH connection handle is missing".to_owned())?
+                .send_input(data)
+                .map_err(|error| error.to_string()),
+            TerminalSessionKind::Local => self
+                .local_terminal_handle
+                .as_ref()
+                .ok_or_else(|| "local terminal handle is missing".to_owned())?
+                .send_input(data)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn resize_terminal(&self, size: PtySize) -> Result<(), String> {
+        match self.kind {
+            TerminalSessionKind::Ssh => self
+                .connection_handle
+                .as_ref()
+                .ok_or_else(|| "SSH connection handle is missing".to_owned())?
+                .resize(size)
+                .map_err(|error| error.to_string()),
+            TerminalSessionKind::Local => self
+                .local_terminal_handle
+                .as_ref()
+                .ok_or_else(|| "local terminal handle is missing".to_owned())?
+                .resize(local_pty_size(size))
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn disconnect_terminal(&self) -> Result<(), String> {
+        match self.kind {
+            TerminalSessionKind::Ssh => self
+                .connection_handle
+                .as_ref()
+                .ok_or_else(|| "SSH connection handle is missing".to_owned())?
+                .disconnect()
+                .map_err(|error| error.to_string()),
+            TerminalSessionKind::Local => self
+                .local_terminal_handle
+                .as_ref()
+                .ok_or_else(|| "local terminal handle is missing".to_owned())?
+                .disconnect()
+                .map_err(|error| error.to_string()),
         }
     }
 
@@ -296,15 +392,15 @@ impl Render for CommandTooltip {
         div()
             .px_2()
             .py(px(5.0))
-            .rounded_md()
+            .rounded_lg()
             .border_1()
-            .border_color(self.theme.border)
+            .border_color(self.theme.border_strong)
             .bg(self.theme.sidebar_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(0.0), px(3.0)),
-                blur_radius: px(10.0),
-                spread_radius: px(-3.0),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
             }])
             .text_sm()
             .text_color(self.theme.text_primary)
@@ -335,6 +431,11 @@ impl ActiveTerminal {
     fn process(&mut self, bytes: &[u8]) -> Vec<TerminalEvent> {
         self.engine.process(bytes);
         self.engine.drain_events()
+    }
+
+    fn reset(&mut self) {
+        self.engine.reset();
+        self.title = None;
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
@@ -396,6 +497,8 @@ struct TerminalLayout {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ActivePanel {
     #[default]
+    Home,
+    Server,
     Connection,
     Settings,
 }
@@ -404,6 +507,8 @@ enum ActivePanel {
 enum SettingsSelector {
     Theme,
     TabLayout,
+    TerminalFont,
+    TerminalFontSize,
     TransferRate,
     ParallelTransfers,
 }
@@ -413,6 +518,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => "settings-theme-selector",
             Self::TabLayout => "settings-tab-layout-selector",
+            Self::TerminalFont => "settings-terminal-font-selector",
+            Self::TerminalFontSize => "settings-terminal-font-size-selector",
             Self::TransferRate => "settings-transfer-rate-selector",
             Self::ParallelTransfers => "settings-parallel-transfers-selector",
         }
@@ -422,6 +529,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => &THEME_SETTING_OPTIONS,
             Self::TabLayout => &TAB_LAYOUT_SETTING_OPTIONS,
+            Self::TerminalFont => &[],
+            Self::TerminalFontSize => &TERMINAL_FONT_SIZE_SETTING_OPTIONS,
             Self::TransferRate => &TRANSFER_RATE_SETTING_OPTIONS,
             Self::ParallelTransfers => &PARALLEL_TRANSFER_SETTING_OPTIONS,
         }
@@ -431,6 +540,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => 92.0,
             Self::TabLayout => 104.0,
+            Self::TerminalFont => 180.0,
+            Self::TerminalFontSize => 72.0,
             Self::TransferRate => 104.0,
             Self::ParallelTransfers => 56.0,
         }
@@ -440,6 +551,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => 104.0,
             Self::TabLayout => 120.0,
+            Self::TerminalFont => 220.0,
+            Self::TerminalFontSize => 88.0,
             Self::TransferRate => 120.0,
             Self::ParallelTransfers => 72.0,
         }
@@ -450,6 +563,7 @@ impl SettingsSelector {
 enum SettingsValue {
     Theme(ThemeMode),
     TabLayout(TabLayout),
+    TerminalFontSize(u16),
     TransferRate(u32),
     ParallelTransfers(u8),
 }
@@ -482,6 +596,76 @@ const TAB_LAYOUT_SETTING_OPTIONS: [SettingsOption; 2] = [
     SettingsOption {
         label: "Vertical",
         value: SettingsValue::TabLayout(TabLayout::Vertical),
+    },
+];
+const TERMINAL_FONT_SIZE_SETTING_OPTIONS: [SettingsOption; 17] = [
+    SettingsOption {
+        label: "8 pt",
+        value: SettingsValue::TerminalFontSize(8),
+    },
+    SettingsOption {
+        label: "9 pt",
+        value: SettingsValue::TerminalFontSize(9),
+    },
+    SettingsOption {
+        label: "10 pt",
+        value: SettingsValue::TerminalFontSize(10),
+    },
+    SettingsOption {
+        label: "11 pt",
+        value: SettingsValue::TerminalFontSize(11),
+    },
+    SettingsOption {
+        label: "12 pt",
+        value: SettingsValue::TerminalFontSize(12),
+    },
+    SettingsOption {
+        label: "13 pt",
+        value: SettingsValue::TerminalFontSize(13),
+    },
+    SettingsOption {
+        label: "14 pt",
+        value: SettingsValue::TerminalFontSize(14),
+    },
+    SettingsOption {
+        label: "15 pt",
+        value: SettingsValue::TerminalFontSize(15),
+    },
+    SettingsOption {
+        label: "16 pt",
+        value: SettingsValue::TerminalFontSize(16),
+    },
+    SettingsOption {
+        label: "17 pt",
+        value: SettingsValue::TerminalFontSize(17),
+    },
+    SettingsOption {
+        label: "18 pt",
+        value: SettingsValue::TerminalFontSize(18),
+    },
+    SettingsOption {
+        label: "20 pt",
+        value: SettingsValue::TerminalFontSize(20),
+    },
+    SettingsOption {
+        label: "22 pt",
+        value: SettingsValue::TerminalFontSize(22),
+    },
+    SettingsOption {
+        label: "24 pt",
+        value: SettingsValue::TerminalFontSize(24),
+    },
+    SettingsOption {
+        label: "26 pt",
+        value: SettingsValue::TerminalFontSize(26),
+    },
+    SettingsOption {
+        label: "28 pt",
+        value: SettingsValue::TerminalFontSize(28),
+    },
+    SettingsOption {
+        label: "32 pt",
+        value: SettingsValue::TerminalFontSize(32),
     },
 ];
 const TRANSFER_RATE_SETTING_OPTIONS: [SettingsOption; 4] = [
@@ -686,6 +870,12 @@ impl SftpBrowserPlacement {
 struct SidebarResize {
     start_x: Pixels,
     start_width: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BottomPanelResize {
+    start_y: Pixels,
+    start_height: f32,
 }
 
 struct SftpBrowserState {
@@ -1090,9 +1280,19 @@ struct SftpFileState {
     write_request_id: Option<u64>,
 }
 
+struct ProfileContextMenu {
+    profile_id: String,
+    position: gpui::Point<Pixels>,
+}
+
 struct SftpContextMenu {
     session_id: SessionId,
     placement: SftpBrowserPlacement,
+    position: gpui::Point<Pixels>,
+}
+
+struct TerminalContextMenu {
+    session_id: SessionId,
     position: gpui::Point<Pixels>,
 }
 
@@ -1107,6 +1307,14 @@ struct SftpCreatePrompt {
     placement: SftpBrowserPlacement,
     kind: SftpCreateKind,
     input: Entity<TextField>,
+    error: Option<String>,
+}
+
+struct QuickCommandPrompt {
+    input: Entity<TextField>,
+    selected_profile_ids: HashSet<String>,
+    selection_touched: bool,
+    target_menu_open: bool,
     error: Option<String>,
 }
 
@@ -1533,6 +1741,7 @@ impl RemoteTextFormat {
 
 #[derive(Clone)]
 struct ProfileEditor {
+    mode: ProfileEditorMode,
     profile_id: String,
     name: Entity<TextField>,
     host: Entity<TextField>,
@@ -1540,6 +1749,12 @@ struct ProfileEditor {
     username: Entity<TextField>,
     auth_kind: ProfileAuthKind,
     private_key_path: Entity<TextField>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileEditorMode {
+    Create,
+    Edit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1551,6 +1766,22 @@ enum ProfileAuthKind {
 }
 
 impl ProfileAuthKind {
+    const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::None, "No Password"),
+        (Self::Password, "Password"),
+        (Self::PrivateKey, "Private Key"),
+        (Self::Agent, "SSH Agent"),
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "No Password",
+            Self::Password => "Password",
+            Self::PrivateKey => "Private Key",
+            Self::Agent => "SSH Agent",
+        }
+    }
+
     fn from_config(config: &AuthConfig) -> Self {
         match config {
             AuthConfig::None => Self::None,
@@ -1673,6 +1904,14 @@ impl RemCmdApp {
         };
         let theme_mode = settings.theme_mode;
         let tab_layout = settings.tab_layout;
+        let terminal_settings = settings.terminal.normalized();
+        let terminal_font_families =
+            normalize_terminal_font_families(cx.text_system().all_font_names());
+        let terminal_font_family = resolve_terminal_font_family(
+            terminal_settings.font_family.as_deref(),
+            &terminal_font_families,
+        );
+        let terminal_font_size = terminal_settings.font_size;
         let transfer_settings = settings.transfers.normalized();
         let transfer_rate_limiter = Arc::new(TransferRateLimiter::new(
             transfer_settings.bytes_per_second(),
@@ -1686,8 +1925,9 @@ impl RemCmdApp {
         let sidebar_search = cx.new(|cx| TextField::new(cx, "", "Search connections"));
         cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
         let settings_focus_handle = cx.focus_handle();
+        let quick_terminal_focus_handle = cx.focus_handle();
 
-        let mut app = Self {
+        let app = Self {
             profiles,
             profiles_path,
             selected_profile_id,
@@ -1726,14 +1966,27 @@ impl RemCmdApp {
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
-            active_panel: ActivePanel::Connection,
+            active_panel: ActivePanel::Home,
             theme_mode,
             tab_layout,
+            terminal_font_family,
+            terminal_font_families,
+            terminal_font_size,
             transfer_settings,
             transfer_rate_limiter,
             next_transfer_session_cursor: 0,
+            profile_context_menu: None,
             sftp_context_menu: None,
+            terminal_context_menu: None,
             sftp_create_prompt: None,
+            quick_command_prompt: None,
+            bottom_panel_open: false,
+            bottom_panel_height: BOTTOM_PANEL_DEFAULT_HEIGHT,
+            bottom_panel_resize: None,
+            quick_terminal_session_id: None,
+            quick_terminal_focus_handle: quick_terminal_focus_handle.clone(),
+            focused_terminal_session_id: None,
+            profile_auth_selector_open: false,
             open_settings_selector: None,
             settings_focus_handle,
             theme,
@@ -1742,7 +1995,40 @@ impl RemCmdApp {
             _appearance_subscription: appearance_subscription,
         };
 
-        app.load_editor_for_selected_profile(cx);
+        cx.on_focus(&quick_terminal_focus_handle, window, |this, _, cx| {
+            if let Some(session_id) = this.quick_terminal_session_id {
+                this.focused_terminal_session_id = Some(session_id);
+                let modes = this
+                    .session(session_id)
+                    .and_then(|session| session.terminal.as_ref())
+                    .map(ActiveTerminal::modes)
+                    .unwrap_or(TerminalModes::NONE);
+                if let Some(bytes) = encode_focus(true, modes) {
+                    this.send_terminal_response(session_id, bytes);
+                }
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.on_blur(&quick_terminal_focus_handle, window, |this, _, cx| {
+            let Some(session_id) = this.quick_terminal_session_id else {
+                return;
+            };
+            if this.focused_terminal_session_id == Some(session_id) {
+                this.focused_terminal_session_id = None;
+            }
+            let modes = this
+                .session(session_id)
+                .and_then(|session| session.terminal.as_ref())
+                .map(ActiveTerminal::modes)
+                .unwrap_or(TerminalModes::NONE);
+            if let Some(bytes) = encode_focus(false, modes) {
+                this.send_terminal_response(session_id, bytes);
+            }
+            cx.notify();
+        })
+        .detach();
+
         app
     }
 
@@ -1776,9 +2062,32 @@ impl RemCmdApp {
         self.session_mut(session_id)
     }
 
+    fn terminal_input_session_id(&self) -> Option<SessionId> {
+        self.focused_terminal_session_id
+            .filter(|session_id| self.session(*session_id).is_some())
+            .or(self.active_session_id)
+    }
+
+    fn terminal_input_session(&self) -> Option<&TerminalSession> {
+        self.terminal_input_session_id()
+            .and_then(|session_id| self.session(session_id))
+    }
+
+    fn terminal_input_session_mut(&mut self) -> Option<&mut TerminalSession> {
+        let session_id = self.terminal_input_session_id()?;
+        self.session_mut(session_id)
+    }
+
     fn session_for_profile_mut(&mut self, profile_id: &str) -> Option<&mut TerminalSession> {
         self.sessions
             .iter_mut()
+            .rev()
+            .find(|session| session.profile_id == profile_id)
+    }
+
+    fn session_for_profile(&self, profile_id: &str) -> Option<&TerminalSession> {
+        self.sessions
+            .iter()
             .rev()
             .find(|session| session.profile_id == profile_id)
     }
@@ -1794,6 +2103,13 @@ impl RemCmdApp {
         self.next_session_id += 1;
         self.sessions
             .push(TerminalSession::new(session_id, profile_id.to_owned()));
+        session_id
+    }
+
+    fn create_local_session(&mut self) -> SessionId {
+        let session_id = SessionId(self.next_session_id);
+        self.next_session_id += 1;
+        self.sessions.push(TerminalSession::new_local(session_id));
         session_id
     }
 
@@ -1940,6 +2256,59 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         if self.right_sidebar_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn begin_bottom_panel_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.bottom_panel_open {
+            return;
+        }
+        self.bottom_panel_resize = Some(BottomPanelResize {
+            start_y: event.position.y,
+            start_height: clamp_bottom_panel_height(
+                self.bottom_panel_height,
+                f32::from(window.viewport_size().height),
+            ),
+        });
+        cx.stop_propagation();
+    }
+
+    fn resize_bottom_panel(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.bottom_panel_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.bottom_panel_resize = None;
+            return;
+        }
+
+        let requested_height = resize.start_height + f32::from(resize.start_y - event.position.y);
+        let height =
+            clamp_bottom_panel_height(requested_height, f32::from(window.viewport_size().height));
+        if self.bottom_panel_height != height {
+            self.bottom_panel_height = height;
+            cx.notify();
+        }
+    }
+
+    fn finish_bottom_panel_resize(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bottom_panel_resize.take().is_some() {
             cx.notify();
         }
     }
@@ -3252,7 +3621,6 @@ impl RemCmdApp {
             return false;
         };
 
-        let profile_changed = self.selected_profile_id.as_deref() != Some(profile_id.as_str());
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.active_pane_id = pane_id;
         }
@@ -3266,9 +3634,6 @@ impl RemCmdApp {
         self.active_panel = ActivePanel::Connection;
         self.open_settings_selector = None;
         self.selected_profile_id = Some(profile_id);
-        if profile_changed {
-            self.load_editor_for_selected_profile(cx);
-        }
         if self.right_sidebar_open && self.right_sidebar_view == RightSidebarView::Sftp {
             self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
         }
@@ -3290,6 +3655,9 @@ impl RemCmdApp {
         let session_id = pane.session_id;
         if focused {
             self.set_active_pane(pane_id, cx);
+            self.focused_terminal_session_id = Some(session_id);
+        } else if self.focused_terminal_session_id == Some(session_id) {
+            self.focused_terminal_session_id = None;
         }
 
         let modes = self
@@ -3459,6 +3827,19 @@ impl RemCmdApp {
                 .map(|pane| pane.session_id)
                 .filter(|replacement| *replacement != session_id);
         }
+        if self.quick_terminal_session_id == Some(session_id) {
+            self.quick_terminal_session_id = None;
+        }
+        if self.focused_terminal_session_id == Some(session_id) {
+            self.focused_terminal_session_id = None;
+        }
+        if self
+            .terminal_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.session_id == session_id)
+        {
+            self.terminal_context_menu = None;
+        }
 
         self.sync_performance_monitoring();
         true
@@ -3495,6 +3876,28 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn set_terminal_font_family(
+        &mut self,
+        terminal_font_family: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_selector = None;
+        self.terminal_font_family = terminal_font_family;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_terminal_font_size(&mut self, terminal_font_size: u16, cx: &mut Context<Self>) {
+        self.terminal_font_size = TerminalSettings {
+            font_family: None,
+            font_size: terminal_font_size,
+        }
+        .normalized()
+        .font_size;
+        self.persist_settings();
+        cx.notify();
+    }
+
     fn set_transfer_rate_limit(&mut self, rate_limit_mib_per_second: u32, cx: &mut Context<Self>) {
         self.transfer_settings.rate_limit_mib_per_second = rate_limit_mib_per_second;
         self.transfer_settings = self.transfer_settings.normalized();
@@ -3516,6 +3919,12 @@ impl RemCmdApp {
         match selector {
             SettingsSelector::Theme => SettingsValue::Theme(self.theme_mode),
             SettingsSelector::TabLayout => SettingsValue::TabLayout(self.tab_layout),
+            SettingsSelector::TerminalFont => {
+                unreachable!("terminal font choices are generated from installed fonts")
+            }
+            SettingsSelector::TerminalFontSize => {
+                SettingsValue::TerminalFontSize(self.terminal_font_size)
+            }
             SettingsSelector::TransferRate => {
                 SettingsValue::TransferRate(self.transfer_settings.rate_limit_mib_per_second)
             }
@@ -3526,6 +3935,10 @@ impl RemCmdApp {
     }
 
     fn settings_value_label(&self, selector: SettingsSelector) -> SharedString {
+        if selector == SettingsSelector::TerminalFont {
+            return self.terminal_font_family.clone();
+        }
+
         let value = self.settings_value(selector);
         if let Some(option) = selector
             .options()
@@ -3536,6 +3949,7 @@ impl RemCmdApp {
         }
 
         match value {
+            SettingsValue::TerminalFontSize(size) => format!("{size} pt").into(),
             SettingsValue::TransferRate(rate) => format!("{rate} MiB/s").into(),
             SettingsValue::ParallelTransfers(count) => count.to_string().into(),
             SettingsValue::Theme(_) | SettingsValue::TabLayout(_) => {
@@ -3575,6 +3989,7 @@ impl RemCmdApp {
         match value {
             SettingsValue::Theme(mode) => self.set_theme_mode(mode, window, cx),
             SettingsValue::TabLayout(layout) => self.set_tab_layout(layout, cx),
+            SettingsValue::TerminalFontSize(size) => self.set_terminal_font_size(size, cx),
             SettingsValue::TransferRate(rate) => self.set_transfer_rate_limit(rate, cx),
             SettingsValue::ParallelTransfers(count) => {
                 self.set_max_parallel_transfers(count, cx);
@@ -3587,6 +4002,10 @@ impl RemCmdApp {
             theme_mode: self.theme_mode,
             tab_layout: self.tab_layout,
             transfers: self.transfer_settings,
+            terminal: TerminalSettings {
+                font_family: Some(self.terminal_font_family.to_string()),
+                font_size: self.terminal_font_size,
+            },
         };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
@@ -3606,6 +4025,7 @@ impl RemCmdApp {
         };
 
         self.editor = Some(ProfileEditor {
+            mode: ProfileEditorMode::Edit,
             profile_id: profile.id.clone(),
             name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
             host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
@@ -3615,7 +4035,25 @@ impl RemCmdApp {
             private_key_path: cx.new(|cx| TextField::new(cx, private_key_path, "Private key path")),
         });
 
+        self.profile_auth_selector_open = false;
         self.form_error = None;
+    }
+
+    fn open_new_profile_editor(&mut self, cx: &mut Context<Self>) {
+        let number = self.next_profile_number;
+        self.editor = Some(ProfileEditor {
+            mode: ProfileEditorMode::Create,
+            profile_id: format!("demo-{number}"),
+            name: cx.new(|cx| TextField::new(cx, "", "Name")),
+            host: cx.new(|cx| TextField::new(cx, "", "Host")),
+            port: cx.new(|cx| TextField::new(cx, "22", "Port")),
+            username: cx.new(|cx| TextField::new(cx, "", "Username")),
+            auth_kind: ProfileAuthKind::Password,
+            private_key_path: cx.new(|cx| TextField::new(cx, "", "Private key path")),
+        });
+        self.profile_auth_selector_open = false;
+        self.form_error = None;
+        cx.notify();
     }
 }
 
@@ -3760,58 +4198,324 @@ impl RemCmdApp {
 
     fn select_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
-        self.active_panel = ActivePanel::Connection;
+        self.active_panel = ActivePanel::Server;
+        self.profile_context_menu = None;
         self.open_settings_selector = None;
-        let tab_id = self
-            .active_tab()
-            .filter(|tab| tab.profile_id == profile_id)
-            .or_else(|| {
-                self.tabs
-                    .iter()
-                    .rev()
-                    .find(|tab| tab.profile_id == profile_id)
-            })
-            .map(|tab| tab.id);
+        self.bottom_panel_open = false;
+        self.bottom_panel_resize = None;
         self.active_session_id = None;
         self.selected_profile_id = Some(profile_id);
-        self.load_editor_for_selected_profile(cx);
-        if let Some(tab_id) = tab_id {
-            self.activate_tab_in_window(tab_id, window, cx);
-        }
+        self.focused_terminal_session_id = None;
+        self.settings_focus_handle.focus(window);
         self.sync_performance_monitoring();
         cx.notify();
     }
 
     fn add_profile(&mut self, cx: &mut Context<Self>) {
-        let number = self.next_profile_number;
+        self.open_new_profile_editor(cx);
+    }
 
-        let profile = ConnectionProfile::new(
-            format!("demo-{number}"),
-            format!("Demo Server {number}"),
-            format!("demo-{number}.example.com"),
-            22,
-            "ubuntu",
-        );
-
-        self.active_panel = ActivePanel::Connection;
-        self.open_settings_selector = None;
+    fn edit_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        self.selected_profile_id = Some(profile_id);
+        self.active_panel = ActivePanel::Server;
         self.active_session_id = None;
-        self.selected_profile_id = Some(profile.id.clone());
-        self.profiles.push(profile);
-        self.next_profile_number += 1;
-
+        self.profile_context_menu = None;
         self.load_editor_for_selected_profile(cx);
-        self.persist_profiles();
+        cx.notify();
+    }
 
+    fn show_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_credential_prompt(cx);
+        self.bottom_panel_open = false;
+        self.bottom_panel_resize = None;
+        self.active_panel = ActivePanel::Home;
+        self.active_session_id = None;
+        self.focused_terminal_session_id = None;
+        self.open_settings_selector = None;
+        self.settings_focus_handle.focus(window);
         self.sync_performance_monitoring();
         cx.notify();
     }
 
+    fn open_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let session_id = self.create_local_session();
+        let tab_id = self.create_tab_for_session(session_id, LOCAL_PROFILE_ID.into(), window, cx);
+        self.activate_tab_in_window(tab_id, window, cx);
+        self.start_local_terminal(session_id, cx);
+        cx.notify();
+    }
+
+    fn open_terminal_for_current_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_session().is_some_and(TerminalSession::is_local) {
+            self.open_local_terminal(window, cx);
+        } else {
+            self.connect_selected_profile_in_new_session(window, cx);
+        }
+    }
+
+    fn start_local_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
+        let terminal = LocalTerminal::spawn(local_pty_size(size));
+        let (handle, mut events) = terminal.split();
+
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.close_when_disconnected = false;
+        session.connection_state = SessionState::Connecting;
+        session.connection_handle = None;
+        session.local_terminal_handle = Some(handle);
+        session.connection_error = None;
+        session.connection_message = Some("Starting local shell".into());
+        session.terminal_end_reason = None;
+        session.terminal = Some(ActiveTerminal::new(LOCAL_PROFILE_ID.into(), size));
+        session.terminal_marked_text.clear();
+        session.terminal_selection = None;
+        session.terminal_selecting = false;
+        session.terminal_scroll_accumulator = 0.0;
+        session.terminal_resize_task = None;
+        session.sftp_availability =
+            SftpAvailability::Unavailable("SFTP is only available for SSH sessions".into());
+
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next_event().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.handle_local_terminal_event(session_id, event, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
+        self.bottom_panel_open = false;
+        self.bottom_panel_resize = None;
+        self.terminal_context_menu = None;
         self.active_panel = ActivePanel::Settings;
         self.open_settings_selector = None;
         self.settings_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn connected_ssh_profile_ids(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                self.sessions.iter().any(|session| {
+                    session.kind == TerminalSessionKind::Ssh
+                        && session.profile_id == profile.id
+                        && session.connection_state == SessionState::Connected
+                        && session.connection_handle.is_some()
+                })
+            })
+            .map(|profile| profile.id.clone())
+            .collect()
+    }
+
+    fn ensure_quick_command_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.quick_command_prompt.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| TextField::new(cx, "", "Command"));
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        self.quick_command_prompt = Some(QuickCommandPrompt {
+            input,
+            selected_profile_ids: self.connected_ssh_profile_ids().into_iter().collect(),
+            selection_touched: false,
+            target_menu_open: false,
+            error: None,
+        });
+    }
+
+    fn sync_default_quick_command_targets(&mut self) {
+        let connected_profile_ids = self.connected_ssh_profile_ids();
+        if let Some(prompt) = self.quick_command_prompt.as_mut()
+            && !prompt.selection_touched
+        {
+            prompt.selected_profile_ids = connected_profile_ids.into_iter().collect();
+        }
+    }
+
+    fn close_quick_command(&mut self, cx: &mut Context<Self>) {
+        if self.bottom_panel_open {
+            self.bottom_panel_open = false;
+            self.bottom_panel_resize = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bottom_panel_open {
+            self.bottom_panel_open = false;
+            self.bottom_panel_resize = None;
+            cx.notify();
+            return;
+        }
+
+        self.ensure_quick_command_prompt(cx);
+        self.sync_default_quick_command_targets();
+        self.bottom_panel_open = true;
+        if self.quick_terminal_session_id.is_none() {
+            let session_id = self.create_local_session();
+            self.quick_terminal_session_id = Some(session_id);
+            self.start_local_terminal(session_id, cx);
+        }
+        self.quick_terminal_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn restart_quick_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let session_id = if let Some(session_id) = self.quick_terminal_session_id {
+            session_id
+        } else {
+            let session_id = self.create_local_session();
+            self.quick_terminal_session_id = Some(session_id);
+            session_id
+        };
+        if self
+            .session(session_id)
+            .is_some_and(|session| session.connection_state.can_connect())
+        {
+            self.start_local_terminal(session_id, cx);
+        }
+        self.quick_terminal_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn dispose_quick_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.quick_terminal_session_id else {
+            return;
+        };
+        let can_disconnect = self
+            .session(session_id)
+            .is_some_and(|session| session.connection_state.can_disconnect());
+        if can_disconnect {
+            if let Some(session) = self.session_mut(session_id) {
+                session.close_when_disconnected = true;
+            }
+            self.disconnect_session(session_id, cx);
+        } else {
+            self.remove_session(session_id, cx);
+            cx.notify();
+        }
+    }
+
+    fn toggle_quick_command_targets(&mut self, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.quick_command_prompt.as_mut() {
+            prompt.target_menu_open = !prompt.target_menu_open;
+            cx.notify();
+        }
+    }
+
+    fn toggle_quick_command_target(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        let connected = self
+            .connected_ssh_profile_ids()
+            .iter()
+            .any(|candidate| candidate == &profile_id);
+        if !connected {
+            return;
+        }
+        let Some(prompt) = self.quick_command_prompt.as_mut() else {
+            return;
+        };
+        if !prompt.selected_profile_ids.remove(&profile_id) {
+            prompt.selected_profile_ids.insert(profile_id);
+        }
+        prompt.selection_touched = true;
+        prompt.error = None;
+        cx.notify();
+    }
+
+    fn submit_quick_command(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.quick_command_prompt.as_ref() else {
+            return;
+        };
+        let command = prompt.input.read(cx).text().trim().to_owned();
+        let selected_profile_ids = prompt.selected_profile_ids.clone();
+        if command.is_empty() {
+            if let Some(prompt) = self.quick_command_prompt.as_mut() {
+                prompt.error = Some("Enter a command".into());
+            }
+            cx.notify();
+            return;
+        }
+        if selected_profile_ids.is_empty() {
+            if let Some(prompt) = self.quick_command_prompt.as_mut() {
+                prompt.error = Some("Select at least one server".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        let profile_ids = self
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let session_candidates = self
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id,
+                    session.profile_id.as_str(),
+                    session.kind == TerminalSessionKind::Ssh
+                        && session.connection_state == SessionState::Connected
+                        && session.connection_handle.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let target_session_ids = quick_command_target_sessions(
+            &profile_ids,
+            &selected_profile_ids,
+            &session_candidates,
+            self.active_session_id,
+        );
+        let targets = target_session_ids
+            .into_iter()
+            .filter_map(|(profile_id, session_id)| {
+                self.session(session_id)
+                    .and_then(|session| session.connection_handle.clone())
+                    .map(|handle| (profile_id, handle))
+            })
+            .collect::<Vec<_>>();
+
+        if targets.is_empty() {
+            if let Some(prompt) = self.quick_command_prompt.as_mut() {
+                prompt.error = Some("The selected servers are no longer connected".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        let data = format!("{command}\r").into_bytes();
+        let mut failures = Vec::new();
+        for (profile_id, handle) in targets {
+            if let Err(error) = handle.send_input(data.clone()) {
+                let label = self
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+                    .map(|profile| profile.name.as_str())
+                    .unwrap_or(profile_id.as_str());
+                failures.push(format!("{label}: {error}"));
+            }
+        }
+
+        if failures.is_empty() {
+            if let Some(prompt) = self.quick_command_prompt.as_mut() {
+                prompt.error = None;
+                prompt.input.update(cx, |input, cx| input.clear(cx));
+            }
+        } else if let Some(prompt) = self.quick_command_prompt.as_mut() {
+            prompt.error = Some(failures.join("\n"));
+        }
         cx.notify();
     }
 
@@ -3831,11 +4535,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn delete_selected_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(selected_id) = self.selected_profile_id.clone() else {
-            return;
-        };
-
+    fn delete_profile(&mut self, selected_id: String, cx: &mut Context<Self>) {
         if self.sessions.iter().any(|session| {
             session.profile_id == selected_id && session.connection_state.can_disconnect()
         }) {
@@ -3849,7 +4549,6 @@ impl RemCmdApp {
             .iter()
             .position(|profile| profile.id == selected_id)
         else {
-            self.selected_profile_id = None;
             cx.notify();
             return;
         };
@@ -3866,15 +4565,20 @@ impl RemCmdApp {
 
         self.profiles.remove(selected_index);
 
-        self.selected_profile_id = if self.profiles.is_empty() {
-            None
-        } else if selected_index == 0 {
-            Some(self.profiles[0].id.clone())
-        } else {
-            Some(self.profiles[selected_index - 1].id.clone())
-        };
-
-        self.load_editor_for_selected_profile(cx);
+        if self.selected_profile_id.as_deref() == Some(selected_id.as_str()) {
+            self.selected_profile_id = None;
+            self.active_panel = ActivePanel::Home;
+            self.active_session_id = None;
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.profile_id == selected_id)
+        {
+            self.editor = None;
+            self.profile_auth_selector_open = false;
+        }
+        self.profile_context_menu = None;
         self.persist_profiles();
         self.delete_stored_credentials(selected_id, None, None, cx);
 
@@ -3893,12 +4597,18 @@ impl RemCmdApp {
 
         editor.auth_kind = auth_kind;
         let private_key_path = editor.private_key_path.clone();
+        self.profile_auth_selector_open = false;
         self.form_error = None;
 
         if auth_kind == ProfileAuthKind::PrivateKey {
             window.focus(&private_key_path.focus_handle(cx));
         }
 
+        cx.notify();
+    }
+
+    fn toggle_profile_auth_selector(&mut self, cx: &mut Context<Self>) {
+        self.profile_auth_selector_open = !self.profile_auth_selector_open;
         cx.notify();
     }
 
@@ -3988,11 +4698,17 @@ impl RemCmdApp {
             return;
         };
 
-        let name = editor.name.read(cx).text();
-        let host = editor.host.read(cx).text();
+        let name = editor.name.read(cx).text().trim().to_owned();
+        let host = editor.host.read(cx).text().trim().to_owned();
         let port_text = editor.port.read(cx).text();
-        let username = editor.username.read(cx).text();
+        let username = editor.username.read(cx).text().trim().to_owned();
         let private_key_path = editor.private_key_path.read(cx).text();
+
+        if name.is_empty() || host.is_empty() || username.is_empty() {
+            self.form_error = Some("Name, host, and username are required".into());
+            cx.notify();
+            return;
+        }
 
         let Ok(port) = port_text.trim().parse::<u16>() else {
             self.form_error = Some("Port must be a number from 1 to 65535".into());
@@ -4015,27 +4731,43 @@ impl RemCmdApp {
             }
         };
 
-        let credentials_changed = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == editor.profile_id)
-            .is_some_and(|profile| {
-                credentials_invalidated_by_edit(profile, &host, port, &username, &auth)
-            });
+        let credentials_changed = editor.mode == ProfileEditorMode::Edit
+            && self
+                .profiles
+                .iter()
+                .find(|profile| profile.id == editor.profile_id)
+                .is_some_and(|profile| {
+                    credentials_invalidated_by_edit(profile, &host, port, &username, &auth)
+                });
 
-        if let Some(profile) = self
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == editor.profile_id)
-        {
-            profile.name = name;
-            profile.host = host;
-            profile.port = port;
-            profile.username = username;
-            profile.auth = auth;
+        match editor.mode {
+            ProfileEditorMode::Create => {
+                let mut profile =
+                    ConnectionProfile::new(&editor.profile_id, name, host, port, username);
+                profile.auth = auth;
+                self.selected_profile_id = Some(profile.id.clone());
+                self.profiles.push(profile);
+                self.next_profile_number += 1;
+                self.active_panel = ActivePanel::Server;
+            }
+            ProfileEditorMode::Edit => {
+                if let Some(profile) = self
+                    .profiles
+                    .iter_mut()
+                    .find(|profile| profile.id == editor.profile_id)
+                {
+                    profile.name = name;
+                    profile.host = host;
+                    profile.port = port;
+                    profile.username = username;
+                    profile.auth = auth;
+                }
+            }
         }
 
         self.form_error = None;
+        self.editor = None;
+        self.profile_auth_selector_open = false;
         self.persist_profiles();
         if credentials_changed {
             self.delete_stored_credentials(
@@ -4050,7 +4782,9 @@ impl RemCmdApp {
     }
 
     fn cancel_editor(&mut self, cx: &mut Context<Self>) {
-        self.load_editor_for_selected_profile(cx);
+        self.editor = None;
+        self.profile_auth_selector_open = false;
+        self.form_error = None;
         cx.notify();
     }
 
@@ -4092,21 +4826,23 @@ impl RemCmdApp {
         let Some(tab_id) = self.active_tab_id else {
             return;
         };
-        let Some(profile) = self
-            .active_session()
-            .and_then(|session| {
-                self.profiles
-                    .iter()
-                    .find(|profile| profile.id == session.profile_id)
-            })
-            .cloned()
-        else {
+        let Some(active_session) = self.active_session() else {
             return;
         };
-        if self.credential_lookup_task.is_some()
-            || self
-                .credential_mutations_in_progress
-                .contains_key(&profile.id)
+        let is_local = active_session.is_local();
+        let profile = (!is_local)
+            .then(|| {
+                self.profiles
+                    .iter()
+                    .find(|profile| profile.id == active_session.profile_id)
+                    .cloned()
+            })
+            .flatten();
+        if (!is_local && (profile.is_none() || self.credential_lookup_task.is_some()))
+            || profile.as_ref().is_some_and(|profile| {
+                self.credential_mutations_in_progress
+                    .contains_key(&profile.id)
+            })
             || !self
                 .tab(tab_id)
                 .is_some_and(|tab| tab.layout.contains(active_pane_id))
@@ -4114,7 +4850,16 @@ impl RemCmdApp {
             return;
         }
 
-        let session_id = self.create_session_for_profile(&profile.id);
+        let session_id = if is_local {
+            self.create_local_session()
+        } else {
+            self.create_session_for_profile(
+                &profile
+                    .as_ref()
+                    .expect("remote split should retain its profile")
+                    .id,
+            )
+        };
         let pane_id = self.create_terminal_pane(tab_id, session_id, window, cx);
         let split = self
             .tab_mut(tab_id)
@@ -4124,7 +4869,11 @@ impl RemCmdApp {
         debug_assert!(split, "validated active pane should be splittable");
 
         self.activate_session(session_id, cx);
-        self.connect_profile_in_session(session_id, profile, window, cx);
+        if let Some(profile) = profile {
+            self.connect_profile_in_session(session_id, profile, window, cx);
+        } else {
+            self.start_local_terminal(session_id, cx);
+        }
         if let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) {
             focus_handle.focus(window);
         }
@@ -4355,6 +5104,7 @@ impl RemCmdApp {
         session.close_when_disconnected = false;
         session.connection_state = SessionState::Connecting;
         session.connection_handle = Some(handle);
+        session.local_terminal_handle = None;
         session.connection_credential = credential;
         session.connection_error = None;
         session.connection_message = None;
@@ -4678,22 +5428,17 @@ impl RemCmdApp {
 
             session.terminal_resize_task = None;
 
-            if let Some(handle) = session.connection_handle.as_ref() {
-                if let Err(error) = handle.disconnect() {
-                    session.connection_state = SessionState::Failed;
-                    session.connection_handle = None;
-                    session.connection_error = Some(error.to_string());
-                    session.close_when_disconnected
-                } else {
-                    // Disable repeated clicks before the worker publishes its event.
-                    session.connection_state = SessionState::Disconnecting;
-                    session.terminal_end_reason = Some("Session disconnected".into());
-                    false
-                }
-            } else {
+            if let Err(error) = session.disconnect_terminal() {
                 session.connection_state = SessionState::Failed;
-                session.connection_error = Some("SSH connection handle is missing".into());
+                session.connection_handle = None;
+                session.local_terminal_handle = None;
+                session.connection_error = Some(error);
                 session.close_when_disconnected
+            } else {
+                // Disable repeated clicks before the worker publishes its event.
+                session.connection_state = SessionState::Disconnecting;
+                session.terminal_end_reason = Some("Session disconnected".into());
+                false
             }
         };
 
@@ -4704,8 +5449,8 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn terminal_modes(&self) -> TerminalModes {
-        self.active_session()
+    fn terminal_modes(&self, session_id: SessionId) -> TerminalModes {
+        self.session(session_id)
             .and_then(|session| session.terminal.as_ref())
             .map(ActiveTerminal::modes)
             .unwrap_or(TerminalModes::NONE)
@@ -4719,8 +5464,12 @@ impl RemCmdApp {
         }
     }
 
-    fn terminal_point_for_position(&self, position: gpui::Point<Pixels>) -> Option<TerminalPoint> {
-        let terminal = self.active_session()?.terminal.as_ref()?;
+    fn terminal_point_for_position(
+        &self,
+        session_id: SessionId,
+        position: gpui::Point<Pixels>,
+    ) -> Option<TerminalPoint> {
+        let terminal = self.session(session_id)?.terminal.as_ref()?;
         let bounds = terminal.viewport_bounds?;
         let local = bounds.localize(&position)?;
         let size = terminal.engine.size();
@@ -4750,13 +5499,85 @@ impl RemCmdApp {
         let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) else {
             return;
         };
+        let Some(session_id) = self.pane(pane_id).map(|pane| pane.session_id) else {
+            return;
+        };
+        self.focused_terminal_session_id = Some(session_id);
         focus_handle.focus(window);
 
-        let Some(point) = self.terminal_point_for_position(event.position) else {
+        self.begin_terminal_selection(session_id, event, cx);
+    }
+
+    fn on_quick_terminal_mouse_down(
+        &mut self,
+        session_id: SessionId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focused_terminal_session_id = Some(session_id);
+        self.quick_terminal_focus_handle.focus(window);
+        self.begin_terminal_selection(session_id, event, cx);
+    }
+
+    fn open_profile_context_menu(
+        &mut self,
+        profile_id: String,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.sftp_context_menu = None;
+        self.terminal_context_menu = None;
+        self.profile_context_menu = Some(ProfileContextMenu {
+            profile_id,
+            position: event.position,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn open_terminal_context_menu(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Option<PaneId>,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane_id) = pane_id {
+            if !self.set_active_pane(pane_id, cx) {
+                return;
+            }
+            let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone())
+            else {
+                return;
+            };
+            focus_handle.focus(window);
+        } else {
+            self.focused_terminal_session_id = Some(session_id);
+            self.quick_terminal_focus_handle.focus(window);
+        }
+
+        self.sftp_context_menu = None;
+        self.terminal_context_menu = Some(TerminalContextMenu {
+            session_id,
+            position: event.position,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn begin_terminal_selection(
+        &mut self,
+        session_id: SessionId,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(point) = self.terminal_point_for_position(session_id, event.position) else {
             return;
         };
 
-        let Some(session) = self.active_session_mut() else {
+        let Some(session) = self.session_mut(session_id) else {
             return;
         };
         if event.modifiers.shift
@@ -4774,23 +5595,24 @@ impl RemCmdApp {
 
     fn on_terminal_mouse_move(
         &mut self,
+        session_id: SessionId,
         event: &MouseMoveEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self
-            .active_session()
+            .session(session_id)
             .is_some_and(|session| session.terminal_selecting)
             || !event.dragging()
         {
             return;
         }
 
-        let Some(point) = self.terminal_point_for_position(event.position) else {
+        let Some(point) = self.terminal_point_for_position(session_id, event.position) else {
             return;
         };
         let Some(selection) = self
-            .active_session_mut()
+            .session_mut(session_id)
             .and_then(|session| session.terminal_selection.as_mut())
         else {
             return;
@@ -4803,8 +5625,14 @@ impl RemCmdApp {
         cx.stop_propagation();
     }
 
-    fn on_terminal_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.active_session_mut() else {
+    fn on_terminal_mouse_up(
+        &mut self,
+        session_id: SessionId,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
             return;
         };
         session.terminal_selecting = false;
@@ -4817,8 +5645,8 @@ impl RemCmdApp {
         }
     }
 
-    fn copy_terminal_selection(&self, cx: &mut Context<Self>) -> bool {
-        let Some(session) = self.active_session() else {
+    fn copy_terminal_selection(&self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session(session_id) else {
             return false;
         };
         let Some(selection) = session
@@ -4837,8 +5665,8 @@ impl RemCmdApp {
         true
     }
 
-    fn clear_terminal_selection(&mut self) -> bool {
-        let Some(session) = self.active_session_mut() else {
+    fn clear_terminal_selection(&mut self, session_id: SessionId) -> bool {
+        let Some(session) = self.session_mut(session_id) else {
             return false;
         };
         let had_selection = session.terminal_selection.take().is_some();
@@ -4846,65 +5674,110 @@ impl RemCmdApp {
         had_selection || was_selecting
     }
 
+    fn select_all_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session_mut(session_id) else {
+            return false;
+        };
+        let Some(terminal) = session.terminal.as_ref() else {
+            return false;
+        };
+        let size = terminal.engine.size();
+        let Some(selection) = full_terminal_selection(size.rows(), size.columns()) else {
+            return false;
+        };
+
+        session.terminal_selection = Some(selection);
+        session.terminal_selecting = false;
+        cx.notify();
+        true
+    }
+
+    fn reset_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let Some(terminal) = session.terminal.as_mut() else {
+            return;
+        };
+
+        terminal.reset();
+        session.terminal_marked_text.clear();
+        session.terminal_selection = None;
+        session.terminal_selecting = false;
+        session.terminal_scroll_accumulator = 0.0;
+        self.terminal_context_menu = None;
+        cx.notify();
+    }
+
     fn on_terminal_key_down(
         &mut self,
+        session_id: SessionId,
         event: &KeyDownEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if is_terminal_copy_shortcut(&event.keystroke) && self.copy_terminal_selection(cx) {
+        self.focused_terminal_session_id = Some(session_id);
+        if is_terminal_copy_shortcut(&event.keystroke)
+            && self.copy_terminal_selection(session_id, cx)
+        {
             cx.stop_propagation();
             return;
         }
 
         if is_terminal_paste_shortcut(&event.keystroke) {
-            self.paste_into_terminal(cx);
+            self.paste_into_terminal(session_id, cx);
             cx.stop_propagation();
             return;
         }
 
-        if let Some(bytes) = encode_key(&event.keystroke, self.terminal_modes()) {
-            self.send_terminal_user_input(bytes, cx);
+        if let Some(bytes) = encode_key(&event.keystroke, self.terminal_modes(session_id)) {
+            self.send_terminal_user_input(session_id, bytes, cx);
             cx.stop_propagation();
         }
     }
 
-    fn paste_into_terminal(&mut self, cx: &mut Context<Self>) {
+    fn paste_into_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
 
-        let bytes = encode_paste(&text, self.terminal_modes());
-        self.send_terminal_user_input(bytes, cx);
+        let bytes = encode_paste(&text, self.terminal_modes(session_id));
+        self.send_terminal_user_input(session_id, bytes, cx);
     }
 
-    fn send_terminal_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
-        let Some(session) = self.active_session_mut() else {
+    fn send_terminal_input(
+        &mut self,
+        session_id: SessionId,
+        data: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
             return;
         };
         if data.is_empty() || session.connection_state != SessionState::Connected {
             return;
         }
 
-        let Some(handle) = session.connection_handle.as_ref() else {
-            return;
-        };
-
-        if let Err(error) = handle.send_input(data) {
-            session.connection_error = Some(error.to_string());
+        if let Err(error) = session.write_terminal_input(data) {
+            session.connection_error = Some(error);
             cx.notify();
         }
     }
 
-    fn send_terminal_user_input(&mut self, data: Vec<u8>, cx: &mut Context<Self>) {
+    fn send_terminal_user_input(
+        &mut self,
+        session_id: SessionId,
+        data: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
         if data.is_empty() {
             return;
         }
 
-        let selection_cleared = self.clear_terminal_selection();
+        let selection_cleared = self.clear_terminal_selection(session_id);
 
         if let Some(terminal) = self
-            .active_session_mut()
+            .session_mut(session_id)
             .and_then(|session| session.terminal.as_mut())
             && terminal.engine.display_offset() != 0
         {
@@ -4916,7 +5789,7 @@ impl RemCmdApp {
             cx.notify();
         }
 
-        self.send_terminal_input(data, cx);
+        self.send_terminal_input(session_id, data, cx);
     }
 
     fn apply_terminal_layout(
@@ -4972,12 +5845,8 @@ impl RemCmdApp {
                     return;
                 }
 
-                let Some(handle) = session.connection_handle.as_ref() else {
-                    return;
-                };
-
-                if let Err(error) = handle.resize(size) {
-                    session.connection_error = Some(error.to_string());
+                if let Err(error) = session.resize_terminal(size) {
+                    session.connection_error = Some(error);
                     cx.notify();
                 }
             });
@@ -5000,9 +5869,33 @@ impl RemCmdApp {
         if let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone()) {
             focus_handle.focus(window);
         }
+        let Some(session_id) = self.pane(pane_id).map(|pane| pane.session_id) else {
+            return;
+        };
+        self.focused_terminal_session_id = Some(session_id);
+        self.scroll_terminal_session(session_id, event, cx);
+    }
 
+    fn on_quick_terminal_scroll(
+        &mut self,
+        session_id: SessionId,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focused_terminal_session_id = Some(session_id);
+        self.quick_terminal_focus_handle.focus(window);
+        self.scroll_terminal_session(session_id, event, cx);
+    }
+
+    fn scroll_terminal_session(
+        &mut self,
+        session_id: SessionId,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
         let line_height = self
-            .active_session()
+            .session(session_id)
             .and_then(|session| session.terminal.as_ref())
             .map(|terminal| terminal.cell_height)
             .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
@@ -5012,7 +5905,7 @@ impl RemCmdApp {
         }
         cx.stop_propagation();
 
-        let Some(session) = self.active_session_mut() else {
+        let Some(session) = self.session_mut(session_id) else {
             return;
         };
         if session.terminal_scroll_accumulator.signum() != delta.signum() {
@@ -5026,18 +5919,18 @@ impl RemCmdApp {
         }
         session.terminal_scroll_accumulator -= lines as f32 * line_height;
 
-        let modes = self.terminal_modes();
+        let modes = self.terminal_modes(session_id);
         let display_offset = self
-            .active_session()
+            .session(session_id)
             .and_then(|session| session.terminal.as_ref())
             .map(|terminal| terminal.engine.display_offset())
             .unwrap_or_default();
         let alternate_scroll = should_translate_alternate_scroll(modes, display_offset);
 
         if alternate_scroll {
-            self.clear_terminal_selection();
-            self.send_terminal_input(encode_alternate_scroll(lines, modes), cx);
-        } else if let Some(session) = self.active_session_mut() {
+            self.clear_terminal_selection(session_id);
+            self.send_terminal_input(session_id, encode_alternate_scroll(lines, modes), cx);
+        } else if let Some(session) = self.session_mut(session_id) {
             session.terminal_selection = None;
             session.terminal_selecting = false;
             let Some(terminal) = session.terminal.as_mut() else {
@@ -5176,12 +6069,8 @@ impl RemCmdApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        let Some(handle) = session.connection_handle.as_ref() else {
-            return;
-        };
-
-        if let Err(error) = handle.send_input(data) {
-            session.connection_error = Some(error.to_string());
+        if let Err(error) = session.write_terminal_input(data) {
+            session.connection_error = Some(error);
         }
     }
 
@@ -5612,20 +6501,97 @@ impl RemCmdApp {
             cx.notify();
         }
     }
+
+    fn handle_local_terminal_event(
+        &mut self,
+        session_id: SessionId,
+        event: LocalTerminalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session(session_id).is_none() {
+            return;
+        }
+
+        match event {
+            LocalTerminalEvent::Started => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_state = SessionState::Connected;
+                    session.connection_message = None;
+                    if let Some(terminal) = session.terminal.as_mut() {
+                        terminal.was_connected = true;
+                    }
+                }
+            }
+            LocalTerminalEvent::Output(data) => {
+                self.process_terminal_output(session_id, &data, cx);
+            }
+            LocalTerminalEvent::Resized(size) => {
+                let size = ssh_pty_size(size);
+                let dimensions_changed = self
+                    .session_mut(session_id)
+                    .and_then(|session| session.terminal.as_mut())
+                    .is_some_and(|terminal| terminal.acknowledge_resize(size));
+                if dimensions_changed && let Some(session) = self.session_mut(session_id) {
+                    session.terminal_selection = None;
+                    session.terminal_selecting = false;
+                }
+            }
+            LocalTerminalEvent::Exited { exit_code, signal } => {
+                let should_remove = {
+                    let session = self
+                        .session_mut(session_id)
+                        .expect("checked local session should still exist");
+                    let message = signal.map_or_else(
+                        || format!("Local shell exited with status {exit_code}"),
+                        |signal| format!("Local shell exited on signal {signal}"),
+                    );
+                    session.connection_state = SessionState::Disconnected;
+                    session.local_terminal_handle = None;
+                    session.terminal_resize_task = None;
+                    session.connection_message = Some(message.clone());
+                    session.terminal_end_reason = Some(message);
+                    session.close_when_disconnected
+                };
+                if should_remove {
+                    self.remove_session(session_id, cx);
+                }
+            }
+            LocalTerminalEvent::Failed(error) => {
+                let should_remove = {
+                    let session = self
+                        .session_mut(session_id)
+                        .expect("checked local session should still exist");
+                    session.connection_state = SessionState::Failed;
+                    session.local_terminal_handle = None;
+                    session.terminal_resize_task = None;
+                    session.connection_error = Some(error.to_string());
+                    session.close_when_disconnected
+                };
+                if should_remove {
+                    self.remove_session(session_id, cx);
+                }
+            }
+        }
+
+        cx.notify();
+    }
 }
 
 // Root rendering entry point and drawing helpers.
 impl Render for RemCmdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_quick_command_prompt(cx);
+        self.sync_default_quick_command_targets();
         let selected_profile = self.selected_profile().cloned();
         let right_sidebar_width = self.effective_right_sidebar_width(window);
         let sidebar_width = self.effective_sidebar_width(window);
         let should_focus_terminal = self.active_panel == ActivePanel::Connection
             && self.active_tab_view() == TerminalTabView::Terminal
             && !self.right_sidebar_open
-            && selected_profile
-                .as_ref()
-                .is_some_and(|profile| self.is_terminal_visible(&profile.id));
+            && !self.bottom_panel_open
+            && self
+                .active_session()
+                .is_some_and(TerminalSession::is_terminal_visible);
 
         let mut root = div()
             .id("remcmd_root")
@@ -5635,10 +6601,15 @@ impl Render for RemCmdApp {
             .text_color(self.theme.text_primary)
             .on_mouse_move(cx.listener(Self::resize_sidebar))
             .on_mouse_move(cx.listener(Self::resize_right_sidebar))
+            .on_mouse_move(cx.listener(Self::resize_bottom_panel))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_sidebar_resize))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(Self::finish_right_sidebar_resize),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::finish_bottom_panel_resize),
             );
 
         let rendered_left_sidebar_width = sidebar_width * self.left_sidebar_progress;
@@ -5715,6 +6686,35 @@ impl Render for RemCmdApp {
                     ),
             );
         }
+        if self.profile_context_menu.is_some() {
+            root = root
+                .child(
+                    div()
+                        .id("profile_context_menu_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.profile_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.profile_context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(deferred(self.render_profile_context_menu(window, cx)).with_priority(20));
+        }
         if self.sftp_context_menu.is_some() {
             root = root
                 .child(
@@ -5744,6 +6744,35 @@ impl Render for RemCmdApp {
                 )
                 .child(deferred(self.render_sftp_context_menu(window, cx)).with_priority(20));
         }
+        if self.terminal_context_menu.is_some() {
+            root = root
+                .child(
+                    div()
+                        .id("terminal_context_menu_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(deferred(self.render_terminal_context_menu(window, cx)).with_priority(20));
+        }
 
         if self
             .active_session()
@@ -5763,6 +6792,28 @@ impl Render for RemCmdApp {
                 window.focus(&focus_handle);
             }
             root = root.child(self.render_sftp_create_prompt(cx));
+        } else if self.editor.is_some() {
+            root = root.child(self.render_profile_editor_overlay(cx));
+            if self.profile_auth_selector_open {
+                root = root.child(
+                    div()
+                        .id("profile_auth_selector_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.profile_auth_selector_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
         } else if should_focus_terminal
             && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
             && !focus_handle.is_focused(window)
@@ -5869,8 +6920,9 @@ impl RemCmdApp {
     }
 
     fn render_titlebar_action_group(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let local_active = self.active_session().is_some_and(TerminalSession::is_local);
         let can_create_terminal = self.active_panel == ActivePanel::Connection
-            && self.selected_profile_id.is_some()
+            && (local_active || self.selected_profile().is_some())
             && self.credential_lookup_task.is_none()
             && self
                 .selected_profile_id
@@ -5904,13 +6956,43 @@ impl RemCmdApp {
         });
         if can_create_terminal {
             new_terminal = new_terminal.on_click(cx.listener(|this, _, window, cx| {
-                this.connect_selected_profile_in_new_session(window, cx);
+                this.open_terminal_for_current_target(window, cx);
             }));
         }
 
         let right_sidebar = self
             .render_titlebar_sidebar_button("toggle_right_sidebar", false, "Toggle right sidebar")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)));
+        let bottom_panel_enabled = self.active_panel == ActivePanel::Connection;
+        let mut bottom_panel = icon_button(
+            "toggle_bottom_panel",
+            icon(
+                IconName::PanelBottom,
+                theme,
+                IconTone::Default,
+                TITLEBAR_SIDEBAR_ICON_SIZE,
+            ),
+            IconTone::Default,
+            bottom_panel_enabled,
+            &theme,
+        )
+        .size(px(TITLEBAR_CONTROL_HOVER_SIZE))
+        .rounded_full()
+        .when(self.bottom_panel_open, |this| {
+            this.bg(self.theme.control_pressed_bg)
+        })
+        .tooltip(move |_, cx| -> AnyView {
+            cx.new(|_| CommandTooltip {
+                label: "Toggle bottom panel".into(),
+                theme,
+            })
+            .into()
+        });
+        if bottom_panel_enabled {
+            bottom_panel = bottom_panel.on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_bottom_panel(window, cx);
+            }));
+        }
 
         div()
             .id("titlebar_action_group")
@@ -5933,6 +7015,15 @@ impl RemCmdApp {
                     .justify_center()
                     .size(px(TITLEBAR_TAB_GROUP_HEIGHT))
                     .child(new_terminal),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(TITLEBAR_TAB_GROUP_HEIGHT))
+                    .child(bottom_panel),
             )
             .child(
                 div()
@@ -6079,12 +7170,15 @@ impl RemCmdApp {
         let profile_id = active_session
             .map(|session| session.profile_id.as_str())
             .unwrap_or(&tab.profile_id);
-        let server_name = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .map(|profile| profile.name.as_str())
-            .unwrap_or("Server");
+        let server_name = if profile_id == LOCAL_PROFILE_ID {
+            "Local"
+        } else {
+            self.profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .map(|profile| profile.name.as_str())
+                .unwrap_or("Server")
+        };
         let sftp_path = active_session
             .filter(|session| session.sftp.loaded)
             .map(|session| session.sftp.display_path());
@@ -6551,12 +7645,6 @@ impl RemCmdApp {
         self.animate_titlebar_right_edge(titlebar, expanded_right_sidebar_width)
     }
 
-    fn is_terminal_visible(&self, profile_id: &str) -> bool {
-        self.active_session()
-            .filter(|session| session.profile_id == profile_id)
-            .is_some_and(TerminalSession::is_terminal_visible)
-    }
-
     fn has_terminal_workspace(&self, profile_id: &str) -> bool {
         self.active_tab()
             .is_some_and(|tab| tab.profile_id == profile_id)
@@ -6662,6 +7750,16 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .session(session_id)
+            .is_some_and(TerminalSession::is_local)
+        {
+            if self.activate_session_in_window(session_id, window, cx) {
+                self.start_local_terminal(session_id, cx);
+            }
+            return;
+        }
+
         let Some(profile) = self
             .session(session_id)
             .and_then(|session| {
@@ -6732,14 +7830,43 @@ impl RemCmdApp {
         let Some(pane) = self.pane(pane_id) else {
             return div().into_any_element();
         };
-        let palette = self.terminal_palette();
         let session_id = pane.session_id;
+        let terminal_view = self.render_terminal_session_view(
+            session_id,
+            pane.focus_handle.clone(),
+            Some(pane_id),
+            format!("terminal-view-{}", pane_id.0),
+            cx,
+        );
         let session = self.session(session_id);
-        let cell_height = self
-            .session(session_id)
-            .and_then(|session| session.terminal.as_ref())
-            .map(|terminal| terminal.cell_height)
-            .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
+        let mut pane_view = div()
+            .id(SharedString::from(format!("terminal-pane-{}", pane_id.0)))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(120.0))
+            .min_h(px(100.0))
+            .overflow_hidden()
+            .child(terminal_view);
+        if session.is_some_and(TerminalSession::terminal_has_ended) {
+            pane_view = pane_view.child(self.render_terminal_lifecycle(session_id, cx));
+        }
+
+        pane_view.into_any_element()
+    }
+
+    fn render_terminal_session_view(
+        &self,
+        session_id: SessionId,
+        focus_handle: FocusHandle,
+        pane_id: Option<PaneId>,
+        element_id: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.terminal_palette();
+        let session = self.session(session_id);
+        let terminal_font_size = f32::from(self.terminal_font_size);
+        let terminal_line_height = terminal_font_size * TERMINAL_FONT_LINE_HEIGHT_FACTOR;
         let model = session.and_then(|session| {
             session.terminal.as_ref().map(|terminal| {
                 TerminalViewModel::from_snapshot_with_selection(
@@ -6751,7 +7878,7 @@ impl RemCmdApp {
         });
         let input_entity = cx.entity();
         let layout_entity = input_entity.clone();
-        let input_focus_handle = pane.focus_handle.clone();
+        let input_focus_handle = focus_handle.clone();
         let input_layer = canvas(
             move |bounds, window, _| {
                 let metrics = TerminalCellMetrics::measure(window);
@@ -6788,41 +7915,61 @@ impl RemCmdApp {
         .left_0()
         .size_full();
 
-        let border = if self.active_pane_id == Some(pane_id) {
-            self.theme.border_strong
-        } else {
-            self.theme.border
-        };
         let terminal_view = div()
-            .id(SharedString::from(format!("terminal-view-{}", pane_id.0)))
+            .id(SharedString::from(element_id))
             .key_context("Terminal")
-            .track_focus(&pane.focus_handle)
+            .track_focus(&focus_handle)
             .flex_1()
             .min_w(px(0.0))
             .min_h(px(0.0))
             .w_full()
             .p_3()
             .overflow_hidden()
-            .border_1()
-            .border_color(border)
             .bg(rgb(palette.background.hex()))
-            .font_family(TERMINAL_FONT_FAMILY)
-            .text_size(px(14.0))
-            .line_height(px(cell_height))
+            .font_family(self.terminal_font_family.clone())
+            .text_size(px(terminal_font_size))
+            .line_height(px(terminal_line_height))
             .cursor(CursorStyle::IBeam)
-            .focus(|style| style.border_color(self.theme.border_strong))
-            .on_key_down(cx.listener(Self::on_terminal_key_down))
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.on_terminal_key_down(session_id, event, window, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event, window, cx| {
-                    this.on_terminal_mouse_down(pane_id, event, window, cx);
+                    if let Some(pane_id) = pane_id {
+                        this.on_terminal_mouse_down(pane_id, event, window, cx);
+                    } else {
+                        this.on_quick_terminal_mouse_down(session_id, event, window, cx);
+                    }
                 }),
             )
-            .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event, window, cx| {
+                    this.open_terminal_context_menu(session_id, pane_id, event, window, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event, window, cx| {
+                this.on_terminal_mouse_move(session_id, event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event, window, cx| {
+                    this.on_terminal_mouse_up(session_id, event, window, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, event, window, cx| {
+                    this.on_terminal_mouse_up(session_id, event, window, cx);
+                }),
+            )
             .on_scroll_wheel(cx.listener(move |this, event, window, cx| {
-                this.on_terminal_scroll(pane_id, event, window, cx);
+                if let Some(pane_id) = pane_id {
+                    this.on_terminal_scroll(pane_id, event, window, cx);
+                } else {
+                    this.on_quick_terminal_scroll(session_id, event, window, cx);
+                }
             }))
             .child(
                 div()
@@ -6834,20 +7981,7 @@ impl RemCmdApp {
                     .child(input_layer),
             );
 
-        let mut pane_view = div()
-            .id(SharedString::from(format!("terminal-pane-{}", pane_id.0)))
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(120.0))
-            .min_h(px(100.0))
-            .overflow_hidden()
-            .child(terminal_view);
-        if session.is_some_and(TerminalSession::terminal_has_ended) {
-            pane_view = pane_view.child(self.render_terminal_lifecycle(session_id, cx));
-        }
-
-        pane_view.into_any_element()
+        terminal_view.into_any_element()
     }
 
     fn render_terminal_lifecycle(
@@ -6945,21 +8079,12 @@ impl RemCmdApp {
             ),
         };
 
-        let mut modal = div()
+        let mut modal = self
+            .glass_floating_surface()
             .w_full()
             .max_w(px(420.0))
             .mx_4()
             .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(8.0)),
-                blur_radius: px(24.0),
-                spread_radius: px(-8.0),
-            }])
             .child(div().font_weight(FontWeight::MEDIUM).child(title))
             .child(
                 div()
@@ -6983,15 +8108,7 @@ impl RemCmdApp {
 
         modal = modal
             .child(div().mt_4().text_sm().child(field_label))
-            .child(
-                div()
-                    .mt_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.surface_bg)
-                    .child(prompt.input.clone()),
-            )
+            .child(div().mt_2().child(prompt.input.clone()))
             .child(
                 div()
                     .id("credential_remember")
@@ -7101,21 +8218,12 @@ impl RemCmdApp {
             .as_ref()
             .expect("host-key prompt should exist before rendering");
 
-        let modal = div()
+        let modal = self
+            .glass_floating_surface()
             .w_full()
             .max_w(px(500.0))
             .mx_4()
             .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(8.0)),
-                blur_radius: px(24.0),
-                spread_radius: px(-8.0),
-            }])
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
@@ -7162,7 +8270,7 @@ impl RemCmdApp {
                 div()
                     .mt_1()
                     .w_full()
-                    .font_family(TERMINAL_FONT_FAMILY)
+                    .font_family(UI_MONOSPACE_FONT_FAMILY)
                     .text_xs()
                     .child(info.fingerprint().to_owned()),
             )
@@ -7220,7 +8328,7 @@ impl RemCmdApp {
         let list_hover_background = self.theme.list_hover_bg;
         let pressed_background = self.theme.control_pressed_bg;
         let mut connection_tree = div()
-            .id("connection_list")
+            .id("sidebar_navigation")
             .flex()
             .flex_col()
             .flex_1()
@@ -7229,6 +8337,86 @@ impl RemCmdApp {
             .overflow_x_hidden()
             .overflow_y_scroll()
             .mt_3();
+
+        let home_selected = self.active_panel == ActivePanel::Home;
+        let home_background = if home_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let home_hover = if home_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.list_hover_bg
+        };
+        connection_tree = connection_tree
+            .child(
+                div()
+                    .id("show_home")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(10.0))
+                    .h(px(36.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(home_background)
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(home_hover))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(self.render_sidebar_icon(IconName::Home, 17.0))
+                    .child("Home")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_home(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("open_local_terminal")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(10.0))
+                    .h(px(36.0))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(list_hover_background))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(self.render_sidebar_icon(IconName::Terminal, 17.0))
+                    .child("Local Terminal")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_local_terminal(window, cx);
+                    })),
+            )
+            .when(self.tab_layout == TabLayout::Vertical, |mut this| {
+                for tab in self
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.profile_id == LOCAL_PROFILE_ID)
+                {
+                    this =
+                        this.child(self.render_sidebar_terminal_tab(tab, pressed_background, cx));
+                }
+                this
+            })
+            .child(
+                div()
+                    .id("add_connection")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(10.0))
+                    .h(px(36.0))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(list_hover_background))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(self.render_sidebar_icon(IconName::NewConnection, 17.0))
+                    .child("New Connection")
+                    .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
+            );
 
         let section_icon = if self.connections_expanded {
             IconName::Collapse
@@ -7243,6 +8431,7 @@ impl RemCmdApp {
                 .items_center()
                 .gap(px(10.0))
                 .h(px(32.0))
+                .mt_2()
                 .px_2()
                 .rounded_md()
                 .text_sm()
@@ -7270,6 +8459,7 @@ impl RemCmdApp {
 
                 let select_profile_id = profile.id.clone();
                 let new_terminal_profile_id = profile.id.clone();
+                let context_profile_id = profile.id.clone();
                 let can_create_terminal = self.credential_lookup_task.is_none()
                     && !self
                         .credential_mutations_in_progress
@@ -7291,7 +8481,7 @@ impl RemCmdApp {
                             this.connect_selected_profile_in_new_session(window, cx);
                         }));
                 }
-                let is_selected = self.active_panel == ActivePanel::Connection
+                let is_selected = self.active_panel == ActivePanel::Server
                     && self.selected_profile_id.as_ref() == Some(&profile.id);
                 let background = if is_selected {
                     self.theme.list_selected_bg
@@ -7328,6 +8518,16 @@ impl RemCmdApp {
                                 .child(profile.name.clone()),
                         )
                         .child(new_terminal_button)
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event, _, cx| {
+                                this.open_profile_context_menu(
+                                    context_profile_id.clone(),
+                                    event,
+                                    cx,
+                                );
+                            }),
+                        )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_profile(select_profile_id.clone(), window, cx);
                         })),
@@ -7335,71 +8535,11 @@ impl RemCmdApp {
 
                 if self.tab_layout == TabLayout::Vertical {
                     for tab in self.tabs.iter().filter(|tab| tab.profile_id == profile.id) {
-                        let tab_id = tab.id;
-                        let terminal_title = self.terminal_tab_title(tab);
-                        let is_active = self.active_panel == ActivePanel::Connection
-                            && self.active_tab_id == Some(tab_id);
-                        let background = if is_active {
-                            self.theme.list_selected_bg
-                        } else {
-                            self.theme.transparent
-                        };
-                        let hover = if is_active {
-                            self.theme.list_selected_hover_bg
-                        } else {
-                            self.theme.list_hover_bg
-                        };
-                        connection_tree = connection_tree.child(
-                            div()
-                                .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .gap_2()
-                                .h(px(32.0))
-                                .ml(px(20.0))
-                                .pl_2()
-                                .pr_1()
-                                .rounded_md()
-                                .bg(background)
-                                .cursor_pointer()
-                                .hover(move |this| this.bg(hover))
-                                .active(move |this| this.bg(pressed_background))
-                                .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .truncate()
-                                        .text_sm()
-                                        .text_color(self.theme.text_muted)
-                                        .child(terminal_title),
-                                )
-                                .child(
-                                    self.render_icon_button(
-                                        SharedString::from(format!(
-                                            "close-sidebar-tab-{}",
-                                            tab_id.0
-                                        )),
-                                        IconName::Cancel,
-                                        "Close terminal",
-                                        IconTone::Default,
-                                        true,
-                                    )
-                                    .size(px(24.0))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.close_tab(tab_id, cx);
-                                        },
-                                    )),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if this.activate_tab_in_window(tab_id, window, cx) {
-                                        cx.notify();
-                                    }
-                                })),
-                        );
+                        connection_tree = connection_tree.child(self.render_sidebar_terminal_tab(
+                            tab,
+                            pressed_background,
+                            cx,
+                        ));
                     }
                 }
             }
@@ -7434,7 +8574,8 @@ impl RemCmdApp {
             .w(px(width))
             .ml(px(-12.0))
             .mt_3()
-            .pt_2()
+            .pt(px(10.0))
+            .pb(px(10.0))
             .border_t_1()
             .border_color(self.theme.border)
             .child(
@@ -7461,7 +8602,6 @@ impl RemCmdApp {
         self.glass_sidebar_surface()
             .w(px(width))
             .px_3()
-            .pb_4()
             .pt(px(TITLEBAR_HEIGHT))
             .child(
                 div()
@@ -7491,37 +8631,77 @@ impl RemCmdApp {
                     ),
             )
             .when(self.sidebar_search_visible, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .mt_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(self.theme.border)
-                        .bg(self.theme.surface_bg)
-                        .child(self.sidebar_search.clone()),
-                )
+                this.child(div().flex_none().mt_2().child(self.sidebar_search.clone()))
             })
-            .child(
-                div()
-                    .id("add_connection")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(10.0))
-                    .h(px(36.0))
-                    .mt_3()
-                    .px_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(move |this| this.bg(list_hover_background))
-                    .active(move |this| this.bg(pressed_background))
-                    .child(self.render_sidebar_icon(IconName::NewConnection, 17.0))
-                    .child("New Connection")
-                    .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
-            )
             .child(connection_tree)
             .child(settings_footer)
+    }
+
+    fn render_sidebar_terminal_tab(
+        &self,
+        tab: &TerminalTab,
+        pressed_background: Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let tab_id = tab.id;
+        let terminal_title = self.terminal_tab_title(tab);
+        let is_active =
+            self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
+        let background = if is_active {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let hover = if is_active {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.list_hover_bg
+        };
+
+        div()
+            .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(32.0))
+            .ml(px(20.0))
+            .pl_2()
+            .pr_1()
+            .rounded_md()
+            .bg(background)
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover))
+            .active(move |this| this.bg(pressed_background))
+            .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child(terminal_title),
+            )
+            .child(
+                self.render_icon_button(
+                    SharedString::from(format!("close-sidebar-tab-{}", tab_id.0)),
+                    IconName::Cancel,
+                    "Close terminal",
+                    IconTone::Default,
+                    true,
+                )
+                .size(px(24.0))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_tab(tab_id, cx);
+                })),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.activate_tab_in_window(tab_id, window, cx) {
+                    cx.notify();
+                }
+            }))
     }
 
     fn glass_sidebar_surface(&self) -> gpui::Div {
@@ -7532,6 +8712,20 @@ impl RemCmdApp {
             .min_w(px(0.0))
             .h_full()
             .bg(self.theme.sidebar_bg)
+    }
+
+    fn glass_floating_surface(&self) -> gpui::Div {
+        div()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.sidebar_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
     }
 
     fn render_sidebar_resize_handle(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8112,187 +9306,666 @@ impl RemCmdApp {
             .child(content)
     }
 
+    fn render_bottom_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = div()
+            .id("bottom_panel")
+            .relative()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .h(px(0.0))
+            .overflow_hidden();
+        if !self.bottom_panel_open {
+            return panel;
+        }
+
+        let mut actions = div().flex().flex_none().items_center().gap_1();
+        if self.quick_terminal_session_id.is_some() {
+            actions = actions.child(
+                self.render_icon_button(
+                    "dispose_quick_terminal",
+                    IconName::Delete,
+                    "Close Quick Terminal",
+                    IconTone::Default,
+                    true,
+                )
+                .size(px(28.0))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.dispose_quick_terminal(cx);
+                })),
+            );
+        }
+        actions = actions.child(
+            self.render_icon_button(
+                "collapse_bottom_panel",
+                IconName::Collapse,
+                "Collapse panel",
+                IconTone::Default,
+                true,
+            )
+            .size(px(28.0))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.bottom_panel_open = false;
+                this.bottom_panel_resize = None;
+                cx.notify();
+            })),
+        );
+
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .h(px(BOTTOM_PANEL_HEADER_HEIGHT))
+            .px_2()
+            .border_b_1()
+            .border_color(self.theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.render_sidebar_icon(IconName::Terminal, 15.0))
+                    .child("TERMINAL"),
+            )
+            .child(actions);
+
+        panel = panel
+            .h(px(self.bottom_panel_height))
+            .min_h(px(BOTTOM_PANEL_HEADER_HEIGHT))
+            .mx(px(-16.0))
+            .mb(px(-16.0))
+            .mt_2()
+            .border_t_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.panel_bg)
+            .child(
+                div()
+                    .id("bottom_panel_resize_handle")
+                    .absolute()
+                    .top(px(-3.0))
+                    .left_0()
+                    .right_0()
+                    .h(px(6.0))
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(Self::begin_bottom_panel_resize),
+                    ),
+            )
+            .child(self.render_quick_command_prompt(cx))
+            .child(header)
+            .child(self.render_quick_terminal_panel(cx));
+
+        panel
+    }
+
+    fn render_quick_terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(session_id) = self.quick_terminal_session_id else {
+            return div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(
+                    text_button(
+                        "start_quick_terminal",
+                        "Start Local Terminal",
+                        TextButtonTone::Primary,
+                        true,
+                        &self.theme,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.restart_quick_terminal(window, cx);
+                    })),
+                )
+                .into_any_element();
+        };
+        let ended = self
+            .session(session_id)
+            .is_some_and(TerminalSession::terminal_has_ended);
+        let message = self.session(session_id).and_then(|session| {
+            session
+                .connection_error
+                .as_ref()
+                .or(session.terminal_end_reason.as_ref())
+                .cloned()
+        });
+        let terminal = self.render_terminal_session_view(
+            session_id,
+            self.quick_terminal_focus_handle.clone(),
+            None,
+            "quick-terminal-view".into(),
+            cx,
+        );
+
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .p_2()
+            .pt_0()
+            .child(terminal)
+            .when(ended, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pt_2()
+                        .text_sm()
+                        .text_color(self.theme.text_muted)
+                        .child(message.unwrap_or_else(|| "Local terminal ended".into()))
+                        .child(
+                            text_button(
+                                "restart_quick_terminal",
+                                "Restart",
+                                TextButtonTone::Secondary,
+                                true,
+                                &self.theme,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.restart_quick_terminal(window, cx);
+                                },
+                            )),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_home(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut connections = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .overflow_hidden()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg);
+        if self.profiles.is_empty() {
+            connections = connections.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(72.0))
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child("No connections yet"),
+            );
+        } else {
+            for (index, profile) in self.profiles.iter().take(6).enumerate() {
+                let profile_id = profile.id.clone();
+                let hover = self.theme.list_hover_bg;
+                connections = connections.child(
+                    div()
+                        .id(SharedString::from(format!("home-profile-{}", profile.id)))
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .h(px(52.0))
+                        .px_3()
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(hover))
+                        .child(self.render_sidebar_icon(IconName::Server, 19.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(profile.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(self.theme.text_muted)
+                                        .child(profile.address()),
+                                ),
+                        )
+                        .child(self.render_sidebar_icon(IconName::Expand, 14.0))
+                        .when(index + 1 < self.profiles.len().min(6), |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left(px(44.0))
+                                    .right(px(12.0))
+                                    .h(px(1.0))
+                                    .bg(self.theme.settings_separator),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_profile(profile_id.clone(), window, cx);
+                        })),
+                );
+            }
+        }
+
+        let new_connection = text_button(
+            "home-new-connection",
+            "New Connection",
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx)));
+        let local_terminal = text_button(
+            "home-local-terminal",
+            "Local Terminal",
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_local_terminal(window, cx);
+        }));
+
+        self.detail_panel_shell().child(
+            div()
+                .id("home_content")
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .max_w(px(720.0))
+                        .flex_col()
+                        .py(px(64.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(42.0))
+                                        .rounded_lg()
+                                        .bg(self.theme.control_bg)
+                                        .child(icon(
+                                            IconName::Home,
+                                            self.theme,
+                                            IconTone::Default,
+                                            23.0,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .text_size(px(24.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child("RemCmd"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(self.theme.text_muted)
+                                                .child("Remote workspaces, files, and terminals"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .mt_6()
+                                .child(new_connection)
+                                .child(local_terminal),
+                        )
+                        .child(
+                            div()
+                                .mt_8()
+                                .mb_2()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Connections"),
+                        )
+                        .child(connections),
+                ),
+        )
+    }
+
+    fn render_server_overview(
+        &self,
+        profile: Option<ConnectionProfile>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let Some(profile) = profile else {
+            return self.render_home(cx);
+        };
+        let session = self.session_for_profile(&profile.id);
+        let state = session
+            .map(|session| session.connection_state)
+            .unwrap_or(SessionState::Disconnected);
+        let status = match state {
+            SessionState::Disconnected => "Disconnected",
+            SessionState::Connecting => "Connecting",
+            SessionState::Authenticating => "Authenticating",
+            SessionState::Connected => "Connected",
+            SessionState::Disconnecting => "Disconnecting",
+            SessionState::Failed => "Failed",
+        };
+        let status_color = match state {
+            SessionState::Connected => self.theme.status_ok,
+            SessionState::Failed => self.theme.error_text,
+            SessionState::Connecting
+            | SessionState::Authenticating
+            | SessionState::Disconnecting => self.theme.status_warn,
+            SessionState::Disconnected => self.theme.text_muted,
+        };
+        let terminal_count = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.profile_id == profile.id)
+            .count();
+        let state_allows_connect = matches!(
+            state,
+            SessionState::Disconnected | SessionState::Connected | SessionState::Failed
+        );
+        let can_connect = state_allows_connect
+            && self.credential_lookup_task.is_none()
+            && !self
+                .credential_mutations_in_progress
+                .contains_key(&profile.id);
+        let action_label = if state == SessionState::Connected {
+            "New Terminal"
+        } else if state == SessionState::Failed {
+            "Retry Connection"
+        } else if state == SessionState::Connecting || state == SessionState::Authenticating {
+            "Connecting..."
+        } else if state == SessionState::Disconnecting {
+            "Disconnecting..."
+        } else {
+            "Connect"
+        };
+        let action_hover = self.theme.accent_hover;
+        let action_pressed = self.theme.button_primary_pressed_bg;
+        let mut connect = div()
+            .id("server-overview-connect")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .h(px(40.0))
+            .px_5()
+            .rounded_lg()
+            .bg(self.theme.accent)
+            .text_color(self.theme.on_accent)
+            .font_weight(FontWeight::MEDIUM)
+            .when(can_connect, |this| {
+                this.cursor_pointer()
+                    .hover(move |this| this.bg(action_hover))
+                    .active(move |this| this.bg(action_pressed))
+            })
+            .when(!can_connect, |this| this.opacity(0.5))
+            .child(icon_with_color(
+                if state == SessionState::Failed {
+                    IconName::Reconnect
+                } else {
+                    IconName::Connect
+                },
+                self.theme.on_accent,
+                18.0,
+            ))
+            .child(action_label);
+        if can_connect {
+            connect = connect.on_click(cx.listener(|this, _, window, cx| {
+                this.connect_selected_profile_in_new_session(window, cx);
+            }));
+        }
+
+        let info = div()
+            .flex()
+            .w_full()
+            .max_w(px(520.0))
+            .flex_col()
+            .overflow_hidden()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg)
+            .child(self.render_server_info_row("Host", profile.host.clone(), true))
+            .child(self.render_server_info_row("Port", profile.port.to_string(), true))
+            .child(self.render_server_info_row("Username", profile.username.clone(), true))
+            .child(self.render_server_info_row(
+                "Authentication",
+                ProfileAuthKind::from_config(&profile.auth).label().into(),
+                true,
+            ))
+            .child(self.render_server_info_row(
+                "Open terminals",
+                terminal_count.to_string(),
+                false,
+            ));
+
+        self.detail_panel_shell().child(
+            div()
+                .id("server_overview_content")
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .items_center()
+                .child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .flex_col()
+                        .items_center()
+                        .py(px(64.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(58.0))
+                                .rounded_lg()
+                                .bg(self.theme.control_bg)
+                                .child(icon(IconName::Server, self.theme, IconTone::Default, 30.0)),
+                        )
+                        .child(
+                            div()
+                                .mt_4()
+                                .text_size(px(28.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child(profile.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_sm()
+                                .text_color(self.theme.text_muted)
+                                .child(profile.address()),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(status_color)
+                                .child(status),
+                        )
+                        .child(div().mt_6().child(connect))
+                        .child(div().mt_8().w_full().max_w(px(520.0)).child(info))
+                        .when_some(
+                            session.and_then(|session| session.connection_error.as_ref()),
+                            |this, error| {
+                                this.child(
+                                    div()
+                                        .mt_3()
+                                        .max_w(px(520.0))
+                                        .text_sm()
+                                        .text_color(self.theme.error_text)
+                                        .child(error.clone()),
+                                )
+                            },
+                        ),
+                ),
+        )
+    }
+
+    fn render_server_info_row(
+        &self,
+        label: &'static str,
+        value: String,
+        divided: bool,
+    ) -> gpui::Div {
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(40.0))
+            .px_3()
+            .text_sm()
+            .child(div().text_color(self.theme.text_muted).child(label))
+            .child(div().min_w(px(0.0)).truncate().child(value))
+            .when(divided, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(12.0))
+                        .right(px(12.0))
+                        .h(px(1.0))
+                        .bg(self.theme.settings_separator),
+                )
+            })
+    }
+
     fn render_detail_panel(
         &self,
         selected_profile: Option<ConnectionProfile>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        if self.active_panel == ActivePanel::Settings {
-            return self.render_settings(cx);
+        match self.active_panel {
+            ActivePanel::Home => return self.render_home(cx),
+            ActivePanel::Server => return self.render_server_overview(selected_profile, cx),
+            ActivePanel::Settings => return self.render_settings(cx),
+            ActivePanel::Connection => {}
+        }
+        if self.active_session().is_some_and(TerminalSession::is_local)
+            && self
+                .active_tab()
+                .is_some_and(|tab| tab.profile_id == LOCAL_PROFILE_ID)
+        {
+            return self.render_local_terminal_panel(cx);
         }
 
         let mut panel = self.detail_panel_shell();
 
-        match selected_profile {
-            Some(profile) => {
-                let Some(editor) = self.editor.as_ref() else {
-                    return panel.child("No editor loaded");
-                };
+        if let Some(profile) = selected_profile
+            && self.has_terminal_workspace(&profile.id)
+        {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_start()
+                    .gap_1()
+                    .min_h(px(36.0))
+                    .mx(px(-16.0))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(self.render_workspace_controls(cx))
+                    .child(self.render_pane_controls(cx))
+                    .child(self.render_connection_controls(cx)),
+            );
 
-                panel = panel.child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_start()
-                        .gap_1()
-                        .child(self.render_workspace_controls(cx))
-                        .child(self.render_pane_controls(cx))
-                        .child(self.render_connection_controls(cx))
-                        .child(
-                            self.render_icon_button(
-                                "delete_connection",
-                                IconName::Delete,
-                                "Delete",
-                                IconTone::Danger,
-                                true,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_selected_profile(cx);
-                            })),
-                        ),
-                );
-
-                if self.has_terminal_workspace(&profile.id) {
-                    match self.active_tab_view() {
-                        TerminalTabView::Terminal => {
-                            if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
-                                panel = panel.child(
-                                    div()
-                                        .flex()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .min_h(px(0.0))
-                                        .mt_4()
-                                        .overflow_hidden()
-                                        .child(self.render_pane_layout(layout, cx)),
-                                );
-                            }
-                        }
-                        TerminalTabView::Files => {
-                            if let Some(session_id) = self.active_session_id {
-                                panel = panel.child(self.render_sftp_browser(
-                                    session_id,
-                                    SftpBrowserPlacement::Center,
-                                    cx,
-                                ));
-                            }
-                        }
-                    }
-                } else {
-                    let form = div()
-                        .id("connection_form")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .overflow_x_hidden()
-                        .overflow_y_scroll()
-                        .pr_1()
-                        .child(self.render_form_row("Name", editor.name.clone()))
-                        .child(self.render_form_row("Host", editor.host.clone()))
-                        .child(self.render_form_row("Port", editor.port.clone()))
-                        .child(self.render_form_row("Username", editor.username.clone()))
-                        .child(self.render_auth_method_row(editor.auth_kind, cx))
-                        .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
-                            this.child(
-                                self.render_private_key_row(editor.private_key_path.clone(), cx),
-                            )
-                        })
-                        .when(
-                            matches!(
-                                editor.auth_kind,
-                                ProfileAuthKind::Password | ProfileAuthKind::PrivateKey
-                            ),
-                            |this| this.child(self.render_saved_credential_row(cx)),
-                        )
-                        .when_some(self.form_error.as_ref(), |this, error| {
-                            this.child(
-                                div()
-                                    .mt_3()
-                                    .text_color(self.theme.error_text)
-                                    .child(error.clone()),
-                            )
-                        })
-                        .when_some(
-                            self.selected_session()
-                                .and_then(|session| session.connection_error.as_ref()),
-                            |this, error| {
-                                this.child(
-                                    div()
-                                        .mt_3()
-                                        .text_color(self.theme.error_text)
-                                        .child(error.clone()),
-                                )
-                            },
-                        )
-                        .when_some(
-                            self.selected_session()
-                                .and_then(|session| session.connection_message.as_ref()),
-                            |this, message| {
-                                this.child(
-                                    div()
-                                        .mt_3()
-                                        .text_color(self.theme.text_muted)
-                                        .child(message.clone()),
-                                )
-                            },
-                        )
-                        .child(
+            match self.active_tab_view() {
+                TerminalTabView::Terminal => {
+                    if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
+                        panel = panel.child(
                             div()
                                 .flex()
-                                .flex_none()
-                                .flex_wrap()
-                                .mt_6()
-                                .gap_2()
-                                .pb_2()
-                                .child(
-                                    text_button(
-                                        "save_profile",
-                                        "Save",
-                                        TextButtonTone::Primary,
-                                        true,
-                                        &self.theme,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.save_editor(cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    text_button(
-                                        "cancel_profile",
-                                        "Cancel",
-                                        TextButtonTone::Secondary,
-                                        true,
-                                        &self.theme,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.cancel_editor(cx);
-                                        },
-                                    )),
-                                ),
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .min_h(px(0.0))
+                                .overflow_hidden()
+                                .child(self.render_pane_layout(layout, cx)),
                         );
-                    panel = panel.child(form);
+                    }
+                }
+                TerminalTabView::Files => {
+                    if let Some(session_id) = self.active_session_id {
+                        panel = panel.child(self.render_sftp_browser(
+                            session_id,
+                            SftpBrowserPlacement::Center,
+                            cx,
+                        ));
+                    }
                 }
             }
-            None => {
-                panel = panel.child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .text_color(self.theme.text_muted)
-                        .child("No connection selected"),
-                );
-            }
+        } else {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_color(self.theme.text_muted)
+                    .child("No terminal selected"),
+            );
         }
 
-        panel
+        panel.child(self.render_bottom_panel(cx))
+    }
+
+    fn render_local_terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut panel = self.detail_panel_shell().child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_start()
+                .min_h(px(36.0))
+                .mx(px(-16.0))
+                .px_4()
+                .border_b_1()
+                .border_color(self.theme.border)
+                .child(self.render_pane_controls(cx)),
+        );
+
+        if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(self.render_pane_layout(layout, cx)),
+            );
+        }
+
+        panel.child(self.render_bottom_panel(cx))
     }
 
     fn detail_panel_shell(&self) -> gpui::Div {
@@ -8349,6 +10022,26 @@ impl RemCmdApp {
                 false,
                 cx,
             ));
+        let terminal_group = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg)
+            .child(self.render_settings_row(
+                "settings-terminal-font-row",
+                "Font",
+                SettingsSelector::TerminalFont,
+                true,
+                cx,
+            ))
+            .child(self.render_settings_row(
+                "settings-terminal-font-size-row",
+                "Font size",
+                SettingsSelector::TerminalFontSize,
+                false,
+                cx,
+            ));
         let transfer_group = div()
             .flex()
             .flex_col()
@@ -8389,6 +10082,16 @@ impl RemCmdApp {
                     .child("Appearance"),
             )
             .child(appearance_group)
+            .child(
+                div()
+                    .w_full()
+                    .mt_6()
+                    .mb_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Terminal"),
+            )
+            .child(terminal_group)
             .child(
                 div()
                     .w_full()
@@ -8462,11 +10165,16 @@ impl RemCmdApp {
         selector: SettingsSelector,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        if selector == SettingsSelector::TerminalFont {
+            return self.render_terminal_font_selector(cx);
+        }
+
         let is_open = self.open_settings_selector == Some(selector);
-        let control_width = selector.control_width();
+        let max_control_width = selector.control_width();
         let menu_width = selector.menu_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
-        let mut menu = div()
+        let mut menu = self
+            .glass_floating_surface()
             .id(SharedString::from(format!(
                 "{}-menu",
                 selector.element_id()
@@ -8477,23 +10185,19 @@ impl RemCmdApp {
             .w(px(menu_width))
             .flex()
             .flex_col()
-            .p(px(3.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
+            .max_h(px(260.0))
+            .overflow_y_scroll()
+            .p_1()
             .text_sm()
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(3.0)),
-                blur_radius: px(12.0),
-                spread_radius: px(-3.0),
-            }])
             .occlude();
         let selected_value = self.settings_value(selector);
-        let pressed_background = self.theme.control_pressed_bg;
+        let option_hover = self.theme.accent;
+        let option_pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
         for (index, option) in selector.options().iter().copied().enumerate() {
             let is_selected = option.value == selected_value;
+            let hover_group: SharedString =
+                format!("{}-option-{index}-hover", selector.element_id()).into();
             let mut check = div()
                 .flex()
                 .flex_none()
@@ -8503,38 +10207,31 @@ impl RemCmdApp {
             if is_selected {
                 check = check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
             }
-            let option_hover = if is_selected {
-                self.theme.accent_hover
-            } else {
-                self.theme.control_hover_bg
-            };
             menu = menu.child(
                 div()
                     .id(SharedString::from(format!(
                         "{}-option-{index}",
                         selector.element_id()
                     )))
+                    .group(hover_group.clone())
                     .flex()
                     .items_center()
-                    .h(px(24.0))
-                    .px_1()
-                    .rounded_lg()
+                    .gap_2()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
                     .when(is_selected, |this| {
                         this.bg(self.theme.accent).text_color(self.theme.on_accent)
                     })
                     .cursor_pointer()
-                    .hover(move |this| this.bg(option_hover))
-                    .active(move |this| this.bg(pressed_background))
+                    .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                    .active(move |this| this.bg(option_pressed).text_color(on_accent))
                     .child(check)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_center()
-                            .child(option.label),
-                    )
-                    .child(div().flex_none().size(px(16.0)))
+                    .child(self.render_select_menu_label(
+                        option.label.into(),
+                        is_selected,
+                        hover_group,
+                    ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.apply_settings_value(option.value, window, cx);
@@ -8543,6 +10240,7 @@ impl RemCmdApp {
         }
 
         let button_hover = self.theme.control_hover_bg;
+        let button_pressed = self.theme.control_pressed_bg;
         let current_label = self.settings_value_label(selector);
         let picker = div()
             .flex()
@@ -8567,7 +10265,7 @@ impl RemCmdApp {
             .group(control_group)
             .flex()
             .flex_none()
-            .w(px(control_width))
+            .max_w(px(max_control_width))
             .items_center()
             .h(px(24.0))
             .pl(px(6.0))
@@ -8581,11 +10279,12 @@ impl RemCmdApp {
             .text_sm()
             .cursor_pointer()
             .hover(move |this| this.bg(button_hover))
-            .active(move |this| this.bg(pressed_background))
+            .active(move |this| this.bg(button_pressed))
             .child(
                 div()
-                    .flex_1()
+                    .flex_none()
                     .min_w(px(0.0))
+                    .max_w(px(max_control_width - 33.0))
                     .truncate()
                     .pr(px(4.0))
                     .text_right()
@@ -8600,9 +10299,185 @@ impl RemCmdApp {
             .relative()
             .flex()
             .flex_none()
-            .w(px(control_width))
+            .max_w(px(max_control_width))
             .child(button)
             .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
+    }
+
+    fn render_terminal_font_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let selector = SettingsSelector::TerminalFont;
+        let is_open = self.open_settings_selector == Some(selector);
+        let max_control_width = selector.control_width();
+        let control_group: SharedString = format!("{}-control", selector.element_id()).into();
+        let mut menu = self
+            .glass_floating_surface()
+            .id(SharedString::from(format!(
+                "{}-menu",
+                selector.element_id()
+            )))
+            .absolute()
+            .top(px(26.0))
+            .right_0()
+            .w(px(selector.menu_width()))
+            .max_h(px(260.0))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .p_1()
+            .text_sm()
+            .occlude();
+        let option_hover = self.theme.accent;
+        let option_pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
+        for (index, family) in self.terminal_font_families.iter().cloned().enumerate() {
+            let is_selected = family == self.terminal_font_family;
+            let hover_group: SharedString =
+                format!("{}-option-{index}-hover", selector.element_id()).into();
+            let mut check = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(16.0));
+            if is_selected {
+                check = check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+            }
+            let selected_family = family.clone();
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "{}-option-{index}",
+                        selector.element_id()
+                    )))
+                    .group(hover_group.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
+                    .when(is_selected, |this| {
+                        this.bg(self.theme.accent).text_color(self.theme.on_accent)
+                    })
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                    .active(move |this| this.bg(option_pressed).text_color(on_accent))
+                    .child(check)
+                    .child(self.render_select_menu_label(family, is_selected, hover_group))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_terminal_font_family(selected_family.clone(), cx);
+                    })),
+            );
+        }
+
+        let button_hover = self.theme.control_hover_bg;
+        let button_pressed = self.theme.control_pressed_bg;
+        let picker = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded_full()
+            .bg(if is_open {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.settings_picker_bg
+            })
+            .when(!is_open, |this| {
+                this.group_hover(control_group.clone(), |style| {
+                    style.bg(self.theme.transparent)
+                })
+            })
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
+        let button = div()
+            .id(selector.element_id())
+            .group(control_group)
+            .flex()
+            .flex_none()
+            .max_w(px(max_control_width))
+            .items_center()
+            .h(px(24.0))
+            .pl(px(6.0))
+            .pr(px(1.0))
+            .rounded_lg()
+            .bg(if is_open {
+                self.theme.control_hover_bg
+            } else {
+                self.theme.transparent
+            })
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(button_hover))
+            .active(move |this| this.bg(button_pressed))
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .max_w(px(max_control_width - 33.0))
+                    .truncate()
+                    .pr(px(4.0))
+                    .text_right()
+                    .child(self.terminal_font_family.clone()),
+            )
+            .child(picker)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_settings_selector(selector, window, cx);
+            }));
+
+        div()
+            .relative()
+            .flex()
+            .flex_none()
+            .max_w(px(max_control_width))
+            .child(button)
+            .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
+    }
+
+    fn render_select_menu_label(
+        &self,
+        label: SharedString,
+        selected: bool,
+        hover_group: SharedString,
+    ) -> gpui::Div {
+        let base_color = if selected {
+            self.theme.on_accent
+        } else {
+            self.theme.text_primary
+        };
+        let hover_label = label.clone();
+
+        div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .child(
+                div()
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(base_color)
+                    .group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .opacity(0.0)
+                    .text_color(self.theme.on_accent)
+                    .group_hover(hover_group, |style| style.opacity(1.0))
+                    .child(hover_label),
+            )
     }
 
     fn render_pane_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8733,6 +10608,193 @@ impl RemCmdApp {
             .child(files_button)
     }
 
+    fn render_profile_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu_state) = self.profile_context_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == menu_state.profile_id)
+        else {
+            return div().into_any_element();
+        };
+        let profile_id = profile.id.clone();
+        let has_live_session = self.sessions.iter().any(|session| {
+            session.profile_id == profile_id && session.connection_state.can_disconnect()
+        });
+        let can_open_terminal = self.credential_lookup_task.is_none()
+            && !self
+                .credential_mutations_in_progress
+                .contains_key(&profile_id);
+        let viewport = window.viewport_size();
+        let left = f32::from(menu_state.position.x)
+            .min((f32::from(viewport.width) - 196.0).max(8.0))
+            .max(8.0);
+        let top = f32::from(menu_state.position.y)
+            .min((f32::from(viewport.height) - 142.0).max(8.0))
+            .max(8.0);
+
+        let terminal_profile_id = profile_id.clone();
+        let mut new_terminal = self.render_context_menu_item(
+            "profile-context-new-terminal",
+            IconName::Connect,
+            "New Terminal",
+            IconTone::Default,
+            can_open_terminal,
+        );
+        if can_open_terminal {
+            new_terminal = new_terminal.on_click(cx.listener(move |this, _, window, cx| {
+                this.profile_context_menu = None;
+                this.selected_profile_id = Some(terminal_profile_id.clone());
+                this.active_panel = ActivePanel::Server;
+                this.connect_selected_profile_in_new_session(window, cx);
+            }));
+        }
+
+        let edit_profile_id = profile_id.clone();
+        let mut edit = self.render_context_menu_item(
+            "profile-context-edit",
+            IconName::Edit,
+            "Edit Connection",
+            IconTone::Default,
+            true,
+        );
+        edit = edit.on_click(cx.listener(move |this, _, _, cx| {
+            this.edit_profile(edit_profile_id.clone(), cx);
+        }));
+
+        let delete_profile_id = profile_id;
+        let mut delete = self.render_context_menu_item(
+            "profile-context-delete",
+            IconName::Delete,
+            "Delete Connection",
+            IconTone::Danger,
+            !has_live_session,
+        );
+        if !has_live_session {
+            delete = delete.on_click(cx.listener(move |this, _, _, cx| {
+                this.delete_profile(delete_profile_id.clone(), cx);
+            }));
+        }
+
+        self.glass_floating_surface()
+            .id("profile_context_menu")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(188.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .occlude()
+            .child(new_terminal)
+            .child(edit)
+            .child(self.render_context_menu_separator())
+            .child(delete)
+            .into_any_element()
+    }
+
+    fn render_terminal_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu_state) = self.terminal_context_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let session_id = menu_state.session_id;
+        let Some(session) = self.session(session_id) else {
+            return div().into_any_element();
+        };
+        let can_copy = session
+            .terminal_selection
+            .is_some_and(|selection| !selection.is_empty());
+        let can_paste =
+            session.connection_state == SessionState::Connected && session.terminal.is_some();
+        let can_select_all = session.terminal.as_ref().is_some_and(|terminal| {
+            let size = terminal.engine.size();
+            size.rows() > 0 && size.columns() > 0
+        });
+        let can_reset = session.terminal.is_some();
+        let viewport = window.viewport_size();
+        let left = f32::from(menu_state.position.x)
+            .min((f32::from(viewport.width) - 196.0).max(8.0))
+            .max(8.0);
+        let top = f32::from(menu_state.position.y)
+            .min((f32::from(viewport.height) - 166.0).max(8.0))
+            .max(8.0);
+
+        let mut copy = self.render_context_menu_item(
+            "terminal-context-copy",
+            IconName::Copy,
+            "Copy",
+            IconTone::Default,
+            can_copy,
+        );
+        if can_copy {
+            copy = copy.on_click(cx.listener(move |this, _, _, cx| {
+                this.copy_terminal_selection(session_id, cx);
+                this.terminal_context_menu = None;
+                cx.notify();
+            }));
+        }
+        let mut paste = self.render_context_menu_item(
+            "terminal-context-paste",
+            IconName::Paste,
+            "Paste",
+            IconTone::Default,
+            can_paste,
+        );
+        if can_paste {
+            paste = paste.on_click(cx.listener(move |this, _, _, cx| {
+                this.paste_into_terminal(session_id, cx);
+                this.terminal_context_menu = None;
+                cx.notify();
+            }));
+        }
+        let mut select_all = self.render_context_menu_item(
+            "terminal-context-select-all",
+            IconName::SelectAll,
+            "Select All",
+            IconTone::Default,
+            can_select_all,
+        );
+        if can_select_all {
+            select_all = select_all.on_click(cx.listener(move |this, _, _, cx| {
+                this.select_all_terminal(session_id, cx);
+                this.terminal_context_menu = None;
+                cx.notify();
+            }));
+        }
+        let mut reset = self.render_context_menu_item(
+            "terminal-context-reset",
+            IconName::Reconnect,
+            "Reset Terminal",
+            IconTone::Default,
+            can_reset,
+        );
+        if can_reset {
+            reset = reset.on_click(cx.listener(move |this, _, _, cx| {
+                this.reset_terminal(session_id, cx);
+            }));
+        }
+
+        self.glass_floating_surface()
+            .id("terminal_context_menu")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(188.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .occlude()
+            .child(copy)
+            .child(paste)
+            .child(self.render_context_menu_separator())
+            .child(select_all)
+            .child(self.render_context_menu_separator())
+            .child(reset)
+            .into_any_element()
+    }
+
     fn render_sftp_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(menu_state) = self.sftp_context_menu.as_ref() else {
             return div().into_any_element();
@@ -8757,7 +10819,7 @@ impl RemCmdApp {
             .min((f32::from(viewport.height) - 286.0).max(8.0))
             .max(8.0);
 
-        let mut new_file = self.render_sftp_context_menu_item(
+        let mut new_file = self.render_context_menu_item(
             "sftp-context-new-file",
             IconName::File,
             "New File",
@@ -8775,7 +10837,7 @@ impl RemCmdApp {
                 );
             }));
         }
-        let mut new_folder = self.render_sftp_context_menu_item(
+        let mut new_folder = self.render_context_menu_item(
             "sftp-context-new-folder",
             IconName::Folder,
             "New Folder",
@@ -8793,7 +10855,7 @@ impl RemCmdApp {
                 );
             }));
         }
-        let mut copy_path = self.render_sftp_context_menu_item(
+        let mut copy_path = self.render_context_menu_item(
             "sftp-context-copy-path",
             IconName::Copy,
             "Copy Path",
@@ -8805,7 +10867,7 @@ impl RemCmdApp {
                 this.copy_selected_sftp_paths(session_id, placement, cx);
             }));
         }
-        let mut view = self.render_sftp_context_menu_item(
+        let mut view = self.render_context_menu_item(
             "sftp-context-view",
             IconName::View,
             "View",
@@ -8817,7 +10879,7 @@ impl RemCmdApp {
                 this.open_selected_sftp_file(session_id, placement, false, cx);
             }));
         }
-        let mut edit = self.render_sftp_context_menu_item(
+        let mut edit = self.render_context_menu_item(
             "sftp-context-edit",
             IconName::Edit,
             "Edit",
@@ -8829,7 +10891,7 @@ impl RemCmdApp {
                 this.open_selected_sftp_file(session_id, placement, true, cx);
             }));
         }
-        let mut download = self.render_sftp_context_menu_item(
+        let mut download = self.render_context_menu_item(
             "sftp-context-download",
             IconName::Download,
             "Download",
@@ -8841,7 +10903,7 @@ impl RemCmdApp {
                 this.download_selected_sftp_entries(session_id, placement, cx);
             }));
         }
-        let mut delete = self.render_sftp_context_menu_item(
+        let mut delete = self.render_context_menu_item(
             "sftp-context-delete",
             IconName::Delete,
             "Delete",
@@ -8854,7 +10916,7 @@ impl RemCmdApp {
             }));
         }
 
-        div()
+        self.glass_floating_surface()
             .id("sftp_context_menu")
             .absolute()
             .left(px(left))
@@ -8863,30 +10925,20 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .occlude()
             .child(new_file)
             .child(new_folder)
-            .child(self.render_sftp_context_menu_separator())
+            .child(self.render_context_menu_separator())
             .child(copy_path)
             .child(view)
             .child(edit)
             .child(download)
-            .child(self.render_sftp_context_menu_separator())
+            .child(self.render_context_menu_separator())
             .child(delete)
             .into_any_element()
     }
 
-    fn render_sftp_context_menu_item(
+    fn render_context_menu_item(
         &self,
         id: &'static str,
         icon_name: IconName,
@@ -8988,7 +11040,7 @@ impl RemCmdApp {
             )
     }
 
-    fn render_sftp_context_menu_separator(&self) -> gpui::Div {
+    fn render_context_menu_separator(&self) -> gpui::Div {
         div().h(px(1.0)).mx_2().my_1().bg(self.theme.border)
     }
 
@@ -9040,22 +11092,12 @@ impl RemCmdApp {
                 cx.notify();
             }))
             .child(
-                div()
+                self.glass_floating_surface()
                     .w(px(360.0))
                     .flex()
                     .flex_col()
                     .gap_3()
                     .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border_strong)
-                    .bg(self.theme.sidebar_bg)
-                    .shadow(vec![BoxShadow {
-                        color: self.theme.shadow,
-                        offset: point(px(0.0), px(6.0)),
-                        blur_radius: px(24.0),
-                        spread_radius: px(-5.0),
-                    }])
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(input)
                     .when_some(prompt.error.as_ref(), |this, error| {
@@ -9075,6 +11117,223 @@ impl RemCmdApp {
                             .child(create),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn render_quick_command_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(prompt) = self.quick_command_prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let connected_profile_ids = self.connected_ssh_profile_ids();
+        let selected_count = connected_profile_ids
+            .iter()
+            .filter(|profile_id| prompt.selected_profile_ids.contains(*profile_id))
+            .count();
+        let target_label: SharedString =
+            if selected_count == connected_profile_ids.len() && !connected_profile_ids.is_empty() {
+                "All servers".into()
+            } else if selected_count == 0 {
+                "No servers selected".into()
+            } else if selected_count == 1 {
+                let selected_profile_id = connected_profile_ids
+                    .iter()
+                    .find(|profile_id| prompt.selected_profile_ids.contains(*profile_id));
+                selected_profile_id
+                    .and_then(|profile_id| {
+                        self.profiles
+                            .iter()
+                            .find(|profile| profile.id == *profile_id)
+                    })
+                    .map(|profile| profile.name.clone().into())
+                    .unwrap_or_else(|| "1 server".into())
+            } else {
+                format!("{selected_count} servers").into()
+            };
+
+        let selector_group: SharedString = "quick-command-target-control".into();
+        let selector_hover = self.theme.control_hover_bg;
+        let pressed_background = self.theme.control_pressed_bg;
+        let picker = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded_full()
+            .bg(if prompt.target_menu_open {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.settings_picker_bg
+            })
+            .when(!prompt.target_menu_open, |this| {
+                this.group_hover(selector_group.clone(), |style| {
+                    style.bg(self.theme.transparent)
+                })
+            })
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
+        let selector_button = div()
+            .id("quick_command_targets")
+            .group(selector_group)
+            .flex()
+            .flex_none()
+            .items_center()
+            .max_w(px(180.0))
+            .h(px(24.0))
+            .pl(px(6.0))
+            .pr(px(1.0))
+            .rounded_lg()
+            .bg(if prompt.target_menu_open {
+                self.theme.control_hover_bg
+            } else {
+                self.theme.transparent
+            })
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(selector_hover))
+            .active(move |this| this.bg(pressed_background))
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .max_w(px(147.0))
+                    .truncate()
+                    .pr(px(4.0))
+                    .text_right()
+                    .child(target_label),
+            )
+            .child(picker)
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_quick_command_targets(cx);
+            }));
+
+        let mut selector = div()
+            .relative()
+            .flex()
+            .flex_none()
+            .max_w(px(180.0))
+            .child(selector_button);
+        if prompt.target_menu_open {
+            let mut menu = self
+                .glass_floating_surface()
+                .id("quick_command_target_menu")
+                .absolute()
+                .top(px(26.0))
+                .right_0()
+                .w(px(240.0))
+                .max_h(px(220.0))
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .p_1()
+                .text_sm()
+                .occlude();
+            let option_hover = self.theme.accent;
+            let option_pressed = self.theme.accent_hover;
+            let on_accent = self.theme.on_accent;
+            for (index, profile_id) in connected_profile_ids.iter().enumerate() {
+                let Some(profile) = self
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == *profile_id)
+                else {
+                    continue;
+                };
+                let is_selected = prompt.selected_profile_ids.contains(profile_id);
+                let hover_group: SharedString =
+                    format!("quick-command-target-option-{index}-hover").into();
+                let mut check = div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(16.0));
+                if is_selected {
+                    check =
+                        check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+                }
+                let target_profile_id = profile_id.clone();
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "quick-command-target-option-{index}"
+                        )))
+                        .group(hover_group.clone())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .when(is_selected, |this| {
+                            this.bg(self.theme.accent).text_color(self.theme.on_accent)
+                        })
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                        .active(move |this| this.bg(option_pressed).text_color(on_accent))
+                        .child(check)
+                        .child(self.render_select_menu_label(
+                            profile.name.clone().into(),
+                            is_selected,
+                            hover_group,
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_quick_command_target(target_profile_id.clone(), cx);
+                        })),
+                );
+            }
+            selector = selector.child(deferred(menu).with_priority(30));
+        }
+
+        let run_enabled = !prompt.input.read(cx).text().trim().is_empty()
+            && selected_count > 0
+            && !connected_profile_ids.is_empty();
+        let input = prompt.input.clone();
+        let run = text_button(
+            "submit_quick_command",
+            "Run",
+            TextButtonTone::Primary,
+            run_enabled,
+            &self.theme,
+        );
+        let run = if run_enabled {
+            run.on_click(cx.listener(|this, _, _, cx| this.submit_quick_command(cx)))
+        } else {
+            run
+        };
+
+        div()
+            .id("quick_command_panel")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(42.0))
+            .px_3()
+            .border_b_1()
+            .border_color(self.theme.border)
+            .key_context("QuickCommandPrompt")
+            .on_action(
+                cx.listener(|this, _: &SubmitQuickCommand, _, cx| this.submit_quick_command(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CancelQuickCommand, _, cx| this.close_quick_command(cx)),
+            )
+            .child(self.render_sidebar_icon(IconName::QuickCommand, 15.0))
+            .child(div().flex().flex_1().min_w(px(100.0)).child(input))
+            .when_some(prompt.error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .max_w(px(140.0))
+                        .truncate()
+                        .text_sm()
+                        .text_color(self.theme.error_text)
+                        .child(error.clone()),
+                )
+            })
+            .child(selector)
+            .child(run)
             .into_any_element()
     }
 
@@ -9389,7 +11648,7 @@ impl RemCmdApp {
             .items_center()
             .overflow_x_scroll()
             .track_scroll(&scroll_handle)
-            .font_family(TERMINAL_FONT_FAMILY)
+            .font_family(UI_MONOSPACE_FONT_FAMILY)
             .text_sm();
         for (index, (label, target)) in remote_breadcrumbs(path).into_iter().enumerate() {
             if index > 0 {
@@ -10043,7 +12302,7 @@ impl RemCmdApp {
                             .min_w(px(0.0))
                             .ml_2()
                             .truncate()
-                            .font_family(TERMINAL_FONT_FAMILY)
+                            .font_family(UI_MONOSPACE_FONT_FAMILY)
                             .text_sm()
                             .child(path),
                     )
@@ -10087,6 +12346,118 @@ impl RemCmdApp {
             })
             .child(content)
             .child(self.render_sftp_transfer_queue(session_id, SftpBrowserPlacement::Center, cx))
+            .into_any_element()
+    }
+
+    fn render_profile_editor_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = match editor.mode {
+            ProfileEditorMode::Create => "New Connection",
+            ProfileEditorMode::Edit => "Edit Connection",
+        };
+        let save = text_button(
+            "save_profile",
+            "Save",
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.save_editor(cx)));
+        let cancel = text_button(
+            "cancel_profile",
+            "Cancel",
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.cancel_editor(cx)));
+
+        let form = div()
+            .id("connection_form")
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .overflow_x_hidden()
+            .overflow_y_scroll()
+            .px_4()
+            .py_3()
+            .child(self.render_form_row("Name", editor.name.clone()))
+            .child(self.render_form_row("Host", editor.host.clone()))
+            .child(self.render_form_row("Port", editor.port.clone()))
+            .child(self.render_form_row("Username", editor.username.clone()))
+            .child(self.render_auth_method_row(editor.auth_kind, cx))
+            .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
+                this.child(self.render_private_key_row(editor.private_key_path.clone(), cx))
+            })
+            .when(
+                editor.mode == ProfileEditorMode::Edit
+                    && matches!(
+                        editor.auth_kind,
+                        ProfileAuthKind::Password | ProfileAuthKind::PrivateKey
+                    ),
+                |this| this.child(self.render_saved_credential_row(cx)),
+            )
+            .when_some(self.form_error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .mt_3()
+                        .text_sm()
+                        .text_color(self.theme.error_text)
+                        .child(error.clone()),
+                )
+            });
+
+        div()
+            .id("profile_editor_overlay")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .bg(self.theme.overlay_bg)
+            .occlude()
+            .child(
+                self.glass_floating_surface()
+                    .flex()
+                    .w_full()
+                    .max_w(px(620.0))
+                    .max_h(px(640.0))
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(46.0))
+                            .px_4()
+                            .border_b_1()
+                            .border_color(self.theme.border)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(form)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_between()
+                            .h(px(54.0))
+                            .px_4()
+                            .border_t_1()
+                            .border_color(self.theme.border)
+                            .child(cancel)
+                            .child(save),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -10229,9 +12600,128 @@ impl RemCmdApp {
         selected: ProfileAuthKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let control_group: SharedString = "profile-auth-selector-control".into();
+        let button_hover = self.theme.control_hover_bg;
+        let button_pressed = self.theme.control_pressed_bg;
+        let picker = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded_full()
+            .bg(if self.profile_auth_selector_open {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.settings_picker_bg
+            })
+            .when(!self.profile_auth_selector_open, |this| {
+                this.group_hover(control_group.clone(), |style| {
+                    style.bg(self.theme.transparent)
+                })
+            })
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
+        let button = div()
+            .id("profile-auth-selector")
+            .group(control_group)
+            .flex()
+            .flex_none()
+            .max_w(px(180.0))
+            .items_center()
+            .h(px(24.0))
+            .pl(px(6.0))
+            .pr(px(1.0))
+            .rounded_lg()
+            .bg(if self.profile_auth_selector_open {
+                self.theme.control_hover_bg
+            } else {
+                self.theme.transparent
+            })
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(button_hover))
+            .active(move |this| this.bg(button_pressed))
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(147.0))
+                    .truncate()
+                    .pr(px(4.0))
+                    .text_right()
+                    .child(selected.label()),
+            )
+            .child(picker)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_profile_auth_selector(cx);
+            }));
+
+        let mut selector = div().relative().flex().flex_none().child(button);
+        if self.profile_auth_selector_open {
+            let mut menu = self
+                .glass_floating_surface()
+                .id("profile-auth-selector-menu")
+                .absolute()
+                .top(px(26.0))
+                .right_0()
+                .w(px(180.0))
+                .flex()
+                .flex_col()
+                .p_1()
+                .text_sm()
+                .occlude();
+            let option_hover = self.theme.accent;
+            let option_pressed = self.theme.accent_hover;
+            let on_accent = self.theme.on_accent;
+            for (index, (auth_kind, label)) in ProfileAuthKind::OPTIONS.iter().copied().enumerate()
+            {
+                let is_selected = auth_kind == selected;
+                let hover_group: SharedString = format!("profile-auth-option-{index}-hover").into();
+                let mut check = div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(16.0));
+                if is_selected {
+                    check =
+                        check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+                }
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("profile-auth-option-{index}")))
+                        .group(hover_group.clone())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .when(is_selected, |this| {
+                            this.bg(self.theme.accent).text_color(self.theme.on_accent)
+                        })
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                        .active(move |this| this.bg(option_pressed).text_color(on_accent))
+                        .child(check)
+                        .child(self.render_select_menu_label(
+                            label.into(),
+                            is_selected,
+                            hover_group,
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.select_auth_method(auth_kind, window, cx);
+                        })),
+                );
+            }
+            selector = selector.child(deferred(menu).with_priority(30));
+        }
+
         div()
             .flex()
             .items_center()
+            .justify_between()
+            .gap_3()
             .mt_3()
             .child(
                 div()
@@ -10240,101 +12730,7 @@ impl RemCmdApp {
                     .truncate()
                     .child("Authentication"),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .p(px(2.0))
-                    .gap(px(2.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.control_bg)
-                    .child(self.render_auth_method_option(
-                        "auth_none",
-                        "No Password",
-                        ProfileAuthKind::None,
-                        selected,
-                        cx,
-                    ))
-                    .child(self.render_auth_method_option(
-                        "auth_password",
-                        "Password",
-                        ProfileAuthKind::Password,
-                        selected,
-                        cx,
-                    ))
-                    .child(self.render_auth_method_option(
-                        "auth_private_key",
-                        "Private Key",
-                        ProfileAuthKind::PrivateKey,
-                        selected,
-                        cx,
-                    ))
-                    .child(self.render_auth_method_option(
-                        "auth_agent",
-                        "SSH Agent",
-                        ProfileAuthKind::Agent,
-                        selected,
-                        cx,
-                    )),
-            )
-    }
-
-    fn render_auth_method_option(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        auth_kind: ProfileAuthKind,
-        selected: ProfileAuthKind,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = auth_kind == selected;
-        let background = if is_selected {
-            self.theme.list_selected_bg
-        } else {
-            self.theme.transparent
-        };
-        let border = if is_selected {
-            self.theme.border_strong
-        } else {
-            self.theme.transparent
-        };
-        let hover_background = if is_selected {
-            self.theme.list_selected_hover_bg
-        } else {
-            self.theme.control_hover_bg
-        };
-
-        div()
-            .id(id)
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .items_center()
-            .justify_center()
-            .px_2()
-            .py(px(6.0))
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(background)
-            .text_sm()
-            .cursor_pointer()
-            .hover(move |this| this.bg(hover_background))
-            .when(is_selected, |this| {
-                this.shadow(vec![BoxShadow {
-                    color: self.theme.shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(3.0),
-                    spread_radius: px(-1.0),
-                }])
-            })
-            .child(div().truncate().child(label))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_auth_method(auth_kind, window, cx);
-            }))
+            .child(selector)
     }
 
     fn render_private_key_row(
@@ -10354,16 +12750,7 @@ impl RemCmdApp {
                     .min_w(px(0.0))
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(self.theme.border)
-                            .bg(self.theme.surface_bg)
-                            .child(field),
-                    )
+                    .child(div().flex_1().min_w(px(0.0)).child(field))
                     .child(
                         self.render_icon_button(
                             "browse_private_key",
@@ -10411,16 +12798,7 @@ impl RemCmdApp {
             .items_center()
             .mt_3()
             .child(div().flex_none().w(px(112.0)).truncate().child(label))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.surface_bg)
-                    .child(field),
-            )
+            .child(div().flex_1().min_w(px(0.0)).child(field))
     }
 }
 
@@ -10432,7 +12810,7 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let marked_text = &self.active_session()?.terminal_marked_text;
+        let marked_text = &self.terminal_input_session()?.terminal_marked_text;
         let utf16_len = marked_text.encode_utf16().count();
         let start_utf16 = range_utf16.start.min(utf16_len);
         let end_utf16 = range_utf16.end.clamp(start_utf16, utf16_len);
@@ -10452,7 +12830,7 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let cursor = self
-            .active_session()
+            .terminal_input_session()
             .map(|session| session.terminal_marked_text.encode_utf16().count())
             .unwrap_or_default();
         Some(UTF16Selection {
@@ -10463,18 +12841,21 @@ impl EntityInputHandler for RemCmdApp {
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         let len = self
-            .active_session()
+            .terminal_input_session()
             .map(|session| session.terminal_marked_text.encode_utf16().count())
             .unwrap_or_default();
         (len != 0).then_some(0..len)
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.terminal_input_session_id() else {
+            return;
+        };
         let text = self
-            .active_session_mut()
+            .session_mut(session_id)
             .map(|session| std::mem::take(&mut session.terminal_marked_text))
             .unwrap_or_default();
-        self.send_terminal_user_input(text.into_bytes(), cx);
+        self.send_terminal_user_input(session_id, text.into_bytes(), cx);
     }
 
     fn replace_text_in_range(
@@ -10484,10 +12865,13 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.active_session_mut() {
+        let Some(session_id) = self.terminal_input_session_id() else {
+            return;
+        };
+        if let Some(session) = self.session_mut(session_id) {
             session.terminal_marked_text.clear();
         }
-        self.send_terminal_user_input(new_text.as_bytes().to_vec(), cx);
+        self.send_terminal_user_input(session_id, new_text.as_bytes().to_vec(), cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -10498,7 +12882,7 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.active_session_mut() {
+        if let Some(session) = self.terminal_input_session_mut() {
             new_text.clone_into(&mut session.terminal_marked_text);
         }
         cx.notify();
@@ -10511,7 +12895,7 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let terminal = self.active_session()?.terminal.as_ref()?;
+        let terminal = self.terminal_input_session()?.terminal.as_ref()?;
         let cursor = terminal.snapshot().cursor;
         let (row, column) = cursor
             .map(|cursor| (cursor.row, cursor.column))
@@ -10533,7 +12917,7 @@ impl EntityInputHandler for RemCmdApp {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(
-            self.active_session()
+            self.terminal_input_session()
                 .map(|session| session.terminal_marked_text.encode_utf16().count())
                 .unwrap_or_default(),
         )
@@ -10588,12 +12972,55 @@ fn clamp_right_sidebar_width(requested: f32, viewport_width: f32, left_sidebar_w
     }
 }
 
+fn clamp_bottom_panel_height(requested: f32, viewport_height: f32) -> f32 {
+    let available_height = (viewport_height - TITLEBAR_HEIGHT - 100.0)
+        .clamp(BOTTOM_PANEL_MIN_HEIGHT, BOTTOM_PANEL_MAX_HEIGHT);
+    requested.clamp(BOTTOM_PANEL_MIN_HEIGHT, available_height)
+}
+
 fn sftp_browser_placement_for_request(request_id: u64) -> SftpBrowserPlacement {
     if request_id >= SIDEBAR_SFTP_REQUEST_ID_START {
         SftpBrowserPlacement::Sidebar
     } else {
         SftpBrowserPlacement::Center
     }
+}
+
+fn quick_command_target_sessions(
+    profile_ids: &[String],
+    selected_profile_ids: &HashSet<String>,
+    sessions: &[(SessionId, &str, bool)],
+    active_session_id: Option<SessionId>,
+) -> Vec<(String, SessionId)> {
+    let mut seen_profile_ids = HashSet::new();
+    profile_ids
+        .iter()
+        .filter(|profile_id| {
+            selected_profile_ids.contains(*profile_id)
+                && seen_profile_ids.insert((*profile_id).clone())
+        })
+        .filter_map(|profile_id| {
+            let active = active_session_id.and_then(|active_session_id| {
+                sessions
+                    .iter()
+                    .find(|(session_id, session_profile_id, available)| {
+                        *session_id == active_session_id
+                            && *session_profile_id == profile_id
+                            && *available
+                    })
+            });
+            active
+                .or_else(|| {
+                    sessions
+                        .iter()
+                        .rev()
+                        .find(|(_, session_profile_id, available)| {
+                            *session_profile_id == profile_id && *available
+                        })
+                })
+                .map(|(session_id, _, _)| (profile_id.clone(), *session_id))
+        })
+        .collect()
 }
 
 fn estimated_titlebar_label_width(label: &str) -> f32 {
@@ -10900,6 +13327,14 @@ fn terminal_layout_for_pixels(
     }
 }
 
+fn local_pty_size(size: PtySize) -> LocalPtySize {
+    LocalPtySize::new(size.columns, size.rows).with_pixels(size.pixel_width, size.pixel_height)
+}
+
+fn ssh_pty_size(size: LocalPtySize) -> PtySize {
+    PtySize::new(size.columns, size.rows).with_pixels(size.pixel_width, size.pixel_height)
+}
+
 fn terminal_point_for_pixels(
     x: f32,
     y: f32,
@@ -10914,6 +13349,15 @@ fn terminal_point_for_pixels(
     let row = (y.max(0.0) / cell_height).floor() as usize;
 
     TerminalPoint::new(row.min(rows.saturating_sub(1)), column.min(columns))
+}
+
+fn full_terminal_selection(rows: usize, columns: usize) -> Option<TerminalSelection> {
+    (rows > 0 && columns > 0).then(|| {
+        TerminalSelection::new(
+            TerminalPoint::new(0, 0),
+            TerminalPoint::new(rows - 1, columns),
+        )
+    })
 }
 
 fn valid_dimension(value: f32, fallback: f32) -> f32 {
@@ -10995,6 +13439,86 @@ fn is_terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
     }
 }
 
+fn normalize_terminal_font_families(mut families: Vec<String>) -> Vec<SharedString> {
+    families.retain(|family| {
+        let family = family.trim();
+        !family.is_empty() && !family.starts_with('.')
+    });
+    families.sort_by_cached_key(|family| family.to_lowercase());
+    families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    families.into_iter().map(SharedString::from).collect()
+}
+
+fn resolve_terminal_font_family(
+    preferred: Option<&str>,
+    available: &[SharedString],
+) -> SharedString {
+    let find_available = |candidate: &str| {
+        available
+            .iter()
+            .find(|family| family.as_ref().eq_ignore_ascii_case(candidate))
+            .cloned()
+    };
+
+    if let Some(preferred) = preferred
+        && let Some(family) = find_available(preferred)
+    {
+        return family;
+    }
+
+    for fallback in ["SF Mono", "Menlo", UI_MONOSPACE_FONT_FAMILY] {
+        if let Some(family) = find_available(fallback) {
+            return family;
+        }
+    }
+
+    available
+        .first()
+        .cloned()
+        .unwrap_or_else(|| SharedString::from("Menlo"))
+}
+
+#[cfg(target_os = "macos")]
+fn register_macos_sf_mono(cx: &mut App) {
+    const FONT_DIRECTORIES: [&str; 2] = [
+        "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts",
+        "/Applications/Utilities/Terminal.app/Contents/Resources/Fonts",
+    ];
+    const FONT_FILES: [&str; 12] = [
+        "SF-Mono-Regular.otf",
+        "SF-Mono-RegularItalic.otf",
+        "SF-Mono-Medium.otf",
+        "SF-Mono-MediumItalic.otf",
+        "SF-Mono-Semibold.otf",
+        "SF-Mono-SemiboldItalic.otf",
+        "SF-Mono-Bold.otf",
+        "SF-Mono-BoldItalic.otf",
+        "SF-Mono-Light.otf",
+        "SF-Mono-LightItalic.otf",
+        "SF-Mono-Heavy.otf",
+        "SF-Mono-HeavyItalic.otf",
+    ];
+
+    let Some(directory) = FONT_DIRECTORIES
+        .iter()
+        .map(Path::new)
+        .find(|directory| directory.join(FONT_FILES[0]).is_file())
+    else {
+        return;
+    };
+    let fonts = FONT_FILES
+        .iter()
+        .filter_map(|file| std::fs::read(directory.join(file)).ok())
+        .map(std::borrow::Cow::Owned)
+        .collect::<Vec<_>>();
+    if !fonts.is_empty() {
+        let _ = cx.text_system().add_fonts(fonts);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_macos_sf_mono(_: &mut App) {}
+
 // Application startup functions stay outside main so startup remains testable and readable.
 fn main_window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
@@ -11054,8 +13578,16 @@ fn bind_sftp_create_prompt_keys(cx: &mut App) {
     ]);
 }
 
+fn bind_quick_command_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("enter", SubmitQuickCommand, Some("QuickCommandPrompt")),
+        KeyBinding::new("escape", CancelQuickCommand, Some("QuickCommandPrompt")),
+    ]);
+}
+
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
+    register_macos_sf_mono(cx);
 
     bind_text_field_keys(cx);
     bind_file_editor_keys(cx);
@@ -11063,6 +13595,7 @@ fn launch(cx: &mut App) {
     bind_host_key_prompt_keys(cx);
     bind_settings_selector_keys(cx);
     bind_sftp_create_prompt_keys(cx);
+    bind_quick_command_keys(cx);
     open_main_window(cx);
     cx.activate(true);
 }
@@ -11097,6 +13630,11 @@ mod tests {
             SettingsSelector::TabLayout.options(),
             &TAB_LAYOUT_SETTING_OPTIONS
         );
+        assert!(SettingsSelector::TerminalFont.options().is_empty());
+        assert_eq!(
+            SettingsSelector::TerminalFontSize.options(),
+            &TERMINAL_FONT_SIZE_SETTING_OPTIONS
+        );
         assert_eq!(
             SettingsSelector::TransferRate.options(),
             &TRANSFER_RATE_SETTING_OPTIONS
@@ -11113,6 +13651,12 @@ mod tests {
             label: "Horizontal",
             value: SettingsValue::TabLayout(TabLayout::Horizontal),
         }));
+        assert!(
+            TERMINAL_FONT_SIZE_SETTING_OPTIONS.contains(&SettingsOption {
+                label: "14 pt",
+                value: SettingsValue::TerminalFontSize(14),
+            })
+        );
         assert!(TRANSFER_RATE_SETTING_OPTIONS.contains(&SettingsOption {
             label: "Unlimited",
             value: SettingsValue::TransferRate(0),
@@ -11121,6 +13665,77 @@ mod tests {
             label: "4",
             value: SettingsValue::ParallelTransfers(4),
         }));
+    }
+
+    #[test]
+    fn terminal_font_selection_prefers_saved_font_then_sf_mono_then_menlo() {
+        let available = normalize_terminal_font_families(vec![
+            "Menlo".into(),
+            "SF Mono".into(),
+            "Custom Mono".into(),
+            ".SystemUIFont".into(),
+        ]);
+
+        assert_eq!(
+            resolve_terminal_font_family(Some("custom mono"), &available),
+            "Custom Mono"
+        );
+        assert_eq!(
+            resolve_terminal_font_family(Some("Missing Mono"), &available),
+            "SF Mono"
+        );
+
+        let without_sf = normalize_terminal_font_families(vec!["Menlo".into(), "Arial".into()]);
+        assert_eq!(resolve_terminal_font_family(None, &without_sf), "Menlo");
+        assert!(
+            without_sf
+                .iter()
+                .all(|family| !family.as_ref().starts_with('.'))
+        );
+    }
+
+    #[test]
+    fn quick_commands_target_each_selected_server_once() {
+        let profile_ids = vec!["server-a".to_owned(), "server-b".to_owned()];
+        let selected_profile_ids = HashSet::from(["server-a".to_owned(), "server-b".to_owned()]);
+        let sessions = [
+            (SessionId(1), "server-a", true),
+            (SessionId(2), "server-a", true),
+            (SessionId(3), "server-b", true),
+        ];
+
+        assert_eq!(
+            quick_command_target_sessions(
+                &profile_ids,
+                &selected_profile_ids,
+                &sessions,
+                Some(SessionId(1)),
+            ),
+            vec![
+                ("server-a".to_owned(), SessionId(1)),
+                ("server-b".to_owned(), SessionId(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn quick_commands_fall_back_to_the_latest_connected_session() {
+        let profile_ids = vec!["server-a".to_owned(), "server-a".to_owned()];
+        let selected_profile_ids = HashSet::from(["server-a".to_owned()]);
+        let sessions = [
+            (SessionId(1), "server-a", false),
+            (SessionId(2), "server-a", true),
+        ];
+
+        assert_eq!(
+            quick_command_target_sessions(
+                &profile_ids,
+                &selected_profile_ids,
+                &sessions,
+                Some(SessionId(1)),
+            ),
+            vec![("server-a".to_owned(), SessionId(2))]
+        );
     }
 
     #[test]
@@ -11141,6 +13756,13 @@ mod tests {
         assert_eq!(clamp_right_sidebar_width(100.0, 1200.0, 300.0), 260.0);
         assert_eq!(clamp_right_sidebar_width(700.0, 1200.0, 300.0), 520.0);
         assert_eq!(clamp_right_sidebar_width(340.0, 720.0, 0.0), 340.0);
+    }
+
+    #[test]
+    fn bottom_panel_height_preserves_main_content() {
+        assert_eq!(clamp_bottom_panel_height(80.0, 720.0), 140.0);
+        assert_eq!(clamp_bottom_panel_height(600.0, 720.0), 520.0);
+        assert_eq!(clamp_bottom_panel_height(400.0, 480.0), 328.0);
     }
 
     #[test]
@@ -11694,6 +14316,29 @@ mod tests {
     }
 
     #[test]
+    fn app_navigation_defaults_to_home() {
+        assert_eq!(ActivePanel::default(), ActivePanel::Home);
+    }
+
+    #[test]
+    fn profile_auth_selector_exposes_every_supported_method() {
+        assert_eq!(
+            ProfileAuthKind::OPTIONS,
+            [
+                (ProfileAuthKind::None, "No Password"),
+                (ProfileAuthKind::Password, "Password"),
+                (ProfileAuthKind::PrivateKey, "Private Key"),
+                (ProfileAuthKind::Agent, "SSH Agent"),
+            ]
+        );
+        assert!(
+            ProfileAuthKind::OPTIONS
+                .iter()
+                .all(|(kind, label)| kind.label() == *label)
+        );
+    }
+
+    #[test]
     fn private_key_authentication_requires_a_path() {
         assert_eq!(
             ProfileAuthKind::PrivateKey.into_config("   "),
@@ -11909,6 +14554,19 @@ mod tests {
         assert_eq!(
             terminal_point_for_pixels(10_000.0, 10_000.0, 80, 24, 8.0, 19.0),
             TerminalPoint::new(23, 80)
+        );
+    }
+
+    #[test]
+    fn terminal_select_all_covers_the_complete_visible_grid() {
+        assert_eq!(full_terminal_selection(0, 80), None);
+        assert_eq!(full_terminal_selection(24, 0), None);
+        assert_eq!(
+            full_terminal_selection(24, 80),
+            Some(TerminalSelection::new(
+                TerminalPoint::new(0, 0),
+                TerminalPoint::new(23, 80),
+            ))
         );
     }
 

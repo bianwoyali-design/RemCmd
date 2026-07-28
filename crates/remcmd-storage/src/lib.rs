@@ -4,7 +4,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use remcmd_core::{ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
+use remcmd_core::{ConnectionProfile, TabLayout, TerminalSettings, ThemeMode, TransferSettings};
 
 mod credentials;
 pub use credentials::{
@@ -34,6 +34,8 @@ pub struct AppSettings {
     pub tab_layout: TabLayout,
     #[serde(default)]
     pub transfers: TransferSettings,
+    #[serde(default)]
+    pub terminal: TerminalSettings,
 }
 
 pub fn ensure_profiles_file(path: &Path) -> io::Result<()> {
@@ -83,6 +85,7 @@ pub fn load_settings(path: &Path) -> io::Result<AppSettings> {
     let mut settings: AppSettings = serde_json::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     settings.transfers = settings.transfers.normalized();
+    settings.terminal = settings.terminal.normalized();
     Ok(settings)
 }
 
@@ -107,6 +110,7 @@ mod tests {
         assert_eq!(settings.theme_mode, ThemeMode::System);
         assert_eq!(settings.tab_layout, TabLayout::Vertical);
         assert_eq!(settings.transfers, TransferSettings::default());
+        assert_eq!(settings.terminal, TerminalSettings::default());
     }
 
     #[test]
@@ -119,6 +123,10 @@ mod tests {
             transfers: TransferSettings {
                 rate_limit_mib_per_second: 20,
                 max_parallel_transfers: 2,
+            },
+            terminal: TerminalSettings {
+                font_family: Some("Menlo".into()),
+                font_size: 16,
             },
         };
 
@@ -138,6 +146,7 @@ mod tests {
         assert_eq!(settings.theme_mode, ThemeMode::Light);
         assert_eq!(settings.tab_layout, TabLayout::Vertical);
         assert_eq!(settings.transfers, TransferSettings::default());
+        assert_eq!(settings.terminal, TerminalSettings::default());
     }
 
     #[test]
@@ -174,6 +183,32 @@ mod tests {
             TransferSettings {
                 rate_limit_mib_per_second: remcmd_core::MAX_TRANSFER_RATE_MIB_PER_SECOND,
                 max_parallel_transfers: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_settings_are_normalized_when_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+                "terminal": {
+                    "font_family": "  Menlo  ",
+                    "font_size": 200
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = load_settings(&path).unwrap();
+
+        assert_eq!(
+            settings.terminal,
+            TerminalSettings {
+                font_family: Some("Menlo".into()),
+                font_size: remcmd_core::MAX_TERMINAL_FONT_SIZE,
             }
         );
     }

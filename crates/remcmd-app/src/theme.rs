@@ -68,6 +68,8 @@ pub struct Theme {
     pub titlebar_add_shadow: Hsla,
     pub titlebar_tab_separator: Hsla,
 
+    pub input_bg: Hsla,
+    pub input_text: Hsla,
     pub input_cursor: Hsla,
     pub input_placeholder: Hsla,
     pub selection_bg: Hsla,
@@ -128,6 +130,8 @@ impl Theme {
             titlebar_add_shadow: alpha(0x00000052),
             titlebar_tab_separator: alpha(0xffffff24),
 
+            input_bg: alpha(0xffffff18),
+            input_text: opaque(0xf4f4f5),
             input_cursor: hsla(0.0, 0.0, 1.0, 0.9),
             input_placeholder: hsla(0.0, 0.0, 1.0, 0.45),
             selection_bg: alpha(0x0159d155),
@@ -186,6 +190,8 @@ impl Theme {
             titlebar_add_shadow: alpha(0x0000002e),
             titlebar_tab_separator: alpha(0x0000001f),
 
+            input_bg: alpha(0x0000000d),
+            input_text: opaque(0x1a1a1a),
             input_cursor: hsla(0.0, 0.0, 0.0, 0.8),
             input_placeholder: hsla(0.0, 0.0, 0.0, 0.4),
             selection_bg: alpha(0x0159d133),
