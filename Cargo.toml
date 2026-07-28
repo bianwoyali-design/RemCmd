@@ -2,6 +2,7 @@
 members = [
     "crates/remcmd-app",
     "crates/remcmd-core",
+    "crates/remcmd-local",
     "crates/remcmd-ssh",
     "crates/remcmd-storage",
     "crates/remcmd-terminal",
@@ -17,6 +18,7 @@ version = "0.1.0"
 gpui = "0.2.2"
 
 alacritty_terminal = { version = "=0.26.0", default-features = false }
+portable-pty = "0.9.0"
 
 secrecy = "0.10.3"
 keyring = { version = "3.6.3", default-features = false }
@@ -45,6 +47,7 @@ russh = { version = "0.62.2", default-features = false, features = [
 russh-sftp = "2.3.0"
 
 remcmd-core = { path = "crates/remcmd-core"}
+remcmd-local = { path = "crates/remcmd-local" }
 remcmd-ssh = { path = "crates/remcmd-ssh" }
 remcmd-storage = { path = "crates/remcmd-storage" }
 remcmd-terminal = { path = "crates/remcmd-terminal" }

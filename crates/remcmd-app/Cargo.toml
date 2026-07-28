@@ -8,6 +8,7 @@ license.workspace = true
 directories.workspace = true
 gpui.workspace = true
 remcmd-core.workspace = true
+remcmd-local.workspace = true
 remcmd-ssh.workspace = true
 remcmd-storage.workspace = true
 remcmd-terminal.workspace = true

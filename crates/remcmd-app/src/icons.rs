@@ -27,6 +27,7 @@ pub(crate) enum IconName {
     NewConnection,
     Performance,
     Picker,
+    QuickCommand,
     Reconnect,
     Search,
     Server,
@@ -63,6 +64,7 @@ impl IconName {
             Self::NewConnection => "icons/new-connection.svg",
             Self::Performance => "icons/performance.svg",
             Self::Picker => "icons/picker.svg",
+            Self::QuickCommand => "icons/quick-command.svg",
             Self::Reconnect => "icons/reconnect.svg",
             Self::Search => "icons/search.svg",
             Self::Server => "icons/server.svg",
@@ -99,6 +101,7 @@ impl IconName {
             "icons/new-connection.svg" => Self::NewConnection,
             "icons/performance.svg" => Self::Performance,
             "icons/picker.svg" => Self::Picker,
+            "icons/quick-command.svg" => Self::QuickCommand,
             "icons/reconnect.svg" => Self::Reconnect,
             "icons/search.svg" => Self::Search,
             "icons/server.svg" => Self::Server,
@@ -166,6 +169,9 @@ impl IconName {
             }
             Self::Picker => {
                 r#"<path d="m8.25 9.75 3.75-3.5 3.75 3.5" stroke-width="1.9"/><path d="m8.25 14.25 3.75 3.5 3.75-3.5" stroke-width="1.9"/>"#
+            }
+            Self::QuickCommand => {
+                r#"<rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="m6.5 8.75 3.25 3.25-3.25 3.25"/><path d="M12.5 15.25h5"/><path d="M15.5 7h3" stroke-width="0.8"/><path d="M17 5.5v3" stroke-width="0.8"/>"#
             }
             Self::Reconnect => {
                 r#"<path d="M19.5 8.25A8.25 8.25 0 1 0 19.75 15.25"/><path d="M19.5 3.75v4.5H15"/>"#
