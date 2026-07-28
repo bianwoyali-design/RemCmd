@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod text_field;
 use text_field::{TextField, bind_text_field_keys};
 
@@ -13557,6 +13562,28 @@ fn register_macos_sf_mono(cx: &mut App) {
 #[cfg(not(target_os = "macos"))]
 fn register_macos_sf_mono(_: &mut App) {}
 
+fn main_window_titlebar() -> TitlebarOptions {
+    #[cfg(target_os = "macos")]
+    {
+        TitlebarOptions {
+            appears_transparent: true,
+            traffic_light_position: Some(point(
+                px(TRAFFIC_LIGHT_INSET_X),
+                px(TRAFFIC_LIGHT_INSET_Y),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        TitlebarOptions {
+            title: Some("RemCmd".into()),
+            ..Default::default()
+        }
+    }
+}
+
 // Application startup functions stay outside main so startup remains testable and readable.
 fn main_window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
@@ -13565,14 +13592,7 @@ fn main_window_options(cx: &App) -> WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(720.0), px(480.0))),
         window_background: WindowBackgroundAppearance::Blurred,
-        titlebar: Some(TitlebarOptions {
-            appears_transparent: true,
-            traffic_light_position: Some(point(
-                px(TRAFFIC_LIGHT_INSET_X),
-                px(TRAFFIC_LIGHT_INSET_Y),
-            )),
-            ..Default::default()
-        }),
+        titlebar: Some(main_window_titlebar()),
         ..Default::default()
     }
 }

@@ -63,3 +63,6 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1.12"
