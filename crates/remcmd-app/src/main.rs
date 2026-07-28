@@ -425,6 +425,11 @@ impl ActiveTerminal {
         self.engine.drain_events()
     }
 
+    fn reset(&mut self) {
+        self.engine.reset();
+        self.title = None;
+    }
+
     fn snapshot(&self) -> TerminalSnapshot {
         self.engine.snapshot()
     }
@@ -5455,6 +5460,23 @@ impl RemCmdApp {
         true
     }
 
+    fn reset_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let Some(terminal) = session.terminal.as_mut() else {
+            return;
+        };
+
+        terminal.reset();
+        session.terminal_marked_text.clear();
+        session.terminal_selection = None;
+        session.terminal_selecting = false;
+        session.terminal_scroll_accumulator = 0.0;
+        self.terminal_context_menu = None;
+        cx.notify();
+    }
+
     fn on_terminal_key_down(
         &mut self,
         session_id: SessionId,
@@ -9178,6 +9200,7 @@ impl RemCmdApp {
                 let Some(editor) = self.editor.as_ref() else {
                     return panel.child("No editor loaded");
                 };
+                let has_terminal_workspace = self.has_terminal_workspace(&profile.id);
 
                 panel = panel.child(
                     div()
@@ -9187,6 +9210,13 @@ impl RemCmdApp {
                         .items_center()
                         .justify_start()
                         .gap_1()
+                        .when(has_terminal_workspace, |this| {
+                            this.min_h(px(36.0))
+                                .mx(px(-16.0))
+                                .px_4()
+                                .border_b_1()
+                                .border_color(self.theme.border)
+                        })
                         .child(self.render_workspace_controls(cx))
                         .child(self.render_pane_controls(cx))
                         .child(self.render_connection_controls(cx))
@@ -9204,7 +9234,7 @@ impl RemCmdApp {
                         ),
                 );
 
-                if self.has_terminal_workspace(&profile.id) {
+                if has_terminal_workspace {
                     match self.active_tab_view() {
                         TerminalTabView::Terminal => {
                             if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
@@ -9214,7 +9244,6 @@ impl RemCmdApp {
                                         .flex_1()
                                         .min_w(px(0.0))
                                         .min_h(px(0.0))
-                                        .mt_4()
                                         .overflow_hidden()
                                         .child(self.render_pane_layout(layout, cx)),
                                 );
@@ -9352,6 +9381,11 @@ impl RemCmdApp {
                 .flex_none()
                 .items_center()
                 .justify_start()
+                .min_h(px(36.0))
+                .mx(px(-16.0))
+                .px_4()
+                .border_b_1()
+                .border_color(self.theme.border)
                 .child(self.render_pane_controls(cx)),
         );
 
@@ -9362,7 +9396,6 @@ impl RemCmdApp {
                     .flex_1()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
-                    .mt_4()
                     .overflow_hidden()
                     .child(self.render_pane_layout(layout, cx)),
             );
@@ -9833,12 +9866,13 @@ impl RemCmdApp {
             let size = terminal.engine.size();
             size.rows() > 0 && size.columns() > 0
         });
+        let can_reset = session.terminal.is_some();
         let viewport = window.viewport_size();
         let left = f32::from(menu_state.position.x)
             .min((f32::from(viewport.width) - 196.0).max(8.0))
             .max(8.0);
         let top = f32::from(menu_state.position.y)
-            .min((f32::from(viewport.height) - 126.0).max(8.0))
+            .min((f32::from(viewport.height) - 166.0).max(8.0))
             .max(8.0);
 
         let mut copy = self.render_context_menu_item(
@@ -9883,6 +9917,18 @@ impl RemCmdApp {
                 cx.notify();
             }));
         }
+        let mut reset = self.render_context_menu_item(
+            "terminal-context-reset",
+            IconName::Reconnect,
+            "Reset Terminal",
+            IconTone::Default,
+            can_reset,
+        );
+        if can_reset {
+            reset = reset.on_click(cx.listener(move |this, _, _, cx| {
+                this.reset_terminal(session_id, cx);
+            }));
+        }
 
         div()
             .id("terminal_context_menu")
@@ -9908,6 +9954,8 @@ impl RemCmdApp {
             .child(paste)
             .child(self.render_context_menu_separator())
             .child(select_all)
+            .child(self.render_context_menu_separator())
+            .child(reset)
             .into_any_element()
     }
 
