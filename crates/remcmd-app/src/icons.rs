@@ -24,6 +24,7 @@ pub(crate) enum IconName {
     File,
     Folder,
     ForgetCredential,
+    Home,
     NewConnection,
     PanelBottom,
     Paste,
@@ -64,6 +65,7 @@ impl IconName {
             Self::File => "icons/file.svg",
             Self::Folder => "icons/folder.svg",
             Self::ForgetCredential => "icons/forget-credential.svg",
+            Self::Home => "icons/home.svg",
             Self::NewConnection => "icons/new-connection.svg",
             Self::PanelBottom => "icons/panel-bottom.svg",
             Self::Paste => "icons/paste.svg",
@@ -104,6 +106,7 @@ impl IconName {
             "icons/file.svg" => Self::File,
             "icons/folder.svg" => Self::Folder,
             "icons/forget-credential.svg" => Self::ForgetCredential,
+            "icons/home.svg" => Self::Home,
             "icons/new-connection.svg" => Self::NewConnection,
             "icons/panel-bottom.svg" => Self::PanelBottom,
             "icons/paste.svg" => Self::Paste,
@@ -169,6 +172,9 @@ impl IconName {
             }
             Self::ForgetCredential => {
                 r#"<circle cx="7.5" cy="14" r="4"/><path d="M11.5 14h9m-3 0v3m-3-3v2"/><circle cx="18" cy="5.5" r="3"/><path d="M16.5 5.5h3" stroke-width="1.1"/>"#
+            }
+            Self::Home => {
+                r#"<path d="m3.25 10.5 8.75-7 8.75 7"/><path d="M5.5 9.25v10.5h13V9.25"/><path d="M9.25 19.75v-6.5h5.5v6.5"/>"#
             }
             Self::NewConnection => {
                 r#"<path d="M14.75 5H5.5A2.5 2.5 0 0 0 3 7.5v10A2.5 2.5 0 0 0 5.5 20H16a2.5 2.5 0 0 0 2.5-2.5V9"/><path d="M3 12.5h15.5"/><circle cx="6.5" cy="8.75" r="0.55" fill="currentColor" stroke="none"/><circle cx="6.5" cy="16.25" r="0.55" fill="currentColor" stroke="none"/><circle cx="18.5" cy="5.5" r="3.25"/><path d="M18.5 3.75v3.5M16.75 5.5h3.5" stroke-width="1.1"/>"#
@@ -299,6 +305,7 @@ mod tests {
         assert!(assets.load("icons/check.svg").unwrap().is_some());
         assert!(assets.load("icons/copy.svg").unwrap().is_some());
         assert!(assets.load("icons/edit.svg").unwrap().is_some());
+        assert!(assets.load("icons/home.svg").unwrap().is_some());
         assert!(assets.load("icons/performance.svg").unwrap().is_some());
         assert!(assets.load("icons/picker.svg").unwrap().is_some());
         assert!(assets.load("icons/view.svg").unwrap().is_some());

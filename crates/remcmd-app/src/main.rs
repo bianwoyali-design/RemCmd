@@ -173,6 +173,7 @@ struct RemCmdApp {
     transfer_settings: TransferSettings,
     transfer_rate_limiter: Arc<TransferRateLimiter>,
     next_transfer_session_cursor: usize,
+    profile_context_menu: Option<ProfileContextMenu>,
     sftp_context_menu: Option<SftpContextMenu>,
     terminal_context_menu: Option<TerminalContextMenu>,
     sftp_create_prompt: Option<SftpCreatePrompt>,
@@ -183,6 +184,7 @@ struct RemCmdApp {
     quick_terminal_session_id: Option<SessionId>,
     quick_terminal_focus_handle: FocusHandle,
     focused_terminal_session_id: Option<SessionId>,
+    profile_auth_selector_open: bool,
     open_settings_selector: Option<SettingsSelector>,
     settings_focus_handle: FocusHandle,
     theme: Theme,
@@ -495,6 +497,8 @@ struct TerminalLayout {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ActivePanel {
     #[default]
+    Home,
+    Server,
     Connection,
     Settings,
 }
@@ -1276,6 +1280,11 @@ struct SftpFileState {
     write_request_id: Option<u64>,
 }
 
+struct ProfileContextMenu {
+    profile_id: String,
+    position: gpui::Point<Pixels>,
+}
+
 struct SftpContextMenu {
     session_id: SessionId,
     placement: SftpBrowserPlacement,
@@ -1732,6 +1741,7 @@ impl RemoteTextFormat {
 
 #[derive(Clone)]
 struct ProfileEditor {
+    mode: ProfileEditorMode,
     profile_id: String,
     name: Entity<TextField>,
     host: Entity<TextField>,
@@ -1739,6 +1749,12 @@ struct ProfileEditor {
     username: Entity<TextField>,
     auth_kind: ProfileAuthKind,
     private_key_path: Entity<TextField>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileEditorMode {
+    Create,
+    Edit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1750,6 +1766,22 @@ enum ProfileAuthKind {
 }
 
 impl ProfileAuthKind {
+    const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::None, "No Password"),
+        (Self::Password, "Password"),
+        (Self::PrivateKey, "Private Key"),
+        (Self::Agent, "SSH Agent"),
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "No Password",
+            Self::Password => "Password",
+            Self::PrivateKey => "Private Key",
+            Self::Agent => "SSH Agent",
+        }
+    }
+
     fn from_config(config: &AuthConfig) -> Self {
         match config {
             AuthConfig::None => Self::None,
@@ -1895,7 +1927,7 @@ impl RemCmdApp {
         let settings_focus_handle = cx.focus_handle();
         let quick_terminal_focus_handle = cx.focus_handle();
 
-        let mut app = Self {
+        let app = Self {
             profiles,
             profiles_path,
             selected_profile_id,
@@ -1934,7 +1966,7 @@ impl RemCmdApp {
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
-            active_panel: ActivePanel::Connection,
+            active_panel: ActivePanel::Home,
             theme_mode,
             tab_layout,
             terminal_font_family,
@@ -1943,6 +1975,7 @@ impl RemCmdApp {
             transfer_settings,
             transfer_rate_limiter,
             next_transfer_session_cursor: 0,
+            profile_context_menu: None,
             sftp_context_menu: None,
             terminal_context_menu: None,
             sftp_create_prompt: None,
@@ -1953,6 +1986,7 @@ impl RemCmdApp {
             quick_terminal_session_id: None,
             quick_terminal_focus_handle: quick_terminal_focus_handle.clone(),
             focused_terminal_session_id: None,
+            profile_auth_selector_open: false,
             open_settings_selector: None,
             settings_focus_handle,
             theme,
@@ -1995,7 +2029,6 @@ impl RemCmdApp {
         })
         .detach();
 
-        app.load_editor_for_selected_profile(cx);
         app
     }
 
@@ -2048,6 +2081,13 @@ impl RemCmdApp {
     fn session_for_profile_mut(&mut self, profile_id: &str) -> Option<&mut TerminalSession> {
         self.sessions
             .iter_mut()
+            .rev()
+            .find(|session| session.profile_id == profile_id)
+    }
+
+    fn session_for_profile(&self, profile_id: &str) -> Option<&TerminalSession> {
+        self.sessions
+            .iter()
             .rev()
             .find(|session| session.profile_id == profile_id)
     }
@@ -3581,7 +3621,6 @@ impl RemCmdApp {
             return false;
         };
 
-        let profile_changed = self.selected_profile_id.as_deref() != Some(profile_id.as_str());
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.active_pane_id = pane_id;
         }
@@ -3595,9 +3634,6 @@ impl RemCmdApp {
         self.active_panel = ActivePanel::Connection;
         self.open_settings_selector = None;
         self.selected_profile_id = Some(profile_id);
-        if profile_changed {
-            self.load_editor_for_selected_profile(cx);
-        }
         if self.right_sidebar_open && self.right_sidebar_view == RightSidebarView::Sftp {
             self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
         }
@@ -3989,6 +4025,7 @@ impl RemCmdApp {
         };
 
         self.editor = Some(ProfileEditor {
+            mode: ProfileEditorMode::Edit,
             profile_id: profile.id.clone(),
             name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
             host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
@@ -3998,7 +4035,25 @@ impl RemCmdApp {
             private_key_path: cx.new(|cx| TextField::new(cx, private_key_path, "Private key path")),
         });
 
+        self.profile_auth_selector_open = false;
         self.form_error = None;
+    }
+
+    fn open_new_profile_editor(&mut self, cx: &mut Context<Self>) {
+        let number = self.next_profile_number;
+        self.editor = Some(ProfileEditor {
+            mode: ProfileEditorMode::Create,
+            profile_id: format!("demo-{number}"),
+            name: cx.new(|cx| TextField::new(cx, "", "Name")),
+            host: cx.new(|cx| TextField::new(cx, "", "Host")),
+            port: cx.new(|cx| TextField::new(cx, "22", "Port")),
+            username: cx.new(|cx| TextField::new(cx, "", "Username")),
+            auth_kind: ProfileAuthKind::Password,
+            private_key_path: cx.new(|cx| TextField::new(cx, "", "Private key path")),
+        });
+        self.profile_auth_selector_open = false;
+        self.form_error = None;
+        cx.notify();
     }
 }
 
@@ -4143,49 +4198,41 @@ impl RemCmdApp {
 
     fn select_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
-        self.active_panel = ActivePanel::Connection;
+        self.active_panel = ActivePanel::Server;
+        self.profile_context_menu = None;
         self.open_settings_selector = None;
-        let tab_id = self
-            .active_tab()
-            .filter(|tab| tab.profile_id == profile_id)
-            .or_else(|| {
-                self.tabs
-                    .iter()
-                    .rev()
-                    .find(|tab| tab.profile_id == profile_id)
-            })
-            .map(|tab| tab.id);
+        self.bottom_panel_open = false;
+        self.bottom_panel_resize = None;
         self.active_session_id = None;
         self.selected_profile_id = Some(profile_id);
-        self.load_editor_for_selected_profile(cx);
-        if let Some(tab_id) = tab_id {
-            self.activate_tab_in_window(tab_id, window, cx);
-        }
+        self.focused_terminal_session_id = None;
+        self.settings_focus_handle.focus(window);
         self.sync_performance_monitoring();
         cx.notify();
     }
 
     fn add_profile(&mut self, cx: &mut Context<Self>) {
-        let number = self.next_profile_number;
+        self.open_new_profile_editor(cx);
+    }
 
-        let profile = ConnectionProfile::new(
-            format!("demo-{number}"),
-            format!("Demo Server {number}"),
-            format!("demo-{number}.example.com"),
-            22,
-            "ubuntu",
-        );
-
-        self.active_panel = ActivePanel::Connection;
-        self.open_settings_selector = None;
+    fn edit_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        self.selected_profile_id = Some(profile_id);
+        self.active_panel = ActivePanel::Server;
         self.active_session_id = None;
-        self.selected_profile_id = Some(profile.id.clone());
-        self.profiles.push(profile);
-        self.next_profile_number += 1;
-
+        self.profile_context_menu = None;
         self.load_editor_for_selected_profile(cx);
-        self.persist_profiles();
+        cx.notify();
+    }
 
+    fn show_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_credential_prompt(cx);
+        self.bottom_panel_open = false;
+        self.bottom_panel_resize = None;
+        self.active_panel = ActivePanel::Home;
+        self.active_session_id = None;
+        self.focused_terminal_session_id = None;
+        self.open_settings_selector = None;
+        self.settings_focus_handle.focus(window);
         self.sync_performance_monitoring();
         cx.notify();
     }
@@ -4488,11 +4535,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    fn delete_selected_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(selected_id) = self.selected_profile_id.clone() else {
-            return;
-        };
-
+    fn delete_profile(&mut self, selected_id: String, cx: &mut Context<Self>) {
         if self.sessions.iter().any(|session| {
             session.profile_id == selected_id && session.connection_state.can_disconnect()
         }) {
@@ -4506,7 +4549,6 @@ impl RemCmdApp {
             .iter()
             .position(|profile| profile.id == selected_id)
         else {
-            self.selected_profile_id = None;
             cx.notify();
             return;
         };
@@ -4523,15 +4565,20 @@ impl RemCmdApp {
 
         self.profiles.remove(selected_index);
 
-        self.selected_profile_id = if self.profiles.is_empty() {
-            None
-        } else if selected_index == 0 {
-            Some(self.profiles[0].id.clone())
-        } else {
-            Some(self.profiles[selected_index - 1].id.clone())
-        };
-
-        self.load_editor_for_selected_profile(cx);
+        if self.selected_profile_id.as_deref() == Some(selected_id.as_str()) {
+            self.selected_profile_id = None;
+            self.active_panel = ActivePanel::Home;
+            self.active_session_id = None;
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.profile_id == selected_id)
+        {
+            self.editor = None;
+            self.profile_auth_selector_open = false;
+        }
+        self.profile_context_menu = None;
         self.persist_profiles();
         self.delete_stored_credentials(selected_id, None, None, cx);
 
@@ -4550,12 +4597,18 @@ impl RemCmdApp {
 
         editor.auth_kind = auth_kind;
         let private_key_path = editor.private_key_path.clone();
+        self.profile_auth_selector_open = false;
         self.form_error = None;
 
         if auth_kind == ProfileAuthKind::PrivateKey {
             window.focus(&private_key_path.focus_handle(cx));
         }
 
+        cx.notify();
+    }
+
+    fn toggle_profile_auth_selector(&mut self, cx: &mut Context<Self>) {
+        self.profile_auth_selector_open = !self.profile_auth_selector_open;
         cx.notify();
     }
 
@@ -4645,11 +4698,17 @@ impl RemCmdApp {
             return;
         };
 
-        let name = editor.name.read(cx).text();
-        let host = editor.host.read(cx).text();
+        let name = editor.name.read(cx).text().trim().to_owned();
+        let host = editor.host.read(cx).text().trim().to_owned();
         let port_text = editor.port.read(cx).text();
-        let username = editor.username.read(cx).text();
+        let username = editor.username.read(cx).text().trim().to_owned();
         let private_key_path = editor.private_key_path.read(cx).text();
+
+        if name.is_empty() || host.is_empty() || username.is_empty() {
+            self.form_error = Some("Name, host, and username are required".into());
+            cx.notify();
+            return;
+        }
 
         let Ok(port) = port_text.trim().parse::<u16>() else {
             self.form_error = Some("Port must be a number from 1 to 65535".into());
@@ -4672,27 +4731,43 @@ impl RemCmdApp {
             }
         };
 
-        let credentials_changed = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == editor.profile_id)
-            .is_some_and(|profile| {
-                credentials_invalidated_by_edit(profile, &host, port, &username, &auth)
-            });
+        let credentials_changed = editor.mode == ProfileEditorMode::Edit
+            && self
+                .profiles
+                .iter()
+                .find(|profile| profile.id == editor.profile_id)
+                .is_some_and(|profile| {
+                    credentials_invalidated_by_edit(profile, &host, port, &username, &auth)
+                });
 
-        if let Some(profile) = self
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == editor.profile_id)
-        {
-            profile.name = name;
-            profile.host = host;
-            profile.port = port;
-            profile.username = username;
-            profile.auth = auth;
+        match editor.mode {
+            ProfileEditorMode::Create => {
+                let mut profile =
+                    ConnectionProfile::new(&editor.profile_id, name, host, port, username);
+                profile.auth = auth;
+                self.selected_profile_id = Some(profile.id.clone());
+                self.profiles.push(profile);
+                self.next_profile_number += 1;
+                self.active_panel = ActivePanel::Server;
+            }
+            ProfileEditorMode::Edit => {
+                if let Some(profile) = self
+                    .profiles
+                    .iter_mut()
+                    .find(|profile| profile.id == editor.profile_id)
+                {
+                    profile.name = name;
+                    profile.host = host;
+                    profile.port = port;
+                    profile.username = username;
+                    profile.auth = auth;
+                }
+            }
         }
 
         self.form_error = None;
+        self.editor = None;
+        self.profile_auth_selector_open = false;
         self.persist_profiles();
         if credentials_changed {
             self.delete_stored_credentials(
@@ -4707,7 +4782,9 @@ impl RemCmdApp {
     }
 
     fn cancel_editor(&mut self, cx: &mut Context<Self>) {
-        self.load_editor_for_selected_profile(cx);
+        self.editor = None;
+        self.profile_auth_selector_open = false;
+        self.form_error = None;
         cx.notify();
     }
 
@@ -5441,6 +5518,22 @@ impl RemCmdApp {
         self.focused_terminal_session_id = Some(session_id);
         self.quick_terminal_focus_handle.focus(window);
         self.begin_terminal_selection(session_id, event, cx);
+    }
+
+    fn open_profile_context_menu(
+        &mut self,
+        profile_id: String,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.sftp_context_menu = None;
+        self.terminal_context_menu = None;
+        self.profile_context_menu = Some(ProfileContextMenu {
+            profile_id,
+            position: event.position,
+        });
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn open_terminal_context_menu(
@@ -6593,6 +6686,35 @@ impl Render for RemCmdApp {
                     ),
             );
         }
+        if self.profile_context_menu.is_some() {
+            root = root
+                .child(
+                    div()
+                        .id("profile_context_menu_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.profile_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.profile_context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(deferred(self.render_profile_context_menu(window, cx)).with_priority(20));
+        }
         if self.sftp_context_menu.is_some() {
             root = root
                 .child(
@@ -6670,6 +6792,28 @@ impl Render for RemCmdApp {
                 window.focus(&focus_handle);
             }
             root = root.child(self.render_sftp_create_prompt(cx));
+        } else if self.editor.is_some() {
+            root = root.child(self.render_profile_editor_overlay(cx));
+            if self.profile_auth_selector_open {
+                root = root.child(
+                    div()
+                        .id("profile_auth_selector_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.profile_auth_selector_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
         } else if should_focus_terminal
             && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
             && !focus_handle.is_focused(window)
@@ -8220,7 +8364,38 @@ impl RemCmdApp {
             .overflow_y_scroll()
             .mt_3();
 
+        let home_selected = self.active_panel == ActivePanel::Home;
+        let home_background = if home_selected {
+            self.theme.list_selected_bg
+        } else {
+            self.theme.transparent
+        };
+        let home_hover = if home_selected {
+            self.theme.list_selected_hover_bg
+        } else {
+            self.theme.list_hover_bg
+        };
         connection_tree = connection_tree
+            .child(
+                div()
+                    .id("show_home")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(10.0))
+                    .h(px(36.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(home_background)
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(home_hover))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(self.render_sidebar_icon(IconName::Home, 17.0))
+                    .child("Home")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_home(window, cx);
+                    })),
+            )
             .child(
                 div()
                     .id("open_local_terminal")
@@ -8310,6 +8485,7 @@ impl RemCmdApp {
 
                 let select_profile_id = profile.id.clone();
                 let new_terminal_profile_id = profile.id.clone();
+                let context_profile_id = profile.id.clone();
                 let can_create_terminal = self.credential_lookup_task.is_none()
                     && !self
                         .credential_mutations_in_progress
@@ -8331,7 +8507,7 @@ impl RemCmdApp {
                             this.connect_selected_profile_in_new_session(window, cx);
                         }));
                 }
-                let is_selected = self.active_panel == ActivePanel::Connection
+                let is_selected = self.active_panel == ActivePanel::Server
                     && self.selected_profile_id.as_ref() == Some(&profile.id);
                 let background = if is_selected {
                     self.theme.list_selected_bg
@@ -8368,6 +8544,16 @@ impl RemCmdApp {
                                 .child(profile.name.clone()),
                         )
                         .child(new_terminal_button)
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event, _, cx| {
+                                this.open_profile_context_menu(
+                                    context_profile_id.clone(),
+                                    event,
+                                    cx,
+                                );
+                            }),
+                        )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_profile(select_profile_id.clone(), window, cx);
                         })),
@@ -9316,13 +9502,392 @@ impl RemCmdApp {
             .into_any_element()
     }
 
+    fn render_home(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut connections = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .overflow_hidden()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg);
+        if self.profiles.is_empty() {
+            connections = connections.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(72.0))
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .child("No connections yet"),
+            );
+        } else {
+            for (index, profile) in self.profiles.iter().take(6).enumerate() {
+                let profile_id = profile.id.clone();
+                let hover = self.theme.list_hover_bg;
+                connections = connections.child(
+                    div()
+                        .id(SharedString::from(format!("home-profile-{}", profile.id)))
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .h(px(52.0))
+                        .px_3()
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(hover))
+                        .child(self.render_sidebar_icon(IconName::Server, 19.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(profile.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(self.theme.text_muted)
+                                        .child(profile.address()),
+                                ),
+                        )
+                        .child(self.render_sidebar_icon(IconName::Expand, 14.0))
+                        .when(index + 1 < self.profiles.len().min(6), |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left(px(44.0))
+                                    .right(px(12.0))
+                                    .h(px(1.0))
+                                    .bg(self.theme.settings_separator),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_profile(profile_id.clone(), window, cx);
+                        })),
+                );
+            }
+        }
+
+        let new_connection = text_button(
+            "home-new-connection",
+            "New Connection",
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx)));
+        let local_terminal = text_button(
+            "home-local-terminal",
+            "Local Terminal",
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_local_terminal(window, cx);
+        }));
+
+        self.detail_panel_shell().child(
+            div()
+                .id("home_content")
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .max_w(px(720.0))
+                        .flex_col()
+                        .py(px(64.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(42.0))
+                                        .rounded_lg()
+                                        .bg(self.theme.control_bg)
+                                        .child(icon(
+                                            IconName::Home,
+                                            self.theme,
+                                            IconTone::Default,
+                                            23.0,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .text_size(px(24.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child("RemCmd"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(self.theme.text_muted)
+                                                .child("Remote workspaces, files, and terminals"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .mt_6()
+                                .child(new_connection)
+                                .child(local_terminal),
+                        )
+                        .child(
+                            div()
+                                .mt_8()
+                                .mb_2()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Connections"),
+                        )
+                        .child(connections),
+                ),
+        )
+    }
+
+    fn render_server_overview(
+        &self,
+        profile: Option<ConnectionProfile>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let Some(profile) = profile else {
+            return self.render_home(cx);
+        };
+        let session = self.session_for_profile(&profile.id);
+        let state = session
+            .map(|session| session.connection_state)
+            .unwrap_or(SessionState::Disconnected);
+        let status = match state {
+            SessionState::Disconnected => "Disconnected",
+            SessionState::Connecting => "Connecting",
+            SessionState::Authenticating => "Authenticating",
+            SessionState::Connected => "Connected",
+            SessionState::Disconnecting => "Disconnecting",
+            SessionState::Failed => "Failed",
+        };
+        let status_color = match state {
+            SessionState::Connected => self.theme.status_ok,
+            SessionState::Failed => self.theme.error_text,
+            SessionState::Connecting
+            | SessionState::Authenticating
+            | SessionState::Disconnecting => self.theme.status_warn,
+            SessionState::Disconnected => self.theme.text_muted,
+        };
+        let terminal_count = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.profile_id == profile.id)
+            .count();
+        let state_allows_connect = matches!(
+            state,
+            SessionState::Disconnected | SessionState::Connected | SessionState::Failed
+        );
+        let can_connect = state_allows_connect
+            && self.credential_lookup_task.is_none()
+            && !self
+                .credential_mutations_in_progress
+                .contains_key(&profile.id);
+        let action_label = if state == SessionState::Connected {
+            "New Terminal"
+        } else if state == SessionState::Failed {
+            "Retry Connection"
+        } else if state == SessionState::Connecting || state == SessionState::Authenticating {
+            "Connecting..."
+        } else if state == SessionState::Disconnecting {
+            "Disconnecting..."
+        } else {
+            "Connect"
+        };
+        let action_hover = self.theme.accent_hover;
+        let action_pressed = self.theme.button_primary_pressed_bg;
+        let mut connect = div()
+            .id("server-overview-connect")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .h(px(40.0))
+            .px_5()
+            .rounded_lg()
+            .bg(self.theme.accent)
+            .text_color(self.theme.on_accent)
+            .font_weight(FontWeight::MEDIUM)
+            .when(can_connect, |this| {
+                this.cursor_pointer()
+                    .hover(move |this| this.bg(action_hover))
+                    .active(move |this| this.bg(action_pressed))
+            })
+            .when(!can_connect, |this| this.opacity(0.5))
+            .child(icon_with_color(
+                if state == SessionState::Failed {
+                    IconName::Reconnect
+                } else {
+                    IconName::Connect
+                },
+                self.theme.on_accent,
+                18.0,
+            ))
+            .child(action_label);
+        if can_connect {
+            connect = connect.on_click(cx.listener(|this, _, window, cx| {
+                this.connect_selected_profile_in_new_session(window, cx);
+            }));
+        }
+
+        let info = div()
+            .flex()
+            .w_full()
+            .max_w(px(520.0))
+            .flex_col()
+            .overflow_hidden()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg)
+            .child(self.render_server_info_row("Host", profile.host.clone(), true))
+            .child(self.render_server_info_row("Port", profile.port.to_string(), true))
+            .child(self.render_server_info_row("Username", profile.username.clone(), true))
+            .child(self.render_server_info_row(
+                "Authentication",
+                ProfileAuthKind::from_config(&profile.auth).label().into(),
+                true,
+            ))
+            .child(self.render_server_info_row(
+                "Open terminals",
+                terminal_count.to_string(),
+                false,
+            ));
+
+        self.detail_panel_shell().child(
+            div()
+                .id("server_overview_content")
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .items_center()
+                .child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .flex_col()
+                        .items_center()
+                        .py(px(64.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(58.0))
+                                .rounded_lg()
+                                .bg(self.theme.control_bg)
+                                .child(icon(IconName::Server, self.theme, IconTone::Default, 30.0)),
+                        )
+                        .child(
+                            div()
+                                .mt_4()
+                                .text_size(px(28.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child(profile.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_sm()
+                                .text_color(self.theme.text_muted)
+                                .child(profile.address()),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(status_color)
+                                .child(status),
+                        )
+                        .child(div().mt_6().child(connect))
+                        .child(div().mt_8().w_full().max_w(px(520.0)).child(info))
+                        .when_some(
+                            session.and_then(|session| session.connection_error.as_ref()),
+                            |this, error| {
+                                this.child(
+                                    div()
+                                        .mt_3()
+                                        .max_w(px(520.0))
+                                        .text_sm()
+                                        .text_color(self.theme.error_text)
+                                        .child(error.clone()),
+                                )
+                            },
+                        ),
+                ),
+        )
+    }
+
+    fn render_server_info_row(
+        &self,
+        label: &'static str,
+        value: String,
+        divided: bool,
+    ) -> gpui::Div {
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(40.0))
+            .px_3()
+            .text_sm()
+            .child(div().text_color(self.theme.text_muted).child(label))
+            .child(div().min_w(px(0.0)).truncate().child(value))
+            .when(divided, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(12.0))
+                        .right(px(12.0))
+                        .h(px(1.0))
+                        .bg(self.theme.settings_separator),
+                )
+            })
+    }
+
     fn render_detail_panel(
         &self,
         selected_profile: Option<ConnectionProfile>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        if self.active_panel == ActivePanel::Settings {
-            return self.render_settings(cx);
+        match self.active_panel {
+            ActivePanel::Home => return self.render_home(cx),
+            ActivePanel::Server => return self.render_server_overview(selected_profile, cx),
+            ActivePanel::Settings => return self.render_settings(cx),
+            ActivePanel::Connection => {}
         }
         if self.active_session().is_some_and(TerminalSession::is_local)
             && self
@@ -9334,180 +9899,61 @@ impl RemCmdApp {
 
         let mut panel = self.detail_panel_shell();
 
-        match selected_profile {
-            Some(profile) => {
-                let Some(editor) = self.editor.as_ref() else {
-                    return panel.child("No editor loaded");
-                };
-                let has_terminal_workspace = self.has_terminal_workspace(&profile.id);
+        if let Some(profile) = selected_profile
+            && self.has_terminal_workspace(&profile.id)
+        {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_start()
+                    .gap_1()
+                    .min_h(px(36.0))
+                    .mx(px(-16.0))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(self.theme.border)
+                    .child(self.render_workspace_controls(cx))
+                    .child(self.render_pane_controls(cx))
+                    .child(self.render_connection_controls(cx)),
+            );
 
-                panel = panel.child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_start()
-                        .gap_1()
-                        .when(has_terminal_workspace, |this| {
-                            this.min_h(px(36.0))
-                                .mx(px(-16.0))
-                                .px_4()
-                                .border_b_1()
-                                .border_color(self.theme.border)
-                        })
-                        .child(self.render_workspace_controls(cx))
-                        .child(self.render_pane_controls(cx))
-                        .child(self.render_connection_controls(cx))
-                        .child(
-                            self.render_icon_button(
-                                "delete_connection",
-                                IconName::Delete,
-                                "Delete",
-                                IconTone::Danger,
-                                true,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_selected_profile(cx);
-                            })),
-                        ),
-                );
-
-                if has_terminal_workspace {
-                    match self.active_tab_view() {
-                        TerminalTabView::Terminal => {
-                            if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
-                                panel = panel.child(
-                                    div()
-                                        .flex()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .min_h(px(0.0))
-                                        .overflow_hidden()
-                                        .child(self.render_pane_layout(layout, cx)),
-                                );
-                            }
-                        }
-                        TerminalTabView::Files => {
-                            if let Some(session_id) = self.active_session_id {
-                                panel = panel.child(self.render_sftp_browser(
-                                    session_id,
-                                    SftpBrowserPlacement::Center,
-                                    cx,
-                                ));
-                            }
-                        }
-                    }
-                } else {
-                    let form = div()
-                        .id("connection_form")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .overflow_x_hidden()
-                        .overflow_y_scroll()
-                        .pr_1()
-                        .child(self.render_form_row("Name", editor.name.clone()))
-                        .child(self.render_form_row("Host", editor.host.clone()))
-                        .child(self.render_form_row("Port", editor.port.clone()))
-                        .child(self.render_form_row("Username", editor.username.clone()))
-                        .child(self.render_auth_method_row(editor.auth_kind, cx))
-                        .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
-                            this.child(
-                                self.render_private_key_row(editor.private_key_path.clone(), cx),
-                            )
-                        })
-                        .when(
-                            matches!(
-                                editor.auth_kind,
-                                ProfileAuthKind::Password | ProfileAuthKind::PrivateKey
-                            ),
-                            |this| this.child(self.render_saved_credential_row(cx)),
-                        )
-                        .when_some(self.form_error.as_ref(), |this, error| {
-                            this.child(
-                                div()
-                                    .mt_3()
-                                    .text_color(self.theme.error_text)
-                                    .child(error.clone()),
-                            )
-                        })
-                        .when_some(
-                            self.selected_session()
-                                .and_then(|session| session.connection_error.as_ref()),
-                            |this, error| {
-                                this.child(
-                                    div()
-                                        .mt_3()
-                                        .text_color(self.theme.error_text)
-                                        .child(error.clone()),
-                                )
-                            },
-                        )
-                        .when_some(
-                            self.selected_session()
-                                .and_then(|session| session.connection_message.as_ref()),
-                            |this, message| {
-                                this.child(
-                                    div()
-                                        .mt_3()
-                                        .text_color(self.theme.text_muted)
-                                        .child(message.clone()),
-                                )
-                            },
-                        )
-                        .child(
+            match self.active_tab_view() {
+                TerminalTabView::Terminal => {
+                    if let Some(layout) = self.active_tab().map(|tab| &tab.layout) {
+                        panel = panel.child(
                             div()
                                 .flex()
-                                .flex_none()
-                                .flex_wrap()
-                                .mt_6()
-                                .gap_2()
-                                .pb_2()
-                                .child(
-                                    text_button(
-                                        "save_profile",
-                                        "Save",
-                                        TextButtonTone::Primary,
-                                        true,
-                                        &self.theme,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.save_editor(cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    text_button(
-                                        "cancel_profile",
-                                        "Cancel",
-                                        TextButtonTone::Secondary,
-                                        true,
-                                        &self.theme,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.cancel_editor(cx);
-                                        },
-                                    )),
-                                ),
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .min_h(px(0.0))
+                                .overflow_hidden()
+                                .child(self.render_pane_layout(layout, cx)),
                         );
-                    panel = panel.child(form);
+                    }
+                }
+                TerminalTabView::Files => {
+                    if let Some(session_id) = self.active_session_id {
+                        panel = panel.child(self.render_sftp_browser(
+                            session_id,
+                            SftpBrowserPlacement::Center,
+                            cx,
+                        ));
+                    }
                 }
             }
-            None => {
-                panel = panel.child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .text_color(self.theme.text_muted)
-                        .child("No connection selected"),
-                );
-            }
+        } else {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_color(self.theme.text_muted)
+                    .child("No terminal selected"),
+            );
         }
 
         panel.child(self.render_bottom_panel(cx))
@@ -10199,6 +10645,103 @@ impl RemCmdApp {
             .gap_1()
             .child(terminal_button)
             .child(files_button)
+    }
+
+    fn render_profile_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu_state) = self.profile_context_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == menu_state.profile_id)
+        else {
+            return div().into_any_element();
+        };
+        let profile_id = profile.id.clone();
+        let has_live_session = self.sessions.iter().any(|session| {
+            session.profile_id == profile_id && session.connection_state.can_disconnect()
+        });
+        let can_open_terminal = self.credential_lookup_task.is_none()
+            && !self
+                .credential_mutations_in_progress
+                .contains_key(&profile_id);
+        let viewport = window.viewport_size();
+        let left = f32::from(menu_state.position.x)
+            .min((f32::from(viewport.width) - 196.0).max(8.0))
+            .max(8.0);
+        let top = f32::from(menu_state.position.y)
+            .min((f32::from(viewport.height) - 142.0).max(8.0))
+            .max(8.0);
+
+        let terminal_profile_id = profile_id.clone();
+        let mut new_terminal = self.render_context_menu_item(
+            "profile-context-new-terminal",
+            IconName::Connect,
+            "New Terminal",
+            IconTone::Default,
+            can_open_terminal,
+        );
+        if can_open_terminal {
+            new_terminal = new_terminal.on_click(cx.listener(move |this, _, window, cx| {
+                this.profile_context_menu = None;
+                this.selected_profile_id = Some(terminal_profile_id.clone());
+                this.active_panel = ActivePanel::Server;
+                this.connect_selected_profile_in_new_session(window, cx);
+            }));
+        }
+
+        let edit_profile_id = profile_id.clone();
+        let mut edit = self.render_context_menu_item(
+            "profile-context-edit",
+            IconName::Edit,
+            "Edit Connection",
+            IconTone::Default,
+            true,
+        );
+        edit = edit.on_click(cx.listener(move |this, _, _, cx| {
+            this.edit_profile(edit_profile_id.clone(), cx);
+        }));
+
+        let delete_profile_id = profile_id;
+        let mut delete = self.render_context_menu_item(
+            "profile-context-delete",
+            IconName::Delete,
+            "Delete Connection",
+            IconTone::Danger,
+            !has_live_session,
+        );
+        if !has_live_session {
+            delete = delete.on_click(cx.listener(move |this, _, _, cx| {
+                this.delete_profile(delete_profile_id.clone(), cx);
+            }));
+        }
+
+        div()
+            .id("profile_context_menu")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(188.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.sidebar_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
+            .occlude()
+            .child(new_terminal)
+            .child(edit)
+            .child(self.render_context_menu_separator())
+            .child(delete)
+            .into_any_element()
     }
 
     fn render_terminal_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -11904,6 +12447,128 @@ impl RemCmdApp {
             .into_any_element()
     }
 
+    fn render_profile_editor_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = match editor.mode {
+            ProfileEditorMode::Create => "New Connection",
+            ProfileEditorMode::Edit => "Edit Connection",
+        };
+        let save = text_button(
+            "save_profile",
+            "Save",
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.save_editor(cx)));
+        let cancel = text_button(
+            "cancel_profile",
+            "Cancel",
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.cancel_editor(cx)));
+
+        let form = div()
+            .id("connection_form")
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .overflow_x_hidden()
+            .overflow_y_scroll()
+            .px_4()
+            .py_3()
+            .child(self.render_form_row("Name", editor.name.clone()))
+            .child(self.render_form_row("Host", editor.host.clone()))
+            .child(self.render_form_row("Port", editor.port.clone()))
+            .child(self.render_form_row("Username", editor.username.clone()))
+            .child(self.render_auth_method_row(editor.auth_kind, cx))
+            .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
+                this.child(self.render_private_key_row(editor.private_key_path.clone(), cx))
+            })
+            .when(
+                editor.mode == ProfileEditorMode::Edit
+                    && matches!(
+                        editor.auth_kind,
+                        ProfileAuthKind::Password | ProfileAuthKind::PrivateKey
+                    ),
+                |this| this.child(self.render_saved_credential_row(cx)),
+            )
+            .when_some(self.form_error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .mt_3()
+                        .text_sm()
+                        .text_color(self.theme.error_text)
+                        .child(error.clone()),
+                )
+            });
+
+        div()
+            .id("profile_editor_overlay")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .bg(self.theme.overlay_bg)
+            .occlude()
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .max_w(px(620.0))
+                    .max_h(px(640.0))
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(self.theme.border_strong)
+                    .bg(self.theme.sidebar_bg)
+                    .shadow(vec![BoxShadow {
+                        color: self.theme.shadow,
+                        offset: point(px(0.0), px(6.0)),
+                        blur_radius: px(24.0),
+                        spread_radius: px(-5.0),
+                    }])
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(46.0))
+                            .px_4()
+                            .border_b_1()
+                            .border_color(self.theme.border)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(form)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_between()
+                            .h(px(54.0))
+                            .px_4()
+                            .border_t_1()
+                            .border_color(self.theme.border)
+                            .child(save)
+                            .child(cancel),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_connection_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let session = self.selected_session();
         let state = session
@@ -12043,9 +12708,137 @@ impl RemCmdApp {
         selected: ProfileAuthKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let control_group: SharedString = "profile-auth-selector-control".into();
+        let button_hover = self.theme.control_hover_bg;
+        let button_pressed = self.theme.control_pressed_bg;
+        let picker = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded_full()
+            .bg(if self.profile_auth_selector_open {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.settings_picker_bg
+            })
+            .when(!self.profile_auth_selector_open, |this| {
+                this.group_hover(control_group.clone(), |style| {
+                    style.bg(self.theme.transparent)
+                })
+            })
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
+        let button = div()
+            .id("profile-auth-selector")
+            .group(control_group)
+            .flex()
+            .flex_none()
+            .max_w(px(180.0))
+            .items_center()
+            .h(px(24.0))
+            .pl(px(6.0))
+            .pr(px(1.0))
+            .rounded_lg()
+            .bg(if self.profile_auth_selector_open {
+                self.theme.control_hover_bg
+            } else {
+                self.theme.transparent
+            })
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(button_hover))
+            .active(move |this| this.bg(button_pressed))
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(147.0))
+                    .truncate()
+                    .pr(px(4.0))
+                    .text_right()
+                    .child(selected.label()),
+            )
+            .child(picker)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_profile_auth_selector(cx);
+            }));
+
+        let mut selector = div().relative().flex().flex_none().child(button);
+        if self.profile_auth_selector_open {
+            let mut menu = div()
+                .id("profile-auth-selector-menu")
+                .absolute()
+                .top(px(26.0))
+                .right_0()
+                .w(px(180.0))
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(self.theme.border_strong)
+                .bg(self.theme.sidebar_bg)
+                .text_sm()
+                .shadow(vec![BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(-2.0),
+                }])
+                .occlude();
+            let option_hover = self.theme.accent;
+            let option_pressed = self.theme.accent_hover;
+            let on_accent = self.theme.on_accent;
+            for (index, (auth_kind, label)) in ProfileAuthKind::OPTIONS.iter().copied().enumerate()
+            {
+                let is_selected = auth_kind == selected;
+                let hover_group: SharedString = format!("profile-auth-option-{index}-hover").into();
+                let mut check = div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(16.0));
+                if is_selected {
+                    check =
+                        check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+                }
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("profile-auth-option-{index}")))
+                        .group(hover_group.clone())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
+                        .when(is_selected, |this| {
+                            this.bg(self.theme.accent).text_color(self.theme.on_accent)
+                        })
+                        .cursor_pointer()
+                        .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                        .active(move |this| this.bg(option_pressed).text_color(on_accent))
+                        .child(check)
+                        .child(self.render_select_menu_label(
+                            label.into(),
+                            is_selected,
+                            hover_group,
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.select_auth_method(auth_kind, window, cx);
+                        })),
+                );
+            }
+            selector = selector.child(deferred(menu).with_priority(30));
+        }
+
         div()
             .flex()
             .items_center()
+            .justify_between()
+            .gap_3()
             .mt_3()
             .child(
                 div()
@@ -12054,101 +12847,7 @@ impl RemCmdApp {
                     .truncate()
                     .child("Authentication"),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .p(px(2.0))
-                    .gap(px(2.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.control_bg)
-                    .child(self.render_auth_method_option(
-                        "auth_none",
-                        "No Password",
-                        ProfileAuthKind::None,
-                        selected,
-                        cx,
-                    ))
-                    .child(self.render_auth_method_option(
-                        "auth_password",
-                        "Password",
-                        ProfileAuthKind::Password,
-                        selected,
-                        cx,
-                    ))
-                    .child(self.render_auth_method_option(
-                        "auth_private_key",
-                        "Private Key",
-                        ProfileAuthKind::PrivateKey,
-                        selected,
-                        cx,
-                    ))
-                    .child(self.render_auth_method_option(
-                        "auth_agent",
-                        "SSH Agent",
-                        ProfileAuthKind::Agent,
-                        selected,
-                        cx,
-                    )),
-            )
-    }
-
-    fn render_auth_method_option(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        auth_kind: ProfileAuthKind,
-        selected: ProfileAuthKind,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_selected = auth_kind == selected;
-        let background = if is_selected {
-            self.theme.list_selected_bg
-        } else {
-            self.theme.transparent
-        };
-        let border = if is_selected {
-            self.theme.border_strong
-        } else {
-            self.theme.transparent
-        };
-        let hover_background = if is_selected {
-            self.theme.list_selected_hover_bg
-        } else {
-            self.theme.control_hover_bg
-        };
-
-        div()
-            .id(id)
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .items_center()
-            .justify_center()
-            .px_2()
-            .py(px(6.0))
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(background)
-            .text_sm()
-            .cursor_pointer()
-            .hover(move |this| this.bg(hover_background))
-            .when(is_selected, |this| {
-                this.shadow(vec![BoxShadow {
-                    color: self.theme.shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(3.0),
-                    spread_radius: px(-1.0),
-                }])
-            })
-            .child(div().truncate().child(label))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_auth_method(auth_kind, window, cx);
-            }))
+            .child(selector)
     }
 
     fn render_private_key_row(
@@ -13748,6 +14447,29 @@ mod tests {
         assert_eq!(
             ProfileAuthKind::from_config(&AuthConfig::Agent),
             ProfileAuthKind::Agent
+        );
+    }
+
+    #[test]
+    fn app_navigation_defaults_to_home() {
+        assert_eq!(ActivePanel::default(), ActivePanel::Home);
+    }
+
+    #[test]
+    fn profile_auth_selector_exposes_every_supported_method() {
+        assert_eq!(
+            ProfileAuthKind::OPTIONS,
+            [
+                (ProfileAuthKind::None, "No Password"),
+                (ProfileAuthKind::Password, "Password"),
+                (ProfileAuthKind::PrivateKey, "Private Key"),
+                (ProfileAuthKind::Agent, "SSH Agent"),
+            ]
+        );
+        assert!(
+            ProfileAuthKind::OPTIONS
+                .iter()
+                .all(|(kind, label)| kind.label() == *label)
         );
     }
 
