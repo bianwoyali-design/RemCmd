@@ -45,12 +45,13 @@ use std::{
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
-    Task, Timer, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowOptions, canvas, deferred,
-    div, ease_in_out, ease_out_quint, img, point, prelude::*, px, rgb, size, uniform_list,
+    FocusHandle, Focusable, FontWeight, Global, Hsla, IntoElement, KeyBinding, KeyDownEvent,
+    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
+    SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, img, point,
+    prelude::*, px, rgb, size, uniform_list,
 };
 use secrecy::SecretString;
 
@@ -124,6 +125,37 @@ gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
 gpui::actions!(settings_selector, [CancelSettingsSelector]);
 gpui::actions!(sftp_create_prompt, [SubmitSftpCreate, CancelSftpCreate]);
 gpui::actions!(quick_command, [SubmitQuickCommand, CancelQuickCommand]);
+gpui::actions!(
+    app_menu,
+    [
+        ShowHome,
+        ShowSettings,
+        NewConnection,
+        NewLocalTerminal,
+        NewRemoteTerminal,
+        ConnectSelectedProfile,
+        DisconnectActiveSession,
+        SplitHorizontal,
+        SplitVertical,
+        CloseActivePane,
+        CloseActiveTab,
+        ResetActiveTerminal,
+        ShowTerminalView,
+        ShowFilesView,
+        ToggleLeftSidebar,
+        ToggleConnectionSearch,
+        ShowSftpSidebar,
+        ShowPerformanceSidebar,
+        ToggleBottomPanel,
+        SaveProfileEditor,
+        CancelProfileEditor,
+        MinimizeWindow,
+        ZoomWindow,
+        ToggleFullscreen,
+        CloseWindow,
+        Quit,
+    ]
+);
 
 struct RemCmdApp {
     profiles: Vec<ConnectionProfile>,
@@ -192,6 +224,11 @@ struct RemCmdApp {
     settings_error: Option<String>,
     _appearance_subscription: Subscription,
 }
+
+/// Keeps menu-bar actions independent from the currently focused GPUI element.
+struct RemCmdMainWindow(WindowHandle<RemCmdApp>);
+
+impl Global for RemCmdMainWindow {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SessionId(u64);
@@ -12412,6 +12449,7 @@ impl RemCmdApp {
 
         div()
             .id("profile_editor_overlay")
+            .key_context("ProfileEditor")
             .absolute()
             .top_0()
             .right_0()
@@ -13539,13 +13577,13 @@ fn main_window_options(cx: &App) -> WindowOptions {
     }
 }
 
-fn open_main_window(cx: &mut App) {
+fn open_main_window(cx: &mut App) -> WindowHandle<RemCmdApp> {
     let options = main_window_options(cx);
 
     cx.open_window(options, |window, cx| {
         cx.new(|cx| RemCmdApp::load(window, cx))
     })
-    .expect("failed to open main window");
+    .expect("failed to open main window")
 }
 
 fn bind_credential_prompt_keys(cx: &mut App) {
@@ -13585,6 +13623,226 @@ fn bind_quick_command_keys(cx: &mut App) {
     ]);
 }
 
+fn bind_profile_editor_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-s", SaveProfileEditor, Some("ProfileEditor")),
+        KeyBinding::new("escape", CancelProfileEditor, Some("ProfileEditor")),
+    ]);
+}
+
+fn application_menus() -> Vec<Menu> {
+    let mut application_items = vec![MenuItem::action("Settings...", ShowSettings)];
+    #[cfg(target_os = "macos")]
+    application_items.push(MenuItem::os_submenu(
+        "Services",
+        gpui::SystemMenuType::Services,
+    ));
+    application_items.extend([MenuItem::separator(), MenuItem::action("Quit RemCmd", Quit)]);
+
+    vec![
+        Menu {
+            name: "RemCmd".into(),
+            items: application_items,
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New Connection", NewConnection),
+                MenuItem::action("New Local Terminal", NewLocalTerminal),
+                MenuItem::action("New SSH Terminal", NewRemoteTerminal),
+                MenuItem::separator(),
+                MenuItem::action("Connect Selected Server", ConnectSelectedProfile),
+                MenuItem::action("Disconnect Active Session", DisconnectActiveSession),
+            ],
+        },
+        Menu {
+            name: "Terminal".into(),
+            items: vec![
+                MenuItem::action("Split Horizontally", SplitHorizontal),
+                MenuItem::action("Split Vertically", SplitVertical),
+                MenuItem::separator(),
+                MenuItem::action("Show Terminal", ShowTerminalView),
+                MenuItem::action("Show Remote Files", ShowFilesView),
+                MenuItem::separator(),
+                MenuItem::action("Reset Terminal", ResetActiveTerminal),
+                MenuItem::action("Close Active Split", CloseActivePane),
+                MenuItem::action("Close Active Tab", CloseActiveTab),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Home", ShowHome),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Connections Sidebar", ToggleLeftSidebar),
+                MenuItem::action("Search Connections", ToggleConnectionSearch),
+                MenuItem::separator(),
+                MenuItem::action("Show Remote Files Sidebar", ShowSftpSidebar),
+                MenuItem::action("Show Server Performance", ShowPerformanceSidebar),
+                MenuItem::action("Toggle Bottom Terminal", ToggleBottomPanel),
+            ],
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", MinimizeWindow),
+                MenuItem::action("Zoom", ZoomWindow),
+                MenuItem::action("Enter Full Screen", ToggleFullscreen),
+                MenuItem::separator(),
+                MenuItem::action("Close Window", CloseWindow),
+            ],
+        },
+    ]
+}
+
+fn dispatch_main_window_action(
+    cx: &mut App,
+    action: impl FnOnce(&mut RemCmdApp, &mut Window, &mut Context<RemCmdApp>) + 'static,
+) {
+    let window = cx.global::<RemCmdMainWindow>().0;
+    cx.defer(move |cx| {
+        let _ = window.update(cx, action);
+    });
+    cx.stop_propagation();
+}
+
+fn configure_application_menu(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-,", ShowSettings, None),
+        KeyBinding::new("cmd-shift-h", ShowHome, None),
+        KeyBinding::new("cmd-n", NewConnection, None),
+        KeyBinding::new("cmd-t", NewLocalTerminal, None),
+        KeyBinding::new("cmd-shift-t", NewRemoteTerminal, None),
+        KeyBinding::new("cmd-enter", ConnectSelectedProfile, None),
+        KeyBinding::new("cmd-shift-x", DisconnectActiveSession, None),
+        KeyBinding::new("cmd-d", SplitHorizontal, None),
+        KeyBinding::new("cmd-shift-d", SplitVertical, None),
+        KeyBinding::new("alt-cmd-w", CloseActivePane, None),
+        KeyBinding::new("cmd-shift-w", CloseActiveTab, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-r", ResetActiveTerminal, None),
+        KeyBinding::new("cmd-1", ShowTerminalView, None),
+        KeyBinding::new("cmd-2", ShowFilesView, None),
+        KeyBinding::new("cmd-shift-s", ToggleLeftSidebar, None),
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
+        KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
+        KeyBinding::new("cmd-f", ToggleConnectionSearch, None),
+        KeyBinding::new("cmd-shift-f", ShowSftpSidebar, None),
+        KeyBinding::new("cmd-shift-p", ShowPerformanceSidebar, None),
+        KeyBinding::new("cmd-j", ToggleBottomPanel, None),
+        KeyBinding::new("cmd-q", Quit, None),
+    ]);
+    cx.on_action(|_: &ShowSettings, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| this.show_settings(window, cx));
+    });
+    cx.on_action(|_: &ShowHome, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| this.show_home(window, cx));
+    });
+    cx.on_action(|_: &NewConnection, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| this.open_new_profile_editor(cx));
+    });
+    cx.on_action(|_: &NewLocalTerminal, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| this.open_local_terminal(window, cx));
+    });
+    cx.on_action(|_: &NewRemoteTerminal, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.connect_selected_profile_in_new_session(window, cx);
+        });
+    });
+    cx.on_action(|_: &ConnectSelectedProfile, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.connect_selected_profile(window, cx);
+        });
+    });
+    cx.on_action(|_: &DisconnectActiveSession, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| this.disconnect_active_connection(cx));
+    });
+    cx.on_action(|_: &SplitHorizontal, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.split_active_pane(SplitAxis::Horizontal, window, cx);
+        });
+    });
+    cx.on_action(|_: &SplitVertical, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.split_active_pane(SplitAxis::Vertical, window, cx);
+        });
+    });
+    cx.on_action(|_: &CloseActivePane, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| this.close_active_pane(window, cx));
+    });
+    cx.on_action(|_: &CloseActiveTab, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| {
+            if let Some(tab_id) = this.active_tab_id {
+                this.close_tab(tab_id, cx);
+            }
+        });
+    });
+    cx.on_action(|_: &ResetActiveTerminal, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| {
+            if let Some(session_id) = this.active_session_id {
+                this.reset_terminal(session_id, cx);
+            }
+        });
+    });
+    cx.on_action(|_: &ShowTerminalView, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.set_active_tab_view(TerminalTabView::Terminal, window, cx);
+        });
+    });
+    cx.on_action(|_: &ShowFilesView, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.set_active_tab_view(TerminalTabView::Files, window, cx);
+        });
+    });
+    cx.on_action(|_: &ToggleLeftSidebar, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| this.toggle_left_sidebar(cx));
+    });
+    cx.on_action(|_: &ToggleConnectionSearch, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.toggle_sidebar_search(window, cx);
+        });
+    });
+    cx.on_action(|_: &ShowSftpSidebar, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| {
+            this.set_right_sidebar_view(RightSidebarView::Sftp, cx);
+            if !this.right_sidebar_open {
+                this.toggle_right_sidebar(cx);
+            }
+        });
+    });
+    cx.on_action(|_: &ShowPerformanceSidebar, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| {
+            this.set_right_sidebar_view(RightSidebarView::Performance, cx);
+            if !this.right_sidebar_open {
+                this.toggle_right_sidebar(cx);
+            }
+        });
+    });
+    cx.on_action(|_: &ToggleBottomPanel, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| this.toggle_bottom_panel(window, cx));
+    });
+    cx.on_action(|_: &SaveProfileEditor, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| this.save_editor(cx));
+    });
+    cx.on_action(|_: &CancelProfileEditor, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| this.cancel_editor(cx));
+    });
+    cx.on_action(|_: &MinimizeWindow, cx| {
+        dispatch_main_window_action(cx, |_, window, _| window.minimize_window());
+    });
+    cx.on_action(|_: &ZoomWindow, cx| {
+        dispatch_main_window_action(cx, |_, window, _| window.zoom_window());
+    });
+    cx.on_action(|_: &ToggleFullscreen, cx| {
+        dispatch_main_window_action(cx, |_, window, _| window.toggle_fullscreen());
+    });
+    cx.on_action(|_: &CloseWindow, cx| {
+        dispatch_main_window_action(cx, |_, window, _| window.remove_window());
+    });
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.set_menus(application_menus());
+}
+
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
     register_macos_sf_mono(cx);
@@ -13596,17 +13854,38 @@ fn launch(cx: &mut App) {
     bind_settings_selector_keys(cx);
     bind_sftp_create_prompt_keys(cx);
     bind_quick_command_keys(cx);
-    open_main_window(cx);
+    bind_profile_editor_keys(cx);
+    let main_window = open_main_window(cx);
+    cx.set_global(RemCmdMainWindow(main_window));
+    configure_application_menu(cx);
+    cx.activate(true);
+}
+
+fn reopen_main_window(cx: &mut App) {
+    let main_window = open_main_window(cx);
+    cx.set_global(RemCmdMainWindow(main_window));
     cx.activate(true);
 }
 
 fn main() {
-    Application::new().with_assets(RemCmdAssets).run(launch);
+    let application = Application::new().with_assets(RemCmdAssets);
+    application.on_reopen(reopen_main_window);
+    application.run(launch);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_menu_exposes_workspace_operations() {
+        let menu_names = application_menus()
+            .into_iter()
+            .map(|menu| menu.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(menu_names, ["RemCmd", "File", "Terminal", "View", "Window"]);
+    }
 
     #[test]
     fn titlebar_width_estimate_reserves_more_space_for_wide_characters() {

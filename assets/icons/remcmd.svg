@@ -1,0 +1,102 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- ===== background squircle: rich deep blue gradient ===== -->
+    <linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#3d9bff"/>
+      <stop offset="0.45" stop-color="#0f7df2"/>
+      <stop offset="1" stop-color="#013f9e"/>
+    </linearGradient>
+    <!-- soft radial glow top-left behind glass -->
+    <radialGradient id="bgGlow" cx="0.28" cy="0.18" r="0.9">
+      <stop offset="0" stop-color="#7cc0ff" stop-opacity="0.85"/>
+      <stop offset="0.5" stop-color="#3d9bff" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#3d9bff" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- ===== glass panel ===== -->
+    <linearGradient id="glass" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0"   stop-color="#12223f" stop-opacity="0.92"/>
+      <stop offset="0.5" stop-color="#0a1830" stop-opacity="0.90"/>
+      <stop offset="1"   stop-color="#050c1c" stop-opacity="0.94"/>
+    </linearGradient>
+    <!-- glass top inner sheen -->
+    <linearGradient id="glassSheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <!-- glass border light -->
+    <linearGradient id="glassEdge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9fd0ff" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#4a86d8" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#0a2a5a" stop-opacity="0.1"/>
+    </linearGradient>
+
+    <!-- ===== glowing prompt ===== -->
+    <linearGradient id="promptGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8fdcff"/>
+      <stop offset="1" stop-color="#2ea8ff"/>
+    </linearGradient>
+
+    <!-- text lines fading -->
+    <linearGradient id="lineFade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#cfe4ff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#cfe4ff" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <!-- blur for glow -->
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <filter id="softBig" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="30"/>
+    </filter>
+  </defs>
+
+  <!-- ================= base tile ================= -->
+  <rect width="1024" height="1024" rx="242" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="242" fill="url(#bgGlow)"/>
+  <rect width="1024" height="524" rx="242" fill="url(#glassSheen)" opacity="0.55"/>
+  <rect x="3" y="3" width="1018" height="1018" rx="239" fill="none" stroke="#001a4d" stroke-opacity="0.35" stroke-width="6"/>
+
+  <!-- ================= glass terminal window ================= -->
+  <g>
+    <!-- drop shadow -->
+    <rect x="164" y="300" width="696" height="480" rx="64" fill="#001233" opacity="0.45" filter="url(#softBig)"/>
+
+    <!-- glass body -->
+    <rect x="160" y="270" width="704" height="480" rx="64" fill="url(#glass)"/>
+
+    <!-- glass sheen (top) -->
+    <rect x="160" y="270" width="704" height="220" rx="64" fill="url(#glassSheen)" opacity="0.5"/>
+
+    <!-- glass stroke -->
+    <rect x="160" y="270" width="704" height="480" rx="64" fill="none" stroke="url(#glassEdge)" stroke-width="2.5"/>
+
+    <!-- title bar divider -->
+    <line x1="160" y1="342" x2="864" y2="342" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+
+    <!-- traffic lights -->
+    <circle cx="216" cy="306" r="13" fill="#ff5f57"/>
+    <circle cx="216" cy="306" r="13" fill="#ffffff" opacity="0.18"/>
+    <circle cx="264" cy="306" r="13" fill="#febc2e"/>
+    <circle cx="264" cy="306" r="13" fill="#ffffff" opacity="0.18"/>
+    <circle cx="312" cy="306" r="13" fill="#28c840"/>
+    <circle cx="312" cy="306" r="13" fill="#ffffff" opacity="0.18"/>
+
+    <!-- fake scrollback lines -->
+    <rect x="204" y="384" width="390" height="18" rx="9" fill="url(#lineFade)"/>
+    <rect x="204" y="422" width="510" height="18" rx="9" fill="url(#lineFade)" opacity="0.7"/>
+    <rect x="204" y="460" width="315" height="18" rx="9" fill="url(#lineFade)" opacity="0.5"/>
+
+    <!-- ===== glowing prompt ===== -->
+    <!-- glow halo -->
+    <g filter="url(#soft)" opacity="0.9" stroke="#3fb9ff" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M 246 552 L 326 618 L 246 684"/>
+    </g>
+    <!-- crisp chevron -->
+    <path d="M 246 552 L 326 618 L 246 684" fill="none" stroke="url(#promptGrad)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- cursor block -->
+    <rect x="365" y="590" width="62" height="58" rx="10" fill="#3fb9ff" opacity="0.28" filter="url(#soft)"/>
+    <rect x="365" y="590" width="62" height="58" rx="10" fill="url(#promptGrad)"/>
+  </g>
+</svg>

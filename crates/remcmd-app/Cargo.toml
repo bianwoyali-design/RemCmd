@@ -3,6 +3,26 @@ name = "remcmd-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[package.metadata.packager]
+product-name = "RemCmd"
+identifier = "io.github.bianwoyali-design.remcmd"
+category = "DeveloperTool"
+formats = ["app"]
+before-packaging-command = "cargo build --release -p remcmd-app"
+license-file = "../../LICENSE"
+icons = [
+    "../../assets/icons/remcmd.icns",
+    "../../assets/icons/remcmd.ico",
+    "../../assets/icons/remcmd-*.png",
+]
+
+[[bin]]
+name = "remcmd"
+path = "src/main.rs"
 
 [dependencies]
 directories.workspace = true
