@@ -66,6 +66,9 @@ pub enum TabLayout {
 pub const DEFAULT_MAX_PARALLEL_TRANSFERS: u8 = 4;
 pub const MAX_PARALLEL_TRANSFERS: u8 = 8;
 pub const MAX_TRANSFER_RATE_MIB_PER_SECOND: u32 = 10_000;
+pub const DEFAULT_TERMINAL_FONT_SIZE: u16 = 14;
+pub const MIN_TERMINAL_FONT_SIZE: u16 = 8;
+pub const MAX_TERMINAL_FONT_SIZE: u16 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TransferSettings {
@@ -102,6 +105,40 @@ impl Default for TransferSettings {
 
 const fn default_max_parallel_transfers() -> u8 {
     DEFAULT_MAX_PARALLEL_TRANSFERS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TerminalSettings {
+    #[serde(default)]
+    pub font_family: Option<String>,
+    #[serde(default = "default_terminal_font_size")]
+    pub font_size: u16,
+}
+
+impl TerminalSettings {
+    pub fn normalized(mut self) -> Self {
+        self.font_family = self
+            .font_family
+            .map(|family| family.trim().to_owned())
+            .filter(|family| !family.is_empty());
+        self.font_size = self
+            .font_size
+            .clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
+        self
+    }
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            font_family: None,
+            font_size: DEFAULT_TERMINAL_FONT_SIZE,
+        }
+    }
+}
+
+const fn default_terminal_font_size() -> u16 {
+    DEFAULT_TERMINAL_FONT_SIZE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -204,6 +241,39 @@ mod tests {
             Some(20 * 1024 * 1024)
         );
         assert_eq!(TransferSettings::default().bytes_per_second(), None);
+    }
+
+    #[test]
+    fn terminal_settings_default_and_normalize_values() {
+        assert_eq!(
+            TerminalSettings::default(),
+            TerminalSettings {
+                font_family: None,
+                font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            }
+        );
+        assert_eq!(
+            TerminalSettings {
+                font_family: Some("  Menlo  ".into()),
+                font_size: u16::MAX,
+            }
+            .normalized(),
+            TerminalSettings {
+                font_family: Some("Menlo".into()),
+                font_size: MAX_TERMINAL_FONT_SIZE,
+            }
+        );
+        assert_eq!(
+            TerminalSettings {
+                font_family: Some(" ".into()),
+                font_size: 0,
+            }
+            .normalized(),
+            TerminalSettings {
+                font_family: None,
+                font_size: MIN_TERMINAL_FONT_SIZE,
+            }
+        );
     }
 
     #[test]

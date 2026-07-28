@@ -54,7 +54,9 @@ use gpui::{
 };
 use secrecy::SecretString;
 
-use remcmd_core::{AuthConfig, ConnectionProfile, TabLayout, ThemeMode, TransferSettings};
+use remcmd_core::{
+    AuthConfig, ConnectionProfile, TabLayout, TerminalSettings, ThemeMode, TransferSettings,
+};
 use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 #[cfg(test)]
 use remcmd_ssh::LogicalCpuSnapshot;
@@ -110,11 +112,12 @@ const TITLEBAR_CLOSE_SYMBOL_SIZE: f32 = 12.0;
 const TRAFFIC_LIGHT_INSET_X: f32 = 20.0;
 const TRAFFIC_LIGHT_INSET_Y: f32 = 18.0;
 #[cfg(target_os = "macos")]
-const TERMINAL_FONT_FAMILY: &str = "SF Mono";
+const UI_MONOSPACE_FONT_FAMILY: &str = "Menlo";
 #[cfg(target_os = "windows")]
-const TERMINAL_FONT_FAMILY: &str = "Consolas";
+const UI_MONOSPACE_FONT_FAMILY: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const TERMINAL_FONT_FAMILY: &str = "DejaVu Sans Mono";
+const UI_MONOSPACE_FONT_FAMILY: &str = "DejaVu Sans Mono";
+const TERMINAL_FONT_LINE_HEIGHT_FACTOR: f32 = 19.0 / 14.0;
 
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
@@ -164,6 +167,9 @@ struct RemCmdApp {
     active_panel: ActivePanel,
     theme_mode: ThemeMode,
     tab_layout: TabLayout,
+    terminal_font_family: SharedString,
+    terminal_font_families: Vec<SharedString>,
+    terminal_font_size: u16,
     transfer_settings: TransferSettings,
     transfer_rate_limiter: Arc<TransferRateLimiter>,
     next_transfer_session_cursor: usize,
@@ -497,6 +503,8 @@ enum ActivePanel {
 enum SettingsSelector {
     Theme,
     TabLayout,
+    TerminalFont,
+    TerminalFontSize,
     TransferRate,
     ParallelTransfers,
 }
@@ -506,6 +514,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => "settings-theme-selector",
             Self::TabLayout => "settings-tab-layout-selector",
+            Self::TerminalFont => "settings-terminal-font-selector",
+            Self::TerminalFontSize => "settings-terminal-font-size-selector",
             Self::TransferRate => "settings-transfer-rate-selector",
             Self::ParallelTransfers => "settings-parallel-transfers-selector",
         }
@@ -515,6 +525,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => &THEME_SETTING_OPTIONS,
             Self::TabLayout => &TAB_LAYOUT_SETTING_OPTIONS,
+            Self::TerminalFont => &[],
+            Self::TerminalFontSize => &TERMINAL_FONT_SIZE_SETTING_OPTIONS,
             Self::TransferRate => &TRANSFER_RATE_SETTING_OPTIONS,
             Self::ParallelTransfers => &PARALLEL_TRANSFER_SETTING_OPTIONS,
         }
@@ -524,6 +536,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => 92.0,
             Self::TabLayout => 104.0,
+            Self::TerminalFont => 180.0,
+            Self::TerminalFontSize => 72.0,
             Self::TransferRate => 104.0,
             Self::ParallelTransfers => 56.0,
         }
@@ -533,6 +547,8 @@ impl SettingsSelector {
         match self {
             Self::Theme => 104.0,
             Self::TabLayout => 120.0,
+            Self::TerminalFont => 220.0,
+            Self::TerminalFontSize => 88.0,
             Self::TransferRate => 120.0,
             Self::ParallelTransfers => 72.0,
         }
@@ -543,6 +559,7 @@ impl SettingsSelector {
 enum SettingsValue {
     Theme(ThemeMode),
     TabLayout(TabLayout),
+    TerminalFontSize(u16),
     TransferRate(u32),
     ParallelTransfers(u8),
 }
@@ -575,6 +592,76 @@ const TAB_LAYOUT_SETTING_OPTIONS: [SettingsOption; 2] = [
     SettingsOption {
         label: "Vertical",
         value: SettingsValue::TabLayout(TabLayout::Vertical),
+    },
+];
+const TERMINAL_FONT_SIZE_SETTING_OPTIONS: [SettingsOption; 17] = [
+    SettingsOption {
+        label: "8 pt",
+        value: SettingsValue::TerminalFontSize(8),
+    },
+    SettingsOption {
+        label: "9 pt",
+        value: SettingsValue::TerminalFontSize(9),
+    },
+    SettingsOption {
+        label: "10 pt",
+        value: SettingsValue::TerminalFontSize(10),
+    },
+    SettingsOption {
+        label: "11 pt",
+        value: SettingsValue::TerminalFontSize(11),
+    },
+    SettingsOption {
+        label: "12 pt",
+        value: SettingsValue::TerminalFontSize(12),
+    },
+    SettingsOption {
+        label: "13 pt",
+        value: SettingsValue::TerminalFontSize(13),
+    },
+    SettingsOption {
+        label: "14 pt",
+        value: SettingsValue::TerminalFontSize(14),
+    },
+    SettingsOption {
+        label: "15 pt",
+        value: SettingsValue::TerminalFontSize(15),
+    },
+    SettingsOption {
+        label: "16 pt",
+        value: SettingsValue::TerminalFontSize(16),
+    },
+    SettingsOption {
+        label: "17 pt",
+        value: SettingsValue::TerminalFontSize(17),
+    },
+    SettingsOption {
+        label: "18 pt",
+        value: SettingsValue::TerminalFontSize(18),
+    },
+    SettingsOption {
+        label: "20 pt",
+        value: SettingsValue::TerminalFontSize(20),
+    },
+    SettingsOption {
+        label: "22 pt",
+        value: SettingsValue::TerminalFontSize(22),
+    },
+    SettingsOption {
+        label: "24 pt",
+        value: SettingsValue::TerminalFontSize(24),
+    },
+    SettingsOption {
+        label: "26 pt",
+        value: SettingsValue::TerminalFontSize(26),
+    },
+    SettingsOption {
+        label: "28 pt",
+        value: SettingsValue::TerminalFontSize(28),
+    },
+    SettingsOption {
+        label: "32 pt",
+        value: SettingsValue::TerminalFontSize(32),
     },
 ];
 const TRANSFER_RATE_SETTING_OPTIONS: [SettingsOption; 4] = [
@@ -1785,6 +1872,14 @@ impl RemCmdApp {
         };
         let theme_mode = settings.theme_mode;
         let tab_layout = settings.tab_layout;
+        let terminal_settings = settings.terminal.normalized();
+        let terminal_font_families =
+            normalize_terminal_font_families(cx.text_system().all_font_names());
+        let terminal_font_family = resolve_terminal_font_family(
+            terminal_settings.font_family.as_deref(),
+            &terminal_font_families,
+        );
+        let terminal_font_size = terminal_settings.font_size;
         let transfer_settings = settings.transfers.normalized();
         let transfer_rate_limiter = Arc::new(TransferRateLimiter::new(
             transfer_settings.bytes_per_second(),
@@ -1842,6 +1937,9 @@ impl RemCmdApp {
             active_panel: ActivePanel::Connection,
             theme_mode,
             tab_layout,
+            terminal_font_family,
+            terminal_font_families,
+            terminal_font_size,
             transfer_settings,
             transfer_rate_limiter,
             next_transfer_session_cursor: 0,
@@ -3742,6 +3840,28 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn set_terminal_font_family(
+        &mut self,
+        terminal_font_family: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_selector = None;
+        self.terminal_font_family = terminal_font_family;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_terminal_font_size(&mut self, terminal_font_size: u16, cx: &mut Context<Self>) {
+        self.terminal_font_size = TerminalSettings {
+            font_family: None,
+            font_size: terminal_font_size,
+        }
+        .normalized()
+        .font_size;
+        self.persist_settings();
+        cx.notify();
+    }
+
     fn set_transfer_rate_limit(&mut self, rate_limit_mib_per_second: u32, cx: &mut Context<Self>) {
         self.transfer_settings.rate_limit_mib_per_second = rate_limit_mib_per_second;
         self.transfer_settings = self.transfer_settings.normalized();
@@ -3763,6 +3883,12 @@ impl RemCmdApp {
         match selector {
             SettingsSelector::Theme => SettingsValue::Theme(self.theme_mode),
             SettingsSelector::TabLayout => SettingsValue::TabLayout(self.tab_layout),
+            SettingsSelector::TerminalFont => {
+                unreachable!("terminal font choices are generated from installed fonts")
+            }
+            SettingsSelector::TerminalFontSize => {
+                SettingsValue::TerminalFontSize(self.terminal_font_size)
+            }
             SettingsSelector::TransferRate => {
                 SettingsValue::TransferRate(self.transfer_settings.rate_limit_mib_per_second)
             }
@@ -3773,6 +3899,10 @@ impl RemCmdApp {
     }
 
     fn settings_value_label(&self, selector: SettingsSelector) -> SharedString {
+        if selector == SettingsSelector::TerminalFont {
+            return self.terminal_font_family.clone();
+        }
+
         let value = self.settings_value(selector);
         if let Some(option) = selector
             .options()
@@ -3783,6 +3913,7 @@ impl RemCmdApp {
         }
 
         match value {
+            SettingsValue::TerminalFontSize(size) => format!("{size} pt").into(),
             SettingsValue::TransferRate(rate) => format!("{rate} MiB/s").into(),
             SettingsValue::ParallelTransfers(count) => count.to_string().into(),
             SettingsValue::Theme(_) | SettingsValue::TabLayout(_) => {
@@ -3822,6 +3953,7 @@ impl RemCmdApp {
         match value {
             SettingsValue::Theme(mode) => self.set_theme_mode(mode, window, cx),
             SettingsValue::TabLayout(layout) => self.set_tab_layout(layout, cx),
+            SettingsValue::TerminalFontSize(size) => self.set_terminal_font_size(size, cx),
             SettingsValue::TransferRate(rate) => self.set_transfer_rate_limit(rate, cx),
             SettingsValue::ParallelTransfers(count) => {
                 self.set_max_parallel_transfers(count, cx);
@@ -3834,6 +3966,10 @@ impl RemCmdApp {
             theme_mode: self.theme_mode,
             tab_layout: self.tab_layout,
             transfers: self.transfer_settings,
+            terminal: TerminalSettings {
+                font_family: Some(self.terminal_font_family.to_string()),
+                font_size: self.terminal_font_size,
+            },
         };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
@@ -4111,6 +4247,9 @@ impl RemCmdApp {
 
     fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
+        self.bottom_panel_open = false;
+        self.bottom_panel_resize = None;
+        self.terminal_context_menu = None;
         self.active_panel = ActivePanel::Settings;
         self.open_settings_selector = None;
         self.settings_focus_handle.focus(window);
@@ -6680,7 +6819,8 @@ impl RemCmdApp {
         let right_sidebar = self
             .render_titlebar_sidebar_button("toggle_right_sidebar", false, "Toggle right sidebar")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)));
-        let bottom_panel = icon_button(
+        let bottom_panel_enabled = self.active_panel == ActivePanel::Connection;
+        let mut bottom_panel = icon_button(
             "toggle_bottom_panel",
             icon(
                 IconName::PanelBottom,
@@ -6689,7 +6829,7 @@ impl RemCmdApp {
                 TITLEBAR_SIDEBAR_ICON_SIZE,
             ),
             IconTone::Default,
-            true,
+            bottom_panel_enabled,
             &theme,
         )
         .size(px(TITLEBAR_CONTROL_HOVER_SIZE))
@@ -6703,10 +6843,12 @@ impl RemCmdApp {
                 theme,
             })
             .into()
-        })
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.toggle_bottom_panel(window, cx);
-        }));
+        });
+        if bottom_panel_enabled {
+            bottom_panel = bottom_panel.on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_bottom_panel(window, cx);
+            }));
+        }
 
         div()
             .id("titlebar_action_group")
@@ -7579,11 +7721,8 @@ impl RemCmdApp {
     ) -> AnyElement {
         let palette = self.terminal_palette();
         let session = self.session(session_id);
-        let cell_height = self
-            .session(session_id)
-            .and_then(|session| session.terminal.as_ref())
-            .map(|terminal| terminal.cell_height)
-            .unwrap_or(f32::from(TERMINAL_CELL_HEIGHT));
+        let terminal_font_size = f32::from(self.terminal_font_size);
+        let terminal_line_height = terminal_font_size * TERMINAL_FONT_LINE_HEIGHT_FACTOR;
         let model = session.and_then(|session| {
             session.terminal.as_ref().map(|terminal| {
                 TerminalViewModel::from_snapshot_with_selection(
@@ -7643,9 +7782,9 @@ impl RemCmdApp {
             .p_3()
             .overflow_hidden()
             .bg(rgb(palette.background.hex()))
-            .font_family(TERMINAL_FONT_FAMILY)
-            .text_size(px(14.0))
-            .line_height(px(cell_height))
+            .font_family(self.terminal_font_family.clone())
+            .text_size(px(terminal_font_size))
+            .line_height(px(terminal_line_height))
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(move |this, event, window, cx| {
                 this.on_terminal_key_down(session_id, event, window, cx);
@@ -8013,7 +8152,7 @@ impl RemCmdApp {
                 div()
                     .mt_1()
                     .w_full()
-                    .font_family(TERMINAL_FONT_FAMILY)
+                    .font_family(UI_MONOSPACE_FONT_FAMILY)
                     .text_xs()
                     .child(info.fingerprint().to_owned()),
             )
@@ -9458,6 +9597,26 @@ impl RemCmdApp {
                 false,
                 cx,
             ));
+        let terminal_group = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg)
+            .child(self.render_settings_row(
+                "settings-terminal-font-row",
+                "Font",
+                SettingsSelector::TerminalFont,
+                true,
+                cx,
+            ))
+            .child(self.render_settings_row(
+                "settings-terminal-font-size-row",
+                "Font size",
+                SettingsSelector::TerminalFontSize,
+                false,
+                cx,
+            ));
         let transfer_group = div()
             .flex()
             .flex_col()
@@ -9505,6 +9664,16 @@ impl RemCmdApp {
                     .mb_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
+                    .child("Terminal"),
+            )
+            .child(terminal_group)
+            .child(
+                div()
+                    .w_full()
+                    .mt_6()
+                    .mb_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("Transfers"),
             )
             .child(transfer_group)
@@ -9524,13 +9693,6 @@ impl RemCmdApp {
             .track_focus(&self.settings_focus_handle)
             .on_action(cx.listener(Self::on_cancel_settings_selector))
             .child(content)
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .px_4()
-                    .child(self.render_bottom_panel(cx)),
-            )
     }
 
     fn render_settings_row(
@@ -9578,6 +9740,10 @@ impl RemCmdApp {
         selector: SettingsSelector,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        if selector == SettingsSelector::TerminalFont {
+            return self.render_terminal_font_selector(cx);
+        }
+
         let is_open = self.open_settings_selector == Some(selector);
         let control_width = selector.control_width();
         let menu_width = selector.menu_width();
@@ -9593,7 +9759,9 @@ impl RemCmdApp {
             .w(px(menu_width))
             .flex()
             .flex_col()
-            .p(px(3.0))
+            .max_h(px(260.0))
+            .overflow_y_scroll()
+            .p_1()
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
@@ -9601,15 +9769,19 @@ impl RemCmdApp {
             .text_sm()
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(0.0), px(3.0)),
-                blur_radius: px(12.0),
-                spread_radius: px(-3.0),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
             }])
             .occlude();
         let selected_value = self.settings_value(selector);
-        let pressed_background = self.theme.control_pressed_bg;
+        let option_hover = self.theme.accent;
+        let option_pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
         for (index, option) in selector.options().iter().copied().enumerate() {
             let is_selected = option.value == selected_value;
+            let hover_group: SharedString =
+                format!("{}-option-{index}-hover", selector.element_id()).into();
             let mut check = div()
                 .flex()
                 .flex_none()
@@ -9619,38 +9791,31 @@ impl RemCmdApp {
             if is_selected {
                 check = check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
             }
-            let option_hover = if is_selected {
-                self.theme.accent_hover
-            } else {
-                self.theme.control_hover_bg
-            };
             menu = menu.child(
                 div()
                     .id(SharedString::from(format!(
                         "{}-option-{index}",
                         selector.element_id()
                     )))
+                    .group(hover_group.clone())
                     .flex()
                     .items_center()
-                    .h(px(24.0))
-                    .px_1()
-                    .rounded_lg()
+                    .gap_2()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
                     .when(is_selected, |this| {
                         this.bg(self.theme.accent).text_color(self.theme.on_accent)
                     })
                     .cursor_pointer()
-                    .hover(move |this| this.bg(option_hover))
-                    .active(move |this| this.bg(pressed_background))
+                    .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                    .active(move |this| this.bg(option_pressed).text_color(on_accent))
                     .child(check)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_center()
-                            .child(option.label),
-                    )
-                    .child(div().flex_none().size(px(16.0)))
+                    .child(self.render_select_menu_label(
+                        option.label.into(),
+                        is_selected,
+                        hover_group,
+                    ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.apply_settings_value(option.value, window, cx);
@@ -9659,6 +9824,7 @@ impl RemCmdApp {
         }
 
         let button_hover = self.theme.control_hover_bg;
+        let button_pressed = self.theme.control_pressed_bg;
         let current_label = self.settings_value_label(selector);
         let picker = div()
             .flex()
@@ -9697,7 +9863,7 @@ impl RemCmdApp {
             .text_sm()
             .cursor_pointer()
             .hover(move |this| this.bg(button_hover))
-            .active(move |this| this.bg(pressed_background))
+            .active(move |this| this.bg(button_pressed))
             .child(
                 div()
                     .flex_1()
@@ -9719,6 +9885,190 @@ impl RemCmdApp {
             .w(px(control_width))
             .child(button)
             .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
+    }
+
+    fn render_terminal_font_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let selector = SettingsSelector::TerminalFont;
+        let is_open = self.open_settings_selector == Some(selector);
+        let control_width = selector.control_width();
+        let control_group: SharedString = format!("{}-control", selector.element_id()).into();
+        let mut menu = div()
+            .id(SharedString::from(format!(
+                "{}-menu",
+                selector.element_id()
+            )))
+            .absolute()
+            .top(px(26.0))
+            .right_0()
+            .w(px(selector.menu_width()))
+            .max_h(px(260.0))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.sidebar_bg)
+            .text_sm()
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
+            .occlude();
+        let option_hover = self.theme.accent;
+        let option_pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
+        for (index, family) in self.terminal_font_families.iter().cloned().enumerate() {
+            let is_selected = family == self.terminal_font_family;
+            let hover_group: SharedString =
+                format!("{}-option-{index}-hover", selector.element_id()).into();
+            let mut check = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(16.0));
+            if is_selected {
+                check = check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+            }
+            let selected_family = family.clone();
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "{}-option-{index}",
+                        selector.element_id()
+                    )))
+                    .group(hover_group.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(28.0))
+                    .px_2()
+                    .rounded_md()
+                    .when(is_selected, |this| {
+                        this.bg(self.theme.accent).text_color(self.theme.on_accent)
+                    })
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                    .active(move |this| this.bg(option_pressed).text_color(on_accent))
+                    .child(check)
+                    .child(self.render_select_menu_label(family, is_selected, hover_group))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_terminal_font_family(selected_family.clone(), cx);
+                    })),
+            );
+        }
+
+        let button_hover = self.theme.control_hover_bg;
+        let button_pressed = self.theme.control_pressed_bg;
+        let picker = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded_full()
+            .bg(if is_open {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.settings_picker_bg
+            })
+            .when(!is_open, |this| {
+                this.group_hover(control_group.clone(), |style| {
+                    style.bg(self.theme.transparent)
+                })
+            })
+            .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
+        let button = div()
+            .id(selector.element_id())
+            .group(control_group)
+            .flex()
+            .flex_none()
+            .w(px(control_width))
+            .items_center()
+            .h(px(24.0))
+            .pl(px(6.0))
+            .pr(px(1.0))
+            .rounded_lg()
+            .bg(if is_open {
+                self.theme.control_hover_bg
+            } else {
+                self.theme.transparent
+            })
+            .text_sm()
+            .cursor_pointer()
+            .hover(move |this| this.bg(button_hover))
+            .active(move |this| this.bg(button_pressed))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .pr(px(4.0))
+                    .text_right()
+                    .child(self.terminal_font_family.clone()),
+            )
+            .child(picker)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_settings_selector(selector, window, cx);
+            }));
+
+        div()
+            .relative()
+            .flex()
+            .flex_none()
+            .w(px(control_width))
+            .child(button)
+            .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
+    }
+
+    fn render_select_menu_label(
+        &self,
+        label: SharedString,
+        selected: bool,
+        hover_group: SharedString,
+    ) -> gpui::Div {
+        let base_color = if selected {
+            self.theme.on_accent
+        } else {
+            self.theme.text_primary
+        };
+        let hover_label = label.clone();
+
+        div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .child(
+                div()
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(base_color)
+                    .group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .opacity(0.0)
+                    .text_color(self.theme.on_accent)
+                    .group_hover(hover_group, |style| style.opacity(1.0))
+                    .child(hover_label),
+            )
     }
 
     fn render_pane_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -10407,7 +10757,7 @@ impl RemCmdApp {
                 .flex()
                 .flex_col()
                 .overflow_y_scroll()
-                .p(px(3.0))
+                .p_1()
                 .rounded_lg()
                 .border_1()
                 .border_color(self.theme.border_strong)
@@ -10415,11 +10765,14 @@ impl RemCmdApp {
                 .text_sm()
                 .shadow(vec![BoxShadow {
                     color: self.theme.shadow,
-                    offset: point(px(0.0), px(3.0)),
-                    blur_radius: px(12.0),
-                    spread_radius: px(-3.0),
+                    offset: point(px(0.0), px(1.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(-2.0),
                 }])
                 .occlude();
+            let option_hover = self.theme.accent;
+            let option_pressed = self.theme.accent_hover;
+            let on_accent = self.theme.on_accent;
             for (index, profile_id) in connected_profile_ids.iter().enumerate() {
                 let Some(profile) = self
                     .profiles
@@ -10429,11 +10782,8 @@ impl RemCmdApp {
                     continue;
                 };
                 let is_selected = prompt.selected_profile_ids.contains(profile_id);
-                let option_hover = if is_selected {
-                    self.theme.accent_hover
-                } else {
-                    self.theme.control_hover_bg
-                };
+                let hover_group: SharedString =
+                    format!("quick-command-target-option-{index}-hover").into();
                 let mut check = div()
                     .flex()
                     .flex_none()
@@ -10450,27 +10800,25 @@ impl RemCmdApp {
                         .id(SharedString::from(format!(
                             "quick-command-target-option-{index}"
                         )))
+                        .group(hover_group.clone())
                         .flex()
                         .items_center()
-                        .h(px(24.0))
-                        .px_1()
-                        .rounded_lg()
+                        .gap_2()
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_md()
                         .when(is_selected, |this| {
                             this.bg(self.theme.accent).text_color(self.theme.on_accent)
                         })
                         .cursor_pointer()
-                        .hover(move |this| this.bg(option_hover))
-                        .active(move |this| this.bg(pressed_background))
+                        .hover(move |this| this.bg(option_hover).text_color(on_accent))
+                        .active(move |this| this.bg(option_pressed).text_color(on_accent))
                         .child(check)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_center()
-                                .child(profile.name.clone()),
-                        )
-                        .child(div().flex_none().size(px(16.0)))
+                        .child(self.render_select_menu_label(
+                            profile.name.clone().into(),
+                            is_selected,
+                            hover_group,
+                        ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle_quick_command_target(target_profile_id.clone(), cx);
@@ -10852,7 +11200,7 @@ impl RemCmdApp {
             .items_center()
             .overflow_x_scroll()
             .track_scroll(&scroll_handle)
-            .font_family(TERMINAL_FONT_FAMILY)
+            .font_family(UI_MONOSPACE_FONT_FAMILY)
             .text_sm();
         for (index, (label, target)) in remote_breadcrumbs(path).into_iter().enumerate() {
             if index > 0 {
@@ -11506,7 +11854,7 @@ impl RemCmdApp {
                             .min_w(px(0.0))
                             .ml_2()
                             .truncate()
-                            .font_family(TERMINAL_FONT_FAMILY)
+                            .font_family(UI_MONOSPACE_FONT_FAMILY)
                             .text_sm()
                             .child(path),
                     )
@@ -12524,6 +12872,86 @@ fn is_terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
     }
 }
 
+fn normalize_terminal_font_families(mut families: Vec<String>) -> Vec<SharedString> {
+    families.retain(|family| {
+        let family = family.trim();
+        !family.is_empty() && !family.starts_with('.')
+    });
+    families.sort_by_cached_key(|family| family.to_lowercase());
+    families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    families.into_iter().map(SharedString::from).collect()
+}
+
+fn resolve_terminal_font_family(
+    preferred: Option<&str>,
+    available: &[SharedString],
+) -> SharedString {
+    let find_available = |candidate: &str| {
+        available
+            .iter()
+            .find(|family| family.as_ref().eq_ignore_ascii_case(candidate))
+            .cloned()
+    };
+
+    if let Some(preferred) = preferred
+        && let Some(family) = find_available(preferred)
+    {
+        return family;
+    }
+
+    for fallback in ["SF Mono", "Menlo", UI_MONOSPACE_FONT_FAMILY] {
+        if let Some(family) = find_available(fallback) {
+            return family;
+        }
+    }
+
+    available
+        .first()
+        .cloned()
+        .unwrap_or_else(|| SharedString::from("Menlo"))
+}
+
+#[cfg(target_os = "macos")]
+fn register_macos_sf_mono(cx: &mut App) {
+    const FONT_DIRECTORIES: [&str; 2] = [
+        "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts",
+        "/Applications/Utilities/Terminal.app/Contents/Resources/Fonts",
+    ];
+    const FONT_FILES: [&str; 12] = [
+        "SF-Mono-Regular.otf",
+        "SF-Mono-RegularItalic.otf",
+        "SF-Mono-Medium.otf",
+        "SF-Mono-MediumItalic.otf",
+        "SF-Mono-Semibold.otf",
+        "SF-Mono-SemiboldItalic.otf",
+        "SF-Mono-Bold.otf",
+        "SF-Mono-BoldItalic.otf",
+        "SF-Mono-Light.otf",
+        "SF-Mono-LightItalic.otf",
+        "SF-Mono-Heavy.otf",
+        "SF-Mono-HeavyItalic.otf",
+    ];
+
+    let Some(directory) = FONT_DIRECTORIES
+        .iter()
+        .map(Path::new)
+        .find(|directory| directory.join(FONT_FILES[0]).is_file())
+    else {
+        return;
+    };
+    let fonts = FONT_FILES
+        .iter()
+        .filter_map(|file| std::fs::read(directory.join(file)).ok())
+        .map(std::borrow::Cow::Owned)
+        .collect::<Vec<_>>();
+    if !fonts.is_empty() {
+        let _ = cx.text_system().add_fonts(fonts);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_macos_sf_mono(_: &mut App) {}
+
 // Application startup functions stay outside main so startup remains testable and readable.
 fn main_window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
@@ -12592,6 +13020,7 @@ fn bind_quick_command_keys(cx: &mut App) {
 
 fn launch(cx: &mut App) {
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
+    register_macos_sf_mono(cx);
 
     bind_text_field_keys(cx);
     bind_file_editor_keys(cx);
@@ -12634,6 +13063,11 @@ mod tests {
             SettingsSelector::TabLayout.options(),
             &TAB_LAYOUT_SETTING_OPTIONS
         );
+        assert!(SettingsSelector::TerminalFont.options().is_empty());
+        assert_eq!(
+            SettingsSelector::TerminalFontSize.options(),
+            &TERMINAL_FONT_SIZE_SETTING_OPTIONS
+        );
         assert_eq!(
             SettingsSelector::TransferRate.options(),
             &TRANSFER_RATE_SETTING_OPTIONS
@@ -12650,6 +13084,12 @@ mod tests {
             label: "Horizontal",
             value: SettingsValue::TabLayout(TabLayout::Horizontal),
         }));
+        assert!(
+            TERMINAL_FONT_SIZE_SETTING_OPTIONS.contains(&SettingsOption {
+                label: "14 pt",
+                value: SettingsValue::TerminalFontSize(14),
+            })
+        );
         assert!(TRANSFER_RATE_SETTING_OPTIONS.contains(&SettingsOption {
             label: "Unlimited",
             value: SettingsValue::TransferRate(0),
@@ -12658,6 +13098,33 @@ mod tests {
             label: "4",
             value: SettingsValue::ParallelTransfers(4),
         }));
+    }
+
+    #[test]
+    fn terminal_font_selection_prefers_saved_font_then_sf_mono_then_menlo() {
+        let available = normalize_terminal_font_families(vec![
+            "Menlo".into(),
+            "SF Mono".into(),
+            "Custom Mono".into(),
+            ".SystemUIFont".into(),
+        ]);
+
+        assert_eq!(
+            resolve_terminal_font_family(Some("custom mono"), &available),
+            "Custom Mono"
+        );
+        assert_eq!(
+            resolve_terminal_font_family(Some("Missing Mono"), &available),
+            "SF Mono"
+        );
+
+        let without_sf = normalize_terminal_font_families(vec!["Menlo".into(), "Arial".into()]);
+        assert_eq!(resolve_terminal_font_family(None, &without_sf), "Menlo");
+        assert!(
+            without_sf
+                .iter()
+                .all(|family| !family.as_ref().starts_with('.'))
+        );
     }
 
     #[test]
