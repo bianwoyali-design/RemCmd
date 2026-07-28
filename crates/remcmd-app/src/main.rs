@@ -392,15 +392,15 @@ impl Render for CommandTooltip {
         div()
             .px_2()
             .py(px(5.0))
-            .rounded_md()
+            .rounded_lg()
             .border_1()
-            .border_color(self.theme.border)
+            .border_color(self.theme.border_strong)
             .bg(self.theme.sidebar_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(0.0), px(3.0)),
-                blur_radius: px(10.0),
-                spread_radius: px(-3.0),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
             }])
             .text_sm()
             .text_color(self.theme.text_primary)
@@ -8079,21 +8079,12 @@ impl RemCmdApp {
             ),
         };
 
-        let mut modal = div()
+        let mut modal = self
+            .glass_floating_surface()
             .w_full()
             .max_w(px(420.0))
             .mx_4()
             .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(8.0)),
-                blur_radius: px(24.0),
-                spread_radius: px(-8.0),
-            }])
             .child(div().font_weight(FontWeight::MEDIUM).child(title))
             .child(
                 div()
@@ -8117,15 +8108,7 @@ impl RemCmdApp {
 
         modal = modal
             .child(div().mt_4().text_sm().child(field_label))
-            .child(
-                div()
-                    .mt_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.surface_bg)
-                    .child(prompt.input.clone()),
-            )
+            .child(div().mt_2().child(prompt.input.clone()))
             .child(
                 div()
                     .id("credential_remember")
@@ -8235,21 +8218,12 @@ impl RemCmdApp {
             .as_ref()
             .expect("host-key prompt should exist before rendering");
 
-        let modal = div()
+        let modal = self
+            .glass_floating_surface()
             .w_full()
             .max_w(px(500.0))
             .mx_4()
             .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(8.0)),
-                blur_radius: px(24.0),
-                spread_radius: px(-8.0),
-            }])
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
@@ -8657,16 +8631,7 @@ impl RemCmdApp {
                     ),
             )
             .when(self.sidebar_search_visible, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .mt_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(self.theme.border)
-                        .bg(self.theme.surface_bg)
-                        .child(self.sidebar_search.clone()),
-                )
+                this.child(div().flex_none().mt_2().child(self.sidebar_search.clone()))
             })
             .child(connection_tree)
             .child(settings_footer)
@@ -8747,6 +8712,20 @@ impl RemCmdApp {
             .min_w(px(0.0))
             .h_full()
             .bg(self.theme.sidebar_bg)
+    }
+
+    fn glass_floating_surface(&self) -> gpui::Div {
+        div()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.sidebar_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
     }
 
     fn render_sidebar_resize_handle(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -10194,7 +10173,8 @@ impl RemCmdApp {
         let max_control_width = selector.control_width();
         let menu_width = selector.menu_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
-        let mut menu = div()
+        let mut menu = self
+            .glass_floating_surface()
             .id(SharedString::from(format!(
                 "{}-menu",
                 selector.element_id()
@@ -10208,17 +10188,7 @@ impl RemCmdApp {
             .max_h(px(260.0))
             .overflow_y_scroll()
             .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
             .text_sm()
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .occlude();
         let selected_value = self.settings_value(selector);
         let option_hover = self.theme.accent;
@@ -10339,7 +10309,8 @@ impl RemCmdApp {
         let is_open = self.open_settings_selector == Some(selector);
         let max_control_width = selector.control_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
-        let mut menu = div()
+        let mut menu = self
+            .glass_floating_surface()
             .id(SharedString::from(format!(
                 "{}-menu",
                 selector.element_id()
@@ -10353,17 +10324,7 @@ impl RemCmdApp {
             .flex_col()
             .overflow_y_scroll()
             .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
             .text_sm()
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .occlude();
         let option_hover = self.theme.accent;
         let option_pressed = self.theme.accent_hover;
@@ -10717,7 +10678,7 @@ impl RemCmdApp {
             }));
         }
 
-        div()
+        self.glass_floating_surface()
             .id("profile_context_menu")
             .absolute()
             .left(px(left))
@@ -10726,16 +10687,6 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .occlude()
             .child(new_terminal)
             .child(edit)
@@ -10825,7 +10776,7 @@ impl RemCmdApp {
             }));
         }
 
-        div()
+        self.glass_floating_surface()
             .id("terminal_context_menu")
             .absolute()
             .left(px(left))
@@ -10834,16 +10785,6 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .occlude()
             .child(copy)
             .child(paste)
@@ -10975,7 +10916,7 @@ impl RemCmdApp {
             }));
         }
 
-        div()
+        self.glass_floating_surface()
             .id("sftp_context_menu")
             .absolute()
             .left(px(left))
@@ -10984,16 +10925,6 @@ impl RemCmdApp {
             .flex()
             .flex_col()
             .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
-            .shadow(vec![BoxShadow {
-                color: self.theme.shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
-                spread_radius: px(-2.0),
-            }])
             .occlude()
             .child(new_file)
             .child(new_folder)
@@ -11161,22 +11092,12 @@ impl RemCmdApp {
                 cx.notify();
             }))
             .child(
-                div()
+                self.glass_floating_surface()
                     .w(px(360.0))
                     .flex()
                     .flex_col()
                     .gap_3()
                     .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border_strong)
-                    .bg(self.theme.sidebar_bg)
-                    .shadow(vec![BoxShadow {
-                        color: self.theme.shadow,
-                        offset: point(px(0.0), px(6.0)),
-                        blur_radius: px(24.0),
-                        spread_radius: px(-5.0),
-                    }])
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(input)
                     .when_some(prompt.error.as_ref(), |this, error| {
@@ -11293,7 +11214,8 @@ impl RemCmdApp {
             .max_w(px(180.0))
             .child(selector_button);
         if prompt.target_menu_open {
-            let mut menu = div()
+            let mut menu = self
+                .glass_floating_surface()
                 .id("quick_command_target_menu")
                 .absolute()
                 .top(px(26.0))
@@ -11304,17 +11226,7 @@ impl RemCmdApp {
                 .flex_col()
                 .overflow_y_scroll()
                 .p_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(self.theme.border_strong)
-                .bg(self.theme.sidebar_bg)
                 .text_sm()
-                .shadow(vec![BoxShadow {
-                    color: self.theme.shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(4.0),
-                    spread_radius: px(-2.0),
-                }])
                 .occlude();
             let option_hover = self.theme.accent;
             let option_pressed = self.theme.accent_hover;
@@ -11409,17 +11321,7 @@ impl RemCmdApp {
                 cx.listener(|this, _: &CancelQuickCommand, _, cx| this.close_quick_command(cx)),
             )
             .child(self.render_sidebar_icon(IconName::QuickCommand, 15.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(px(100.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.surface_bg)
-                    .child(input),
-            )
+            .child(div().flex().flex_1().min_w(px(100.0)).child(input))
             .when_some(prompt.error.as_ref(), |this, error| {
                 this.child(
                     div()
@@ -12522,23 +12424,13 @@ impl RemCmdApp {
             .bg(self.theme.overlay_bg)
             .occlude()
             .child(
-                div()
+                self.glass_floating_surface()
                     .flex()
                     .w_full()
                     .max_w(px(620.0))
                     .max_h(px(640.0))
                     .flex_col()
                     .overflow_hidden()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border_strong)
-                    .bg(self.theme.sidebar_bg)
-                    .shadow(vec![BoxShadow {
-                        color: self.theme.shadow,
-                        offset: point(px(0.0), px(6.0)),
-                        blur_radius: px(24.0),
-                        spread_radius: px(-5.0),
-                    }])
                     .child(
                         div()
                             .flex()
@@ -12562,8 +12454,8 @@ impl RemCmdApp {
                             .px_4()
                             .border_t_1()
                             .border_color(self.theme.border)
-                            .child(save)
-                            .child(cancel),
+                            .child(cancel)
+                            .child(save),
                     ),
             )
             .into_any_element()
@@ -12765,7 +12657,8 @@ impl RemCmdApp {
 
         let mut selector = div().relative().flex().flex_none().child(button);
         if self.profile_auth_selector_open {
-            let mut menu = div()
+            let mut menu = self
+                .glass_floating_surface()
                 .id("profile-auth-selector-menu")
                 .absolute()
                 .top(px(26.0))
@@ -12774,17 +12667,7 @@ impl RemCmdApp {
                 .flex()
                 .flex_col()
                 .p_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(self.theme.border_strong)
-                .bg(self.theme.sidebar_bg)
                 .text_sm()
-                .shadow(vec![BoxShadow {
-                    color: self.theme.shadow,
-                    offset: point(px(0.0), px(1.0)),
-                    blur_radius: px(4.0),
-                    spread_radius: px(-2.0),
-                }])
                 .occlude();
             let option_hover = self.theme.accent;
             let option_pressed = self.theme.accent_hover;
@@ -12867,16 +12750,7 @@ impl RemCmdApp {
                     .min_w(px(0.0))
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(self.theme.border)
-                            .bg(self.theme.surface_bg)
-                            .child(field),
-                    )
+                    .child(div().flex_1().min_w(px(0.0)).child(field))
                     .child(
                         self.render_icon_button(
                             "browse_private_key",
@@ -12924,16 +12798,7 @@ impl RemCmdApp {
             .items_center()
             .mt_3()
             .child(div().flex_none().w(px(112.0)).truncate().child(label))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.surface_bg)
-                    .child(field),
-            )
+            .child(div().flex_1().min_w(px(0.0)).child(field))
     }
 }
 
