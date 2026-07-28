@@ -168,6 +168,7 @@ struct RemCmdApp {
     transfer_rate_limiter: Arc<TransferRateLimiter>,
     next_transfer_session_cursor: usize,
     sftp_context_menu: Option<SftpContextMenu>,
+    terminal_context_menu: Option<TerminalContextMenu>,
     sftp_create_prompt: Option<SftpCreatePrompt>,
     quick_command_prompt: Option<QuickCommandPrompt>,
     bottom_panel_open: bool,
@@ -1189,6 +1190,11 @@ struct SftpContextMenu {
     position: gpui::Point<Pixels>,
 }
 
+struct TerminalContextMenu {
+    session_id: SessionId,
+    position: gpui::Point<Pixels>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SftpCreateKind {
     File,
@@ -1835,6 +1841,7 @@ impl RemCmdApp {
             transfer_rate_limiter,
             next_transfer_session_cursor: 0,
             sftp_context_menu: None,
+            terminal_context_menu: None,
             sftp_create_prompt: None,
             quick_command_prompt: None,
             bottom_panel_open: false,
@@ -3687,6 +3694,13 @@ impl RemCmdApp {
         if self.focused_terminal_session_id == Some(session_id) {
             self.focused_terminal_session_id = None;
         }
+        if self
+            .terminal_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.session_id == session_id)
+        {
+            self.terminal_context_menu = None;
+        }
 
         self.sync_performance_monitoring();
         true
@@ -5285,6 +5299,37 @@ impl RemCmdApp {
         self.begin_terminal_selection(session_id, event, cx);
     }
 
+    fn open_terminal_context_menu(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Option<PaneId>,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane_id) = pane_id {
+            if !self.set_active_pane(pane_id, cx) {
+                return;
+            }
+            let Some(focus_handle) = self.pane(pane_id).map(|pane| pane.focus_handle.clone())
+            else {
+                return;
+            };
+            focus_handle.focus(window);
+        } else {
+            self.focused_terminal_session_id = Some(session_id);
+            self.quick_terminal_focus_handle.focus(window);
+        }
+
+        self.sftp_context_menu = None;
+        self.terminal_context_menu = Some(TerminalContextMenu {
+            session_id,
+            position: event.position,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn begin_terminal_selection(
         &mut self,
         session_id: SessionId,
@@ -5390,6 +5435,24 @@ impl RemCmdApp {
         let had_selection = session.terminal_selection.take().is_some();
         let was_selecting = std::mem::take(&mut session.terminal_selecting);
         had_selection || was_selecting
+    }
+
+    fn select_all_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session_mut(session_id) else {
+            return false;
+        };
+        let Some(terminal) = session.terminal.as_ref() else {
+            return false;
+        };
+        let size = terminal.engine.size();
+        let Some(selection) = full_terminal_selection(size.rows(), size.columns()) else {
+            return false;
+        };
+
+        session.terminal_selection = Some(selection);
+        session.terminal_selecting = false;
+        cx.notify();
+        true
     }
 
     fn on_terminal_key_down(
@@ -6397,6 +6460,35 @@ impl Render for RemCmdApp {
                         ),
                 )
                 .child(deferred(self.render_sftp_context_menu(window, cx)).with_priority(20));
+        }
+        if self.terminal_context_menu.is_some() {
+            root = root
+                .child(
+                    div()
+                        .id("terminal_context_menu_dismiss_layer")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(deferred(self.render_terminal_context_menu(window, cx)).with_priority(20));
         }
 
         if self
@@ -7518,13 +7610,6 @@ impl RemCmdApp {
         .left_0()
         .size_full();
 
-        let border = if pane_id.is_some_and(|pane_id| self.active_pane_id == Some(pane_id))
-            || (pane_id.is_none() && self.focused_terminal_session_id == Some(session_id))
-        {
-            self.theme.border_strong
-        } else {
-            self.theme.border
-        };
         let terminal_view = div()
             .id(SharedString::from(element_id))
             .key_context("Terminal")
@@ -7535,14 +7620,11 @@ impl RemCmdApp {
             .w_full()
             .p_3()
             .overflow_hidden()
-            .border_1()
-            .border_color(border)
             .bg(rgb(palette.background.hex()))
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(14.0))
             .line_height(px(cell_height))
             .cursor(CursorStyle::IBeam)
-            .focus(|style| style.border_color(self.theme.border_strong))
             .on_key_down(cx.listener(move |this, event, window, cx| {
                 this.on_terminal_key_down(session_id, event, window, cx);
             }))
@@ -7554,6 +7636,12 @@ impl RemCmdApp {
                     } else {
                         this.on_quick_terminal_mouse_down(session_id, event, window, cx);
                     }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event, window, cx| {
+                    this.open_terminal_context_menu(session_id, pane_id, event, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(move |this, event, window, cx| {
@@ -9728,6 +9816,101 @@ impl RemCmdApp {
             .child(files_button)
     }
 
+    fn render_terminal_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu_state) = self.terminal_context_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        let session_id = menu_state.session_id;
+        let Some(session) = self.session(session_id) else {
+            return div().into_any_element();
+        };
+        let can_copy = session
+            .terminal_selection
+            .is_some_and(|selection| !selection.is_empty());
+        let can_paste =
+            session.connection_state == SessionState::Connected && session.terminal.is_some();
+        let can_select_all = session.terminal.as_ref().is_some_and(|terminal| {
+            let size = terminal.engine.size();
+            size.rows() > 0 && size.columns() > 0
+        });
+        let viewport = window.viewport_size();
+        let left = f32::from(menu_state.position.x)
+            .min((f32::from(viewport.width) - 196.0).max(8.0))
+            .max(8.0);
+        let top = f32::from(menu_state.position.y)
+            .min((f32::from(viewport.height) - 126.0).max(8.0))
+            .max(8.0);
+
+        let mut copy = self.render_context_menu_item(
+            "terminal-context-copy",
+            IconName::Copy,
+            "Copy",
+            IconTone::Default,
+            can_copy,
+        );
+        if can_copy {
+            copy = copy.on_click(cx.listener(move |this, _, _, cx| {
+                this.copy_terminal_selection(session_id, cx);
+                this.terminal_context_menu = None;
+                cx.notify();
+            }));
+        }
+        let mut paste = self.render_context_menu_item(
+            "terminal-context-paste",
+            IconName::Paste,
+            "Paste",
+            IconTone::Default,
+            can_paste,
+        );
+        if can_paste {
+            paste = paste.on_click(cx.listener(move |this, _, _, cx| {
+                this.paste_into_terminal(session_id, cx);
+                this.terminal_context_menu = None;
+                cx.notify();
+            }));
+        }
+        let mut select_all = self.render_context_menu_item(
+            "terminal-context-select-all",
+            IconName::SelectAll,
+            "Select All",
+            IconTone::Default,
+            can_select_all,
+        );
+        if can_select_all {
+            select_all = select_all.on_click(cx.listener(move |this, _, _, cx| {
+                this.select_all_terminal(session_id, cx);
+                this.terminal_context_menu = None;
+                cx.notify();
+            }));
+        }
+
+        div()
+            .id("terminal_context_menu")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(188.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.theme.border_strong)
+            .bg(self.theme.sidebar_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(-2.0),
+            }])
+            .occlude()
+            .child(copy)
+            .child(paste)
+            .child(self.render_context_menu_separator())
+            .child(select_all)
+            .into_any_element()
+    }
+
     fn render_sftp_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(menu_state) = self.sftp_context_menu.as_ref() else {
             return div().into_any_element();
@@ -9752,7 +9935,7 @@ impl RemCmdApp {
             .min((f32::from(viewport.height) - 286.0).max(8.0))
             .max(8.0);
 
-        let mut new_file = self.render_sftp_context_menu_item(
+        let mut new_file = self.render_context_menu_item(
             "sftp-context-new-file",
             IconName::File,
             "New File",
@@ -9770,7 +9953,7 @@ impl RemCmdApp {
                 );
             }));
         }
-        let mut new_folder = self.render_sftp_context_menu_item(
+        let mut new_folder = self.render_context_menu_item(
             "sftp-context-new-folder",
             IconName::Folder,
             "New Folder",
@@ -9788,7 +9971,7 @@ impl RemCmdApp {
                 );
             }));
         }
-        let mut copy_path = self.render_sftp_context_menu_item(
+        let mut copy_path = self.render_context_menu_item(
             "sftp-context-copy-path",
             IconName::Copy,
             "Copy Path",
@@ -9800,7 +9983,7 @@ impl RemCmdApp {
                 this.copy_selected_sftp_paths(session_id, placement, cx);
             }));
         }
-        let mut view = self.render_sftp_context_menu_item(
+        let mut view = self.render_context_menu_item(
             "sftp-context-view",
             IconName::View,
             "View",
@@ -9812,7 +9995,7 @@ impl RemCmdApp {
                 this.open_selected_sftp_file(session_id, placement, false, cx);
             }));
         }
-        let mut edit = self.render_sftp_context_menu_item(
+        let mut edit = self.render_context_menu_item(
             "sftp-context-edit",
             IconName::Edit,
             "Edit",
@@ -9824,7 +10007,7 @@ impl RemCmdApp {
                 this.open_selected_sftp_file(session_id, placement, true, cx);
             }));
         }
-        let mut download = self.render_sftp_context_menu_item(
+        let mut download = self.render_context_menu_item(
             "sftp-context-download",
             IconName::Download,
             "Download",
@@ -9836,7 +10019,7 @@ impl RemCmdApp {
                 this.download_selected_sftp_entries(session_id, placement, cx);
             }));
         }
-        let mut delete = self.render_sftp_context_menu_item(
+        let mut delete = self.render_context_menu_item(
             "sftp-context-delete",
             IconName::Delete,
             "Delete",
@@ -9871,17 +10054,17 @@ impl RemCmdApp {
             .occlude()
             .child(new_file)
             .child(new_folder)
-            .child(self.render_sftp_context_menu_separator())
+            .child(self.render_context_menu_separator())
             .child(copy_path)
             .child(view)
             .child(edit)
             .child(download)
-            .child(self.render_sftp_context_menu_separator())
+            .child(self.render_context_menu_separator())
             .child(delete)
             .into_any_element()
     }
 
-    fn render_sftp_context_menu_item(
+    fn render_context_menu_item(
         &self,
         id: &'static str,
         icon_name: IconName,
@@ -9983,7 +10166,7 @@ impl RemCmdApp {
             )
     }
 
-    fn render_sftp_context_menu_separator(&self) -> gpui::Div {
+    fn render_context_menu_separator(&self) -> gpui::Div {
         div().h(px(1.0)).mx_2().my_1().bg(self.theme.border)
     }
 
@@ -12205,6 +12388,15 @@ fn terminal_point_for_pixels(
     TerminalPoint::new(row.min(rows.saturating_sub(1)), column.min(columns))
 }
 
+fn full_terminal_selection(rows: usize, columns: usize) -> Option<TerminalSelection> {
+    (rows > 0 && columns > 0).then(|| {
+        TerminalSelection::new(
+            TerminalPoint::new(0, 0),
+            TerminalPoint::new(rows - 1, columns),
+        )
+    })
+}
+
 fn valid_dimension(value: f32, fallback: f32) -> f32 {
     if value.is_finite() && value > 0.0 {
         value
@@ -13257,6 +13449,19 @@ mod tests {
         assert_eq!(
             terminal_point_for_pixels(10_000.0, 10_000.0, 80, 24, 8.0, 19.0),
             TerminalPoint::new(23, 80)
+        );
+    }
+
+    #[test]
+    fn terminal_select_all_covers_the_complete_visible_grid() {
+        assert_eq!(full_terminal_selection(0, 80), None);
+        assert_eq!(full_terminal_selection(24, 0), None);
+        assert_eq!(
+            full_terminal_selection(24, 80),
+            Some(TerminalSelection::new(
+                TerminalPoint::new(0, 0),
+                TerminalPoint::new(23, 80),
+            ))
         );
     }
 

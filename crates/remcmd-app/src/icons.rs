@@ -26,11 +26,13 @@ pub(crate) enum IconName {
     ForgetCredential,
     NewConnection,
     PanelBottom,
+    Paste,
     Performance,
     Picker,
     QuickCommand,
     Reconnect,
     Search,
+    SelectAll,
     Server,
     Settings,
     SidebarLeft,
@@ -64,11 +66,13 @@ impl IconName {
             Self::ForgetCredential => "icons/forget-credential.svg",
             Self::NewConnection => "icons/new-connection.svg",
             Self::PanelBottom => "icons/panel-bottom.svg",
+            Self::Paste => "icons/paste.svg",
             Self::Performance => "icons/performance.svg",
             Self::Picker => "icons/picker.svg",
             Self::QuickCommand => "icons/quick-command.svg",
             Self::Reconnect => "icons/reconnect.svg",
             Self::Search => "icons/search.svg",
+            Self::SelectAll => "icons/select-all.svg",
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
             Self::SidebarLeft => "icons/sidebar-left.svg",
@@ -102,11 +106,13 @@ impl IconName {
             "icons/forget-credential.svg" => Self::ForgetCredential,
             "icons/new-connection.svg" => Self::NewConnection,
             "icons/panel-bottom.svg" => Self::PanelBottom,
+            "icons/paste.svg" => Self::Paste,
             "icons/performance.svg" => Self::Performance,
             "icons/picker.svg" => Self::Picker,
             "icons/quick-command.svg" => Self::QuickCommand,
             "icons/reconnect.svg" => Self::Reconnect,
             "icons/search.svg" => Self::Search,
+            "icons/select-all.svg" => Self::SelectAll,
             "icons/server.svg" => Self::Server,
             "icons/settings.svg" => Self::Settings,
             "icons/sidebar-left.svg" => Self::SidebarLeft,
@@ -170,6 +176,9 @@ impl IconName {
             Self::PanelBottom => {
                 r#"<rect x="2" y="4" width="20" height="16" rx="3" stroke-width="1.333" stroke-linejoin="round"/><path d="M2 13.5h20" stroke-width="1.333"/>"#
             }
+            Self::Paste => {
+                r#"<path d="M8 5.5H5.5A2.5 2.5 0 0 0 3 8v11.5A2.5 2.5 0 0 0 5.5 22H15a2.5 2.5 0 0 0 2.5-2.5V17"/><rect x="8" y="2" width="13" height="15" rx="2.5"/><path d="M11 2.25V5h7V2.25" stroke-width="1.1"/>"#
+            }
             Self::Performance => {
                 r#"<path d="M3 18.5h18"/><path d="m4.5 15 4-4 3 2.75 5.25-7.25 2.75 2.25"/><circle cx="4.5" cy="15" r="0.75" fill="currentColor" stroke="none"/><circle cx="8.5" cy="11" r="0.75" fill="currentColor" stroke="none"/><circle cx="11.5" cy="13.75" r="0.75" fill="currentColor" stroke="none"/><circle cx="16.75" cy="6.5" r="0.75" fill="currentColor" stroke="none"/><circle cx="19.5" cy="8.75" r="0.75" fill="currentColor" stroke="none"/>"#
             }
@@ -184,6 +193,9 @@ impl IconName {
             }
             Self::Search => {
                 r#"<circle cx="10.25" cy="10.25" r="7.25"/><path d="m15.65 15.65 5.35 5.35"/>"#
+            }
+            Self::SelectAll => {
+                r#"<path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/><rect x="8" y="8" width="8" height="8" rx="1.5"/>"#
             }
             Self::Server => {
                 r#"<rect x="2.5" y="3.5" width="19" height="7" rx="2.25"/><rect x="2.5" y="13.5" width="19" height="7" rx="2.25"/><circle cx="6" cy="7" r="0.65" fill="currentColor" stroke="none"/><circle cx="6" cy="17" r="0.65" fill="currentColor" stroke="none"/><path d="M9.5 7h9m-9 10h9" stroke-width="0.7"/>"#
