@@ -7,7 +7,7 @@ on:
 
 permissions:
     actions: read
-    contents: read
+    contents: write
 
 jobs:
     package:
@@ -72,54 +72,18 @@ jobs:
               if: runner.os == 'Windows'
               run: cargo packager --config packaging/wix/Packager.toml --formats wix
 
-            - name: Verify SignPath release configuration
-              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
-              shell: bash
-              env:
-                  SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-                  SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-                  SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-                  SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-                  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+            - name: Name Windows installer for the release
+              if: runner.os == 'Windows'
+              shell: pwsh
               run: |
-                  for variable in \
-                    SIGNPATH_API_TOKEN \
-                    SIGNPATH_ORGANIZATION_ID \
-                    SIGNPATH_PROJECT_SLUG \
-                    SIGNPATH_SIGNING_POLICY_SLUG \
-                    SIGNPATH_ARTIFACT_CONFIGURATION_SLUG; do
-                    if [ -z "${!variable}" ]; then
-                      echo "Missing required SignPath configuration: ${variable}" >&2
-                      exit 1
-                    fi
-                  done
-
-            - name: Upload unsigned Windows package for SignPath
-              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
-              id: upload-unsigned-windows-package
-              uses: actions/upload-artifact@v4
-              with:
-                  name: remcmd-windows-unsigned
-                  path: target/release/*.msi
-                  if-no-files-found: error
-                  retention-days: 1
-
-            - name: Sign Windows package with SignPath
-              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
-              uses: signpath/github-action-submit-signing-request@v2
-              with:
-                  api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-                  organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-                  project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-                  signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-                  artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-                  github-artifact-id: ${{ steps.upload-unsigned-windows-package.outputs.artifact-id }}
-                  github-token: ${{ secrets.GITHUB_TOKEN }}
-                  wait-for-completion: true
-                  output-artifact-directory: target/release/signed
+                  $version = ((cargo pkgid -p remcmd-app) -split '#')[-1]
+                  $installer = Get-ChildItem target/release -Filter '*.msi' | Select-Object -First 1
+                  if ($null -eq $installer) {
+                    throw 'cargo-packager did not produce an MSI.'
+                  }
+                  Rename-Item $installer.FullName "RemCmd-v$version-windows-x86_64.msi"
 
             - name: Upload package artifact
-              if: matrix.name != 'Windows' || !startsWith(github.ref, 'refs/tags/v')
               uses: actions/upload-artifact@v4
               with:
                   name: ${{ matrix.artifact }}
@@ -127,11 +91,26 @@ jobs:
                   if-no-files-found: error
                   retention-days: 14
 
-            - name: Upload signed Windows package artifact
-              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
-              uses: actions/upload-artifact@v4
+    release:
+        if: startsWith(github.ref, 'refs/tags/v')
+        needs: package
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Download release artifacts
+              uses: actions/download-artifact@v4
               with:
-                  name: remcmd-windows
-                  path: target/release/signed/**/*.msi
-                  if-no-files-found: error
-                  retention-days: 14
+                  path: release-artifacts
+                  merge-multiple: true
+
+            - name: Create GitHub Release
+              shell: bash
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  args=(release create "$GITHUB_REF_NAME" release-artifacts/* --title "$GITHUB_REF_NAME" --generate-notes)
+                  if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+                    args+=(--prerelease)
+                  fi
+                  gh "${args[@]}"

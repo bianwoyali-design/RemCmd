@@ -20,6 +20,12 @@ icons = [
     "../../assets/icons/remcmd-*.png",
 ]
 
+[package.metadata.packager.macos]
+# Ad-hoc signing makes the packaged bundle internally consistent for alpha
+# installs. It is intentionally not a substitute for Developer ID notarization.
+signing-identity = "-"
+minimum-system-version = "13.0"
+
 [[bin]]
 name = "remcmd"
 path = "src/main.rs"

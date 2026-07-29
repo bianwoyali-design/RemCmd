@@ -1,8 +1,8 @@
 # Windows Code Signing
 
-Release tags use WiX to create an MSI package. A manual workflow run publishes
-an unsigned MSI for installation testing. A `v*` tag must be signed by
-SignPath; the workflow refuses to publish an unsigned Windows release.
+The release workflow uses `cargo-packager` to create a WiX MSI. Until RemCmd
+has a public release and is accepted by the SignPath Foundation, both manual
+builds and `v*` tags publish unsigned Windows artifacts.
 
 ## MSI Versioning
 
@@ -17,13 +17,19 @@ Windows version monotonically: `alpha.N` uses `0.0.0.N`, `beta.N` uses
 `0.0.1.N`, and `rc.N` uses `0.0.2.N`. Replace it with `0.1.0` for the final
 `v0.1.0` release.
 
+The generated installer is renamed after packaging for release distribution,
+so its filename remains user-facing SemVer, for example
+`RemCmd-v0.1.0-alpha.1-windows-x86_64.msi`. Only the internal MSI
+`ProductVersion` needs the numeric value.
+
 Do not use `0.1.0.1` for an alpha of `0.1.0`: Windows Installer considers it
 newer than the eventual `0.1.0` release.
 
-## Repository Configuration
+## Future SignPath Configuration
 
-Install the SignPath GitHub App for `bianwoyali-design/RemCmd`, then create a
-SignPath project and add the following repository configuration:
+After a public release makes the project eligible, install the SignPath GitHub
+App for `bianwoyali-design/RemCmd`, create a SignPath project, and add the
+following repository configuration:
 
 - Secret `SIGNPATH_API_TOKEN`: a SignPath token for a user permitted to submit
   signing requests for the release policy.
@@ -44,11 +50,12 @@ Do not use an artifact configuration that signs only the outer MSI. Windows
 users also run the embedded executable after installation, so it must receive
 an Authenticode signature as part of the same SignPath request.
 
-## Release Behavior
+## Current Release Behavior
 
-- `workflow_dispatch`: unsigned MSI, DMG, DEB, and AppImage artifacts for test
-  installation.
-- `v*` tags: the Windows MSI is signed through SignPath and only the signed MSI
-  is retained as `remcmd-windows`.
-- macOS: the DMG remains unsigned until Developer ID signing and notarization
-  are configured.
+- `workflow_dispatch`: unsigned Windows MSI, ad-hoc-signed macOS DMG, DEB,
+  and AppImage artifacts for test installation.
+- `v*` tags: create a GitHub prerelease when the tag contains a prerelease
+  suffix and attach the unsigned Windows MSI, ad-hoc-signed macOS DMG, DEB,
+  and AppImage.
+- macOS: `cargo-packager` ad-hoc-signs the completed app bundle and the final
+  DMG. This does not replace Developer ID signing or notarization.
