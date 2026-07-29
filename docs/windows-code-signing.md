@@ -1,8 +1,24 @@
 # Windows Code Signing
 
-Release tags use WiX to create an MSI package. Pull requests and `main` builds
-publish an unsigned MSI for installation testing. A `v*` tag must be signed by
+Release tags use WiX to create an MSI package. A manual workflow run publishes
+an unsigned MSI for installation testing. A `v*` tag must be signed by
 SignPath; the workflow refuses to publish an unsigned Windows release.
+
+## MSI Versioning
+
+WiX requires a numeric `major.minor.patch.build` version, whereas the
+user-facing Cargo version may use SemVer prerelease labels. The WiX-only
+`packaging/wix/Packager.toml` therefore owns the MSI version.
+
+For `v0.1.0-alpha.1`, the Cargo version remains `0.1.0-alpha.1`, while the
+MSI version is `0.0.0.1`. This keeps the alpha installer older than the future
+`0.1.0` final installer. Before publishing another prerelease, update the
+Windows version monotonically: `alpha.N` uses `0.0.0.N`, `beta.N` uses
+`0.0.1.N`, and `rc.N` uses `0.0.2.N`. Replace it with `0.1.0` for the final
+`v0.1.0` release.
+
+Do not use `0.1.0.1` for an alpha of `0.1.0`: Windows Installer considers it
+newer than the eventual `0.1.0` release.
 
 ## Repository Configuration
 
@@ -30,8 +46,8 @@ an Authenticode signature as part of the same SignPath request.
 
 ## Release Behavior
 
-- `pull_request`, `workflow_dispatch`, and pushes to `main`: unsigned MSI,
-  DMG, DEB, and AppImage artifacts for test installation.
+- `workflow_dispatch`: unsigned MSI, DMG, DEB, and AppImage artifacts for test
+  installation.
 - `v*` tags: the Windows MSI is signed through SignPath and only the signed MSI
   is retained as `remcmd-windows`.
 - macOS: the DMG remains unsigned until Developer ID signing and notarization

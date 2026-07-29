@@ -2,22 +2,8 @@ name: Package
 
 on:
     workflow_dispatch:
-    pull_request:
-        paths:
-            - ".github/workflows/package.yml"
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "crates/**"
-            - "assets/icons/**"
     push:
-        branches: [main]
         tags: ["v*"]
-        paths:
-            - ".github/workflows/package.yml"
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "crates/**"
-            - "assets/icons/**"
 
 permissions:
     actions: read
@@ -79,7 +65,12 @@ jobs:
               run: cargo install cargo-packager --locked --version 0.11.8
 
             - name: Build installation package
+              if: runner.os != 'Windows'
               run: cargo packager --release -p remcmd-app --formats ${{ matrix.formats }}
+
+            - name: Build Windows MSI
+              if: runner.os == 'Windows'
+              run: cargo packager --config packaging/wix/Packager.toml --formats wix
 
             - name: Verify SignPath release configuration
               if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
