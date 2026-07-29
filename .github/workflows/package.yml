@@ -11,12 +11,17 @@ on:
             - "assets/icons/**"
     push:
         branches: [main]
+        tags: ["v*"]
         paths:
             - ".github/workflows/package.yml"
             - "Cargo.toml"
             - "Cargo.lock"
             - "crates/**"
             - "assets/icons/**"
+
+permissions:
+    actions: read
+    contents: read
 
 jobs:
     package:
@@ -33,9 +38,9 @@ jobs:
                       path: target/release/*.dmg
                     - name: Windows
                       os: windows-latest
-                      formats: nsis
+                      formats: wix
                       artifact: remcmd-windows
-                      path: target/release/*-setup.exe
+                      path: target/release/*.msi
                     - name: Linux
                       os: ubuntu-22.04
                       formats: deb,appimage
@@ -76,10 +81,66 @@ jobs:
             - name: Build installation package
               run: cargo packager --release -p remcmd-app --formats ${{ matrix.formats }}
 
+            - name: Verify SignPath release configuration
+              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+              shell: bash
+              env:
+                  SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+                  SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+                  SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+                  SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+                  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+              run: |
+                  for variable in \
+                    SIGNPATH_API_TOKEN \
+                    SIGNPATH_ORGANIZATION_ID \
+                    SIGNPATH_PROJECT_SLUG \
+                    SIGNPATH_SIGNING_POLICY_SLUG \
+                    SIGNPATH_ARTIFACT_CONFIGURATION_SLUG; do
+                    if [ -z "${!variable}" ]; then
+                      echo "Missing required SignPath configuration: ${variable}" >&2
+                      exit 1
+                    fi
+                  done
+
+            - name: Upload unsigned Windows package for SignPath
+              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+              id: upload-unsigned-windows-package
+              uses: actions/upload-artifact@v4
+              with:
+                  name: remcmd-windows-unsigned
+                  path: target/release/*.msi
+                  if-no-files-found: error
+                  retention-days: 1
+
+            - name: Sign Windows package with SignPath
+              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+              uses: signpath/github-action-submit-signing-request@v2
+              with:
+                  api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+                  organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+                  project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+                  signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+                  artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+                  github-artifact-id: ${{ steps.upload-unsigned-windows-package.outputs.artifact-id }}
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  wait-for-completion: true
+                  output-artifact-directory: target/release/signed
+
             - name: Upload package artifact
+              if: matrix.name != 'Windows' || !startsWith(github.ref, 'refs/tags/v')
               uses: actions/upload-artifact@v4
               with:
                   name: ${{ matrix.artifact }}
                   path: ${{ matrix.path }}
+                  if-no-files-found: error
+                  retention-days: 14
+
+            - name: Upload signed Windows package artifact
+              if: matrix.name == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+              uses: actions/upload-artifact@v4
+              with:
+                  name: remcmd-windows
+                  path: target/release/signed/**/*.msi
                   if-no-files-found: error
                   retention-days: 14
