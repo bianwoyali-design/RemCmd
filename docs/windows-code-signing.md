@@ -8,7 +8,9 @@ builds and `v*` tags publish unsigned Windows artifacts.
 
 WiX requires a numeric `major.minor.patch.build` version, whereas the
 user-facing Cargo version may use SemVer prerelease labels. The WiX-only
-`packaging/wix/Packager.toml` therefore owns the MSI version.
+`packaging/wix/windows.toml` therefore owns the MSI version. Its name avoids
+`cargo-packager`'s automatic `Packager.toml` discovery, so the WiX-only version
+cannot create an extra macOS or Linux package.
 
 For `v0.1.0-alpha.1`, the Cargo version remains `0.1.0-alpha.1`, while the
 MSI version is `0.0.0.1`. This keeps the alpha installer older than the future

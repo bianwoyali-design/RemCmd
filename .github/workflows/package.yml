@@ -70,7 +70,7 @@ jobs:
 
             - name: Build Windows MSI
               if: runner.os == 'Windows'
-              run: cargo packager --config packaging/wix/Packager.toml --formats wix
+              run: cargo packager --config packaging/wix/windows.toml --formats wix
 
             - name: Name Windows installer for the release
               if: runner.os == 'Windows'
