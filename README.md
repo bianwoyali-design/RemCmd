@@ -1,4 +1,29 @@
-# RemCmd
+ <p align="center">
+    <img src="assets/icons/remcmd.svg" alt="RemCmd" width="128" />
+</p>
+
+<h1 align="center">RemCmd</h1>
+
+<p align="center">
+    A GPU-accelerated SSH terminal and SFTP client built with Rust.
+    <br />
+    <a href="https://github.com/bianwoyali-design/RemCmd/actions/
+    workflows/ci.yml">
+      <img alt="CI" src="https://github.com/bianwoyali-design/RemCmd/actions/workflows/ci.yml/badge.svg?branch=main" />
+    </a>
+    <a href="LICENSE">
+      <img alt="License" src="https://img.shields.io/badge/license-
+      Apache--2.0-blue.svg" />
+    </a>
+    <img alt="Platform" src="https://img.shields.io/badge/platform-
+    macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" />
+    <a href="https://www.rust-lang.org/">
+      <img alt="Rust" src="https://img.shields.io/badge/rust-1.96%2B-
+      dea584?logo=rust&logoColor=white" />
+    </a>
+</p>
+
+## About
 
 RemCmd is a GPU-accelerated SSH terminal and SFTP client built with Rust and
 GPUI. It combines saved SSH connections, interactive terminal sessions, split
@@ -28,9 +53,12 @@ RemCmd is currently in alpha. Download the latest build from the
 
 Release assets are currently available for:
 
-- macOS on Apple silicon (`.dmg`)
-- Windows x86_64 (`.msi`)
-- Linux x86_64 (`.deb` and `.AppImage`)
+| Platform | Download | Notes |
+|----------|----------|-------|
+| macOS | `RemCmd-v*-macos-aarch64.dmg` | For Apple Silicon Mac |
+| Linux | `RemCmd-v*-linux-x86_64.deb` | For Debian/Ubuntu Linux Distro |
+| Linux | `RemCmd-v*-linux-x86_64.AppImage` | For Linux running directly |
+| Windows | `RemCmd-v*-windows-x86_64.msi` | For Windows Installer |
 
 See the [installation guide](docs/installation.md) for platform-specific
 steps and alpha limitations. macOS users should also read the
@@ -50,8 +78,32 @@ profile JSON file.
 
 ## Build From Source
 
-RemCmd requires Rust 1.96.1. On macOS, install full Xcode because GPUI builds
-Metal shaders. Then run:
+### Prerequisites
+
+RemCmd requires **Rust 1.96.1** (install via [rustup](https://rustup.rs/)).
+
+**macOS** — Xcode Command Line Tools:
+
+**Linux (Debian / Ubuntu)**:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+     libegl1-mesa-dev \
+     libfontconfig1-dev \
+     libwayland-dev \
+     libx11-xcb-dev \
+     libxkbcommon-dev \
+     libxkbcommon-x11-dev \
+     libdbus-1-dev \
+     pkg-config
+```
+
+**Windows** — MSVC toolchain (ships with Visual Studio Build Tools).
+
+### Build & run
+
+Clone this repository first.
 
 ```bash
 cargo run -p remcmd-app
@@ -64,6 +116,16 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## Data Storage
+
+App data lives under the platform-standard directory:
+
+| Platform | Path |
+|----------|------|
+| macOS | `~/Library/Application Support/RemCmd/` |
+| Linux | `~/.local/share/RemCmd/` |
+| Windows | `%APPDATA%\RemCmd\` |
 
 ## Documentation
 
