@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible problem in RemCmd.
+title: "[Bug]: "
+labels:
+    - bug
+body:
+    - type: markdown
+      attributes:
+          value: |
+              Do not include passwords, private keys, host names, IP addresses,
+              or unredacted terminal output.
+    - type: input
+      id: version
+      attributes:
+          label: RemCmd version
+          description: Include the release tag or commit SHA.
+          placeholder: v0.1.0-alpha.1
+      validations:
+          required: true
+    - type: dropdown
+      id: platform
+      attributes:
+          label: Platform
+          options:
+              - macOS
+              - Windows
+              - Linux
+              - Other
+      validations:
+          required: true
+    - type: textarea
+      id: steps
+      attributes:
+          label: Steps to reproduce
+          description: Provide the smallest safe sequence that reproduces the issue.
+          placeholder: |
+              1. Create a connection with redacted test values.
+              2. Connect to the test server.
+              3. Open Remote Files.
+      validations:
+          required: true
+    - type: textarea
+      id: expected
+      attributes:
+          label: Expected behavior
+      validations:
+          required: true
+    - type: textarea
+      id: actual
+      attributes:
+          label: Actual behavior
+      validations:
+          required: true
+    - type: textarea
+      id: logs
+      attributes:
+          label: Safe diagnostics
+          description: Include only redacted errors, logs, or screenshots.
+          render: text
