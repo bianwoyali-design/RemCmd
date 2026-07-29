@@ -9,16 +9,16 @@ come from the official `bianwoyali-design/RemCmd` repository before installing.
 
 The current macOS build supports Apple silicon and requires macOS 13 or later.
 
-1. Download the `.dmg` file.
+1. Download the `RemCmd-v*-macos-aarch64.dmg` file.
 2. Follow the [macOS installation notes](macos-installation.md) to open the
    DMG and move `RemCmd.app` to Applications.
 
-The alpha DMG uses an ad-hoc signature and is not notarized. Gatekeeper needs a
+The DMG uses an ad-hoc signature and is not notarized. Gatekeeper needs a
 one-time confirmation for both the DMG and the app.
 
 ## Windows
 
-Download and run the x86_64 `.msi` installer. The current installer is not yet
+Download and run the `RemCmd-v*-windows-x86_64.msi` installer. The current installer is not yet
 Authenticode-signed, so Microsoft Defender SmartScreen can require an explicit
 confirmation. Check that the installer came from the official release before
 choosing **More info** and **Run anyway**.
@@ -27,10 +27,10 @@ choosing **More info** and **Run anyway**.
 
 ### Debian and Ubuntu
 
-Download the `amd64.deb` package, then install it with:
+Download the `RemCmd-v*-linux-x86_64.deb` package, then install it with:
 
 ```bash
-sudo apt install ./remcmd_0.1.0-alpha.1_amd64.deb
+sudo apt install ./RemCmd-v*-linux-x86_64.deb
 ```
 
 ### AppImage
@@ -38,8 +38,8 @@ sudo apt install ./remcmd_0.1.0-alpha.1_amd64.deb
 Download the x86_64 AppImage, make it executable, then run it:
 
 ```bash
-chmod +x remcmd_0.1.0-alpha.1_x86_64.AppImage
-./remcmd_0.1.0-alpha.1_x86_64.AppImage
+chmod +x RemCmd-v*-linux-x86_64.AppImage
+./RemCmd-v*-linux-x86_64.AppImage
 ```
 
 RemCmd needs a Wayland or X11 desktop session. A bare WSL terminal has no
