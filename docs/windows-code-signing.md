@@ -56,6 +56,9 @@ an Authenticode signature as part of the same SignPath request.
 
 - `workflow_dispatch`: unsigned Windows MSI, ad-hoc-signed macOS DMG, DEB,
   and AppImage artifacts for test installation.
+- `workflow_dispatch` with `release_tag` set to an existing `v*` tag: rebuild
+  the packages and create that tag's GitHub release. This is the recovery path
+  for a failed release job without moving the tag.
 - `v*` tags: create a GitHub prerelease when the tag contains a prerelease
   suffix and attach the unsigned Windows MSI, ad-hoc-signed macOS DMG, DEB,
   and AppImage.
