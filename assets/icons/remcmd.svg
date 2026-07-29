@@ -55,7 +55,7 @@
   <!-- ================= base tile ================= -->
   <rect width="1024" height="1024" rx="242" fill="url(#bg)"/>
   <rect width="1024" height="1024" rx="242" fill="url(#bgGlow)"/>
-  <rect width="1024" height="524" rx="242" fill="url(#glassSheen)" opacity="0.55"/>
+  <rect x="10" y="10" width="1004" height="504" rx="232" fill="url(#glassSheen)" opacity="0.55"/>
   <rect x="3" y="3" width="1018" height="1018" rx="239" fill="none" stroke="#001a4d" stroke-opacity="0.35" stroke-width="6"/>
 
   <!-- ================= glass terminal window ================= -->

@@ -1,0 +1,21 @@
+# WiX accepts only a numeric MSI ProductVersion. Keep this separate from the
+# user-facing Cargo prerelease version; see docs/windows-code-signing.md.
+name = "remcmd-app"
+product-name = "RemCmd"
+version = "0.0.0+1"
+identifier = "io.github.bianwoyali-design.remcmd"
+category = "DeveloperTool"
+formats = ["wix"]
+before-packaging-command = "cargo build --release -p remcmd-app"
+license-file = "../../LICENSE"
+out-dir = "../../target/release"
+binaries-dir = "../../target/release"
+icons = [
+    "../../assets/icons/remcmd.icns",
+    "../../assets/icons/remcmd.ico",
+    "../../assets/icons/remcmd-*.png",
+]
+
+[[binaries]]
+path = "remcmd"
+main = true
