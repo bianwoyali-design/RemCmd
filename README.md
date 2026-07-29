@@ -8,18 +8,12 @@
     A GPU-accelerated SSH terminal and SFTP client built with Rust.
     <br />
     <a href="https://github.com/bianwoyali-design/RemCmd/actions/
-    workflows/ci.yml">
-      <img alt="CI" src="https://github.com/bianwoyali-design/RemCmd/actions/workflows/ci.yml/badge.svg?branch=main" />
+    workflows/ci.yml"><img alt="CI" src="https://github.com/bianwoyali-design/RemCmd/actions/workflows/ci.yml/badge.svg?branch=main" />
     </a>
-    <a href="LICENSE">
-      <img alt="License" src="https://img.shields.io/badge/license-
-      Apache--2.0-blue.svg" />
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" />
     </a>
-    <img alt="Platform" src="https://img.shields.io/badge/platform-
-    macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" />
-    <a href="https://www.rust-lang.org/">
-      <img alt="Rust" src="https://img.shields.io/badge/rust-1.96%2B-
-      dea584?logo=rust&logoColor=white" />
+    <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" />
+    <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-1.96%2B-dea584?logo=rust&logoColor=white" />
     </a>
 </p>
 
