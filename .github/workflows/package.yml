@@ -109,7 +109,7 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   set -euo pipefail
-                  args=(release create "$GITHUB_REF_NAME" release-artifacts/* --title "$GITHUB_REF_NAME" --generate-notes)
+                  args=(release create "$GITHUB_REF_NAME" release-artifacts/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes)
                   if [[ "$GITHUB_REF_NAME" == *-* ]]; then
                     args+=(--prerelease)
                   fi
