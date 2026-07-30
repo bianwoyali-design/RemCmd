@@ -13,7 +13,7 @@ mod pane_layout;
 use pane_layout::{PaneId, PaneLayout, SplitAxis};
 
 mod icons;
-use icons::{IconName, RemCmdAssets, icon, icon_with_color};
+use icons::{IconName, RemCmdAssets, app_icon, icon, icon_with_color, wordmark};
 
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
@@ -123,6 +123,8 @@ const TITLEBAR_CONTROL_HOVER_SIZE: f32 = 28.0;
 const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
 const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
 const TITLEBAR_LEFT_CONTROL_EDGE_GAP: f32 = 10.0;
+const WINDOWS_TITLEBAR_BUTTON_WIDTH: f32 = 46.0;
+const WINDOWS_TITLEBAR_CONTROLS_WIDTH: f32 = WINDOWS_TITLEBAR_BUTTON_WIDTH * 3.0;
 const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
 const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
 const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
@@ -146,6 +148,7 @@ gpui::actions!(
     app_menu,
     [
         ShowHome,
+        ShowAbout,
         ShowSettings,
         NewConnection,
         NewLocalTerminal,
@@ -246,6 +249,7 @@ struct RemCmdApp {
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
+    about_window: Option<WindowHandle<AboutWindow>>,
     _appearance_subscription: Subscription,
 }
 
@@ -451,6 +455,8 @@ struct CommandTooltip {
     theme: Theme,
 }
 
+struct AboutWindow;
+
 impl Render for CommandTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -469,6 +475,61 @@ impl Render for CommandTooltip {
             .text_sm()
             .text_color(self.theme.text_primary)
             .child(self.label.clone())
+    }
+}
+
+impl Render for AboutWindow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+
+        div()
+            .flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(theme.panel_bg)
+            .text_color(theme.text_primary)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .text_center()
+                    .child(
+                        div()
+                            .size(px(96.0))
+                            .rounded_lg()
+                            .shadow(vec![BoxShadow {
+                                color: theme.shadow,
+                                offset: point(px(0.0), px(5.0)),
+                                blur_radius: px(18.0),
+                                spread_radius: px(-6.0),
+                            }])
+                            .child(app_icon(96.0)),
+                    )
+                    .child(div().mt_5().child(wordmark(theme, 174.0, 38.0)))
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_sm()
+                            .text_color(theme.text_muted)
+                            .child("Remote workspaces, files, and terminals in one native app."),
+                    )
+                    .child(
+                        div()
+                            .mt_5()
+                            .text_xs()
+                            .text_color(theme.text_faint)
+                            .child("Licensed under Apache-2.0"),
+                    ),
+            )
     }
 }
 
@@ -2121,6 +2182,7 @@ impl RemCmdApp {
             theme,
             settings_path,
             settings_error,
+            about_window: None,
             _appearance_subscription: appearance_subscription,
         };
 
@@ -4487,6 +4549,27 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn show_about(&mut self, cx: &mut Context<Self>) {
+        if let Some(window_handle) = self.about_window
+            && window_handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            return;
+        }
+
+        let options = about_window_options(cx);
+        match cx.open_window(options, |_, cx| cx.new(|_| AboutWindow)) {
+            Ok(window_handle) => {
+                self.about_window = Some(window_handle);
+            }
+            Err(error) => {
+                self.settings_error = Some(format!("Failed to open About window: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
     fn connected_ssh_profile_ids(&self) -> Vec<String> {
         self.profiles
             .iter()
@@ -4704,6 +4787,14 @@ impl RemCmdApp {
     }
 
     fn toggle_sidebar_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(target_os = "windows") {
+            if !self.left_sidebar_open {
+                self.toggle_left_sidebar(cx);
+            }
+            self.sidebar_search.focus_handle(cx).focus(window);
+            return;
+        }
+
         self.sidebar_search_visible = !self.sidebar_search_visible;
         if self.sidebar_search_visible {
             self.sidebar_search.focus_handle(cx).focus(window);
@@ -7198,6 +7289,67 @@ impl RemCmdApp {
         })
     }
 
+    fn render_windows_titlebar_controls(&self) -> gpui::Div {
+        let hover = self.theme.control_hover_bg;
+        let pressed = self.theme.control_pressed_bg;
+        let glyph = self.theme.text_muted;
+
+        let minimize = div()
+            .id("minimize_window")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
+            .h_full()
+            .window_control_area(WindowControlArea::Min)
+            .hover(move |this| this.bg(hover))
+            .active(move |this| this.bg(pressed))
+            .child(div().w(px(10.0)).h(px(1.0)).bg(glyph));
+        let maximize = div()
+            .id("maximize_window")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
+            .h_full()
+            .window_control_area(WindowControlArea::Max)
+            .hover(move |this| this.bg(hover))
+            .active(move |this| this.bg(pressed))
+            .child(
+                div()
+                    .size(px(10.0))
+                    .border_1()
+                    .border_color(glyph)
+                    .rounded(px(1.0)),
+            );
+        let close_hover = self.theme.danger;
+        let close_pressed = self.theme.danger_hover;
+        let close = div()
+            .id("close_window")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
+            .h_full()
+            .window_control_area(WindowControlArea::Close)
+            .hover(move |this| this.bg(close_hover))
+            .active(move |this| this.bg(close_pressed))
+            .child(icon_with_color(IconName::Cancel, glyph, 11.0));
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .w(px(WINDOWS_TITLEBAR_CONTROLS_WIDTH))
+            .h_full()
+            .child(minimize)
+            .child(maximize)
+            .child(close)
+    }
+
     fn render_titlebar_action_group(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let local_active = self.active_session().is_some_and(TerminalSession::is_local);
         let can_create_terminal = self.active_panel == ActivePanel::Connection
@@ -7337,9 +7489,16 @@ impl RemCmdApp {
         width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let titlebar_width = (width
+            - if cfg!(target_os = "windows") {
+                WINDOWS_TITLEBAR_CONTROLS_WIDTH
+            } else {
+                0.0
+            })
+        .max(0.0);
         let open = self.right_sidebar_open;
-        let start_width = if open { 0.0 } else { width };
-        let end_width = if open { width } else { 0.0 };
+        let start_width = if open { 0.0 } else { titlebar_width };
+        let end_width = if open { titlebar_width } else { 0.0 };
         let mut tabs = div()
             .id("right_sidebar_titlebar_tabs")
             .relative()
@@ -7415,7 +7574,11 @@ impl RemCmdApp {
             .id("right_sidebar_titlebar")
             .absolute()
             .top(px(-1.0))
-            .right_0()
+            .right(px(if cfg!(target_os = "windows") {
+                WINDOWS_TITLEBAR_CONTROLS_WIDTH
+            } else {
+                0.0
+            }))
             .flex()
             .items_center()
             .justify_center()
@@ -7495,18 +7658,22 @@ impl RemCmdApp {
         };
         let end_width = if open { expanded_width } else { 0.0 };
 
-        titlebar.child(
-            div().flex_none().h_full().with_animation(
-                SharedString::from(format!("titlebar-right-spacer-{transition_id}-{open}")),
-                Animation::new(if transition_id == 0 {
-                    MOTION_INSTANT_DURATION
-                } else {
-                    MOTION_STANDARD_DURATION
-                })
-                .with_easing(ease_in_out),
-                move |this, delta| this.w(px(start_width + (end_width - start_width) * delta)),
-            ),
-        )
+        titlebar
+            .child(
+                div().flex_none().h_full().with_animation(
+                    SharedString::from(format!("titlebar-right-spacer-{transition_id}-{open}")),
+                    Animation::new(if transition_id == 0 {
+                        MOTION_INSTANT_DURATION
+                    } else {
+                        MOTION_STANDARD_DURATION
+                    })
+                    .with_easing(ease_in_out),
+                    move |this, delta| this.w(px(start_width + (end_width - start_width) * delta)),
+                ),
+            )
+            .when(cfg!(target_os = "windows"), |this| {
+                this.child(self.render_windows_titlebar_controls())
+            })
     }
 
     fn render_titlebar_tabs(
@@ -7522,8 +7689,15 @@ impl RemCmdApp {
         };
         let leading_width = self.titlebar_leading_width(window);
         let expanded_right_sidebar_width = self.effective_right_sidebar_width(window);
+        let windows_titlebar_controls_width = if cfg!(target_os = "windows") {
+            WINDOWS_TITLEBAR_CONTROLS_WIDTH
+        } else {
+            0.0
+        };
+        let expanded_right_titlebar_width =
+            (expanded_right_sidebar_width - windows_titlebar_controls_width).max(0.0);
         let titlebar_right_inset = if self.right_sidebar_open {
-            expanded_right_sidebar_width
+            expanded_right_titlebar_width
         } else {
             0.0
         };
@@ -7557,6 +7731,10 @@ impl RemCmdApp {
             .flex_none()
             .items_center()
             .h_full()
+            .when(
+                cfg!(target_os = "windows") && self.left_sidebar_open,
+                |this| this.child(self.render_sidebar_wordmark()),
+            )
             .child(drag_area().flex_1())
             .child(left_sidebar_group)
             .child(drag_area().w(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP)))
@@ -7585,6 +7763,9 @@ impl RemCmdApp {
             .h(px(TITLEBAR_HEIGHT))
             .flex()
             .items_center()
+            .when(cfg!(target_os = "windows"), |this| {
+                this.bg(self.theme.sidebar_bg)
+            })
             .child(leading);
 
         if self.tab_layout == TabLayout::Vertical {
@@ -7592,7 +7773,7 @@ impl RemCmdApp {
                 .child(drag_area().flex_1())
                 .child(self.render_titlebar_action_group(cx))
                 .child(drag_area().w(px(12.0)));
-            return self.animate_titlebar_right_edge(titlebar, expanded_right_sidebar_width);
+            return self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width);
         }
 
         let tab_labels = self
@@ -7607,6 +7788,7 @@ impl RemCmdApp {
         let track_width = (f32::from(window.viewport_size().width)
             - leading_width
             - titlebar_right_inset
+            - windows_titlebar_controls_width
             - 24.0
             - 8.0
             - TITLEBAR_ACTION_GROUP_WIDTH)
@@ -7971,7 +8153,7 @@ impl RemCmdApp {
         }
 
         let titlebar = titlebar.child(controls.child(self.render_titlebar_action_group(cx)));
-        self.animate_titlebar_right_edge(titlebar, expanded_right_sidebar_width)
+        self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width)
     }
 
     fn has_terminal_workspace(&self, profile_id: &str) -> bool {
@@ -8669,6 +8851,16 @@ impl RemCmdApp {
             .child(modal)
     }
 
+    fn render_sidebar_wordmark(&self) -> gpui::Div {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(24.0))
+            .ml_2()
+            .child(wordmark(self.theme, 108.0, 24.0))
+    }
+
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.sidebar_search.read(cx).text().trim().to_lowercase();
         let list_hover_background = self.theme.list_hover_bg;
@@ -8919,66 +9111,102 @@ impl RemCmdApp {
             .flex_none()
             .w(px(width))
             .ml(px(-12.0))
-            .mt_3()
+            .mt_4()
             .pt(px(10.0))
             .pb(px(10.0))
             .border_t_1()
             .border_color(self.theme.border)
             .child(
                 div()
-                    .id("show_settings")
                     .flex()
+                    .w_full()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap_1()
                     .h(px(30.0))
-                    .mx_3()
-                    .px_2()
-                    .rounded_md()
-                    .bg(settings_background)
-                    .cursor_pointer()
-                    .hover(move |this| this.bg(settings_hover))
-                    .active(move |this| this.bg(pressed_background))
-                    .child(self.render_sidebar_icon(IconName::Settings, 18.0))
-                    .child("Settings")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.show_settings(window, cx);
-                    })),
+                    .pl_2()
+                    .pr_3()
+                    .child(
+                        div()
+                            .id("show_settings")
+                            .flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .items_center()
+                            .justify_start()
+                            .gap_2()
+                            .h_full()
+                            .pl_1()
+                            .pr_2()
+                            .rounded_md()
+                            .bg(settings_background)
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(settings_hover))
+                            .active(move |this| this.bg(pressed_background))
+                            .child(self.render_sidebar_icon(IconName::Settings, 17.0))
+                            .child("Settings")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_settings(window, cx);
+                            })),
+                    )
+                    .child(
+                        self.render_icon_button(
+                            "show_about",
+                            IconName::About,
+                            "About RemCmd",
+                            IconTone::Default,
+                            true,
+                        )
+                        .size(px(30.0))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_about(cx);
+                        })),
+                    ),
             );
 
         self.glass_sidebar_surface()
             .w(px(width))
             .px_3()
             .pt(px(TITLEBAR_HEIGHT))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_none()
-                    .h(px(34.0))
-                    .child(
-                        div()
-                            .ml_2()
-                            .text_size(px(18.0))
-                            .font_weight(FontWeight::BOLD)
-                            .child("RemCmd"),
-                    )
-                    .child(
-                        self.render_icon_button(
-                            "toggle_sidebar_search",
-                            IconName::Search,
-                            "Search connections",
-                            IconTone::Default,
-                            true,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_sidebar_search(window, cx);
-                        })),
-                    ),
-            )
-            .when(self.sidebar_search_visible, |this| {
-                this.child(div().flex_none().mt_2().child(self.sidebar_search.clone()))
+            .when(!cfg!(target_os = "windows"), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .flex_none()
+                        .h(px(34.0))
+                        .child(self.render_sidebar_wordmark())
+                        .child(
+                            self.render_icon_button(
+                                "toggle_sidebar_search",
+                                IconName::Search,
+                                "Search connections",
+                                IconTone::Default,
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.toggle_sidebar_search(window, cx);
+                                },
+                            )),
+                        ),
+                )
             })
+            .when(
+                cfg!(target_os = "windows") || self.sidebar_search_visible,
+                |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .mt(px(if cfg!(target_os = "windows") {
+                                6.0
+                            } else {
+                                8.0
+                            }))
+                            .child(self.sidebar_search.clone()),
+                    )
+                },
+            )
             .child(connection_tree)
             .child(settings_footer)
     }
@@ -14081,8 +14309,42 @@ fn main_window_titlebar() -> TitlebarOptions {
     {
         TitlebarOptions {
             title: Some("RemCmd".into()),
+            appears_transparent: cfg!(target_os = "windows"),
             ..Default::default()
         }
+    }
+}
+
+fn about_window_options(cx: &App) -> WindowOptions {
+    let window_size = size(px(440.0), px(380.0));
+    let titlebar = {
+        #[cfg(target_os = "macos")]
+        {
+            TitlebarOptions {
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(18.0), px(18.0))),
+                ..Default::default()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            TitlebarOptions {
+                title: Some("About RemCmd".into()),
+                ..Default::default()
+            }
+        }
+    };
+
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            window_size,
+            cx,
+        ))),
+        window_min_size: Some(window_size),
+        window_background: WindowBackgroundAppearance::Blurred,
+        titlebar: Some(titlebar),
+        ..Default::default()
     }
 }
 
@@ -14153,7 +14415,11 @@ fn bind_profile_editor_keys(cx: &mut App) {
 }
 
 fn application_menus() -> Vec<Menu> {
-    let mut application_items = vec![MenuItem::action("Settings...", ShowSettings)];
+    let mut application_items = vec![
+        MenuItem::action("About RemCmd", ShowAbout),
+        MenuItem::separator(),
+        MenuItem::action("Settings...", ShowSettings),
+    ];
     #[cfg(target_os = "macos")]
     application_items.push(MenuItem::os_submenu(
         "Services",
@@ -14256,6 +14522,9 @@ fn configure_application_menu(cx: &mut App) {
     ]);
     cx.on_action(|_: &ShowSettings, cx| {
         dispatch_main_window_action(cx, |this, window, cx| this.show_settings(window, cx));
+    });
+    cx.on_action(|_: &ShowAbout, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| this.show_about(cx));
     });
     cx.on_action(|_: &ShowHome, cx| {
         dispatch_main_window_action(cx, |this, window, cx| this.show_home(window, cx));
@@ -14471,12 +14740,17 @@ mod tests {
 
     #[test]
     fn application_menu_exposes_workspace_operations() {
-        let menu_names = application_menus()
-            .into_iter()
+        let menus = application_menus();
+        let menu_names = menus
+            .iter()
             .map(|menu| menu.name.to_string())
             .collect::<Vec<_>>();
 
         assert_eq!(menu_names, ["RemCmd", "File", "Terminal", "View", "Window"]);
+        assert!(matches!(
+            &menus[0].items[0],
+            MenuItem::Action { name, .. } if name.as_ref() == "About RemCmd"
+        ));
     }
 
     #[test]
