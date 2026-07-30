@@ -2,6 +2,49 @@
 
 All notable changes to RemCmd are documented in this file.
 
+## [Unreleased]
+
+## [0.1.0-beta.1] - 2026-07-30
+
+### Added
+
+- A RemCmd-owned vector wordmark, application About window, and About entries
+  in the sidebar and native application menu.
+- A transparent Windows titlebar with standard minimize, maximize, and close
+  hit targets, sidebar-backed glass styling, aligned branding, and a persistent
+  connection search field.
+
+### Changed
+
+- Terminal rendering now reuses unchanged snapshots, updates only damaged
+  rows, and coalesces redraw notifications to reduce CPU and GPU work.
+- SSH startup now races resolved addresses, enables `TCP_NODELAY`, batches
+  ready events, and keeps shell detection outside the visible terminal.
+- Shell working-directory integration installs after startup output settles,
+  preserving remote login banners and prompt engines while keeping integration
+  commands hidden.
+- Sidebar and titlebar transitions now share motion timing, and long
+  single-select menus virtualize their rows for smoother scrolling.
+
+### Fixed
+
+- Manual tab scrolling remains responsive while new-tab scroll animations run.
+- Opposite sidebar transitions no longer reposition the left sidebar control.
+- Single-select menus open near the selected option and retain full-width,
+  theme-correct hover rows.
+- Home connection rows preserve their rounded hover corners.
+
+### Known Limitations
+
+- macOS builds use an ad-hoc signature and require a Gatekeeper first-launch
+  exception.
+- Windows installers are not yet Authenticode-signed.
+- The Windows custom titlebar requires broader validation across Windows
+  versions and display scaling configurations.
+- SSH Agent authentication currently requires a Unix `SSH_AUTH_SOCK` and is
+  unavailable on Windows.
+- SFTP features require an SFTP subsystem on the remote server.
+
 ## [0.1.0-alpha.1] - 2026-07-29
 
 ### Added
@@ -33,3 +76,7 @@ All notable changes to RemCmd are documented in this file.
   first-launch exception.
 - Windows alpha installers are not yet Authenticode-signed.
 - SFTP features require an SFTP subsystem on the remote server.
+
+[Unreleased]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-beta.1...HEAD
+[0.1.0-beta.1]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-alpha.1...v0.1.0-beta.1
+[0.1.0-alpha.1]: https://github.com/bianwoyali-design/RemCmd/releases/tag/v0.1.0-alpha.1

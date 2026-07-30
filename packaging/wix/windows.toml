@@ -2,7 +2,7 @@
 # user-facing Cargo prerelease version; see docs/windows-code-signing.md.
 name = "remcmd-app"
 product-name = "RemCmd"
-version = "0.0.0+1"
+version = "0.0.1+1"
 identifier = "io.github.bianwoyali-design.remcmd"
 category = "DeveloperTool"
 formats = ["wix"]

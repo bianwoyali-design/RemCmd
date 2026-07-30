@@ -20,12 +20,14 @@ RemCmd is a GPU-accelerated SSH terminal and SFTP client built with Rust and
 GPUI. It combines saved SSH connections, interactive terminal sessions, split
 panes, remote file management, and local terminals in one desktop application.
 
-RemCmd is currently in alpha. Download the latest build from the
+RemCmd is currently in beta. Download the latest build from the
 [GitHub Releases page](https://github.com/bianwoyali-design/RemCmd/releases).
 
 ## Highlights
 
-- SSH Password, Private Key, Passwordless, and SSH Agent authentication.
+- SSH Password, Private Key, and Passwordless authentication on every
+  supported platform, plus Unix-socket SSH Agent authentication on macOS and
+  Linux.
 - Host-key verification backed by `~/.ssh/known_hosts`, including explicit
   first-use fingerprint review.
 - Interactive ANSI terminal with scrollback, selection, clipboard support,
@@ -52,13 +54,14 @@ Release assets are currently available for:
 | Windows | `RemCmd-v*-windows-x86_64.msi` | For Windows Installer |
 
 See the [installation guide](docs/installation.md) for platform-specific
-steps and alpha limitations. macOS users should also read the
+steps and beta limitations. macOS users should also read the
 [macOS installation notes](docs/macos-installation.md).
 
 ## First Connection
 
 1. Open **New Connection** and enter the server host, port, and user.
-2. Choose Password, Private Key, SSH Agent, or Passwordless authentication.
+2. Choose Password, Private Key, Passwordless, or SSH Agent authentication.
+   SSH Agent currently requires macOS or Linux and `SSH_AUTH_SOCK`.
 3. Connect and verify an unknown host-key fingerprint before trusting it.
 4. Open **Remote Files** after connection when the server offers an SFTP
    subsystem.
@@ -121,8 +124,9 @@ App data lives under the platform-standard directory:
 ## Documentation
 
 - [Installation](docs/installation.md)
-- [macOS alpha installation](docs/macos-installation.md)
+- [macOS installation](docs/macos-installation.md)
 - [Windows packaging and future signing](docs/windows-code-signing.md)
+- [Release process](docs/releasing.md)
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
 

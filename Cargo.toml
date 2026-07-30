@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 rust-version = "1.96"
 repository = "https://github.com/bianwoyali-design/RemCmd"
 description = "A GPU-accelerated SSH terminal and SFTP client"
