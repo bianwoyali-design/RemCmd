@@ -760,6 +760,13 @@ pub fn bind_text_field_keys(cx: &mut App) {
         KeyBinding::new("end", End, Some("TextField")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextField")),
     ]);
+    #[cfg(target_os = "windows")]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-a", SelectAll, Some("TextField")),
+        KeyBinding::new("ctrl-v", Paste, Some("TextField")),
+        KeyBinding::new("ctrl-c", Copy, Some("TextField")),
+        KeyBinding::new("ctrl-x", Cut, Some("TextField")),
+    ]);
 }
 
 #[cfg(test)]

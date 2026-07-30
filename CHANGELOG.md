@@ -10,9 +10,9 @@ All notable changes to RemCmd are documented in this file.
 
 - A RemCmd-owned vector wordmark, application About window, and About entries
   in the sidebar and native application menu.
-- A transparent Windows titlebar with standard minimize, maximize, and close
-  hit targets, sidebar-backed glass styling, aligned branding, and a persistent
-  connection search field.
+- A Windows-specific glass titlebar with the RemCmd icon and identity, standard
+  minimize, maximize, and close hit targets, a persistent connection search
+  field, and functional File, Edit, Terminal, View, Window, and Help menus.
 
 ### Changed
 
@@ -39,8 +39,8 @@ All notable changes to RemCmd are documented in this file.
 - macOS builds use an ad-hoc signature and require a Gatekeeper first-launch
   exception.
 - Windows installers are not yet Authenticode-signed.
-- The Windows custom titlebar requires broader validation across Windows
-  versions and display scaling configurations.
+- The Windows glass titlebar and menu placement require broader validation
+  across Windows versions and display scaling configurations.
 - SSH Agent authentication currently requires a Unix `SSH_AUTH_SOCK` and is
   unavailable on Windows.
 - SFTP features require an SFTP subsystem on the remote server.
