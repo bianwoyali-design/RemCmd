@@ -1,13 +1,20 @@
 use std::borrow::Cow;
 
-use gpui::{AnyElement, AssetSource, Hsla, IntoElement, Result, SharedString, prelude::*, px, svg};
+use gpui::{
+    AnyElement, AssetSource, Hsla, IntoElement, Result, SharedString, div, img, prelude::*, px, svg,
+};
 
 use crate::theme::{IconTone, Theme};
+
+const APP_ICON_PATH: &str = "brand/remcmd-app-icon.png";
+const WORDMARK_REM_PATH: &str = "brand/remcmd-wordmark-rem.svg";
+const WORDMARK_COMMAND_PATH: &str = "brand/remcmd-wordmark-command.svg";
 
 // RemCmd-owned icon paths use a shared 24px view box with rounded caps and joins.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum IconName {
     Add,
+    About,
     ArrowLeft,
     ArrowUp,
     Cancel,
@@ -49,6 +56,7 @@ impl IconName {
     const fn asset_path(self) -> &'static str {
         match self {
             Self::Add => "icons/add.svg",
+            Self::About => "icons/about.svg",
             Self::ArrowLeft => "icons/arrow-left.svg",
             Self::ArrowUp => "icons/arrow-up.svg",
             Self::Cancel => "icons/cancel.svg",
@@ -90,6 +98,7 @@ impl IconName {
     fn from_asset_path(path: &str) -> Option<Self> {
         Some(match path {
             "icons/add.svg" => Self::Add,
+            "icons/about.svg" => Self::About,
             "icons/arrow-left.svg" => Self::ArrowLeft,
             "icons/arrow-up.svg" => Self::ArrowUp,
             "icons/cancel.svg" => Self::Cancel,
@@ -133,6 +142,9 @@ impl IconName {
         match self {
             Self::Add => {
                 r#"<path d="M4 12H20" stroke-width="1.4"/><path d="M12 4V20" stroke-width="1.4"/>"#
+            }
+            Self::About => {
+                r#"<circle cx="12" cy="12" r="9.25"/><circle cx="12" cy="7.5" r="0.75" fill="currentColor" stroke="none"/><path d="M12 11v6"/>"#
             }
             Self::ArrowLeft => r#"<path d="M15.25 3.5 7.75 12l7.5 8.5"/>"#,
             Self::ArrowUp => r#"<path d="m3.5 15.25 8.5-7.5 8.5 7.5"/>"#,
@@ -247,6 +259,22 @@ pub(crate) struct RemCmdAssets;
 
 impl AssetSource for RemCmdAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == APP_ICON_PATH {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../../assets/icons/remcmd-256.png"
+            ))));
+        }
+        if path == WORDMARK_REM_PATH {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../../assets/icons/remcmd-wordmark-rem.svg"
+            ))));
+        }
+        if path == WORDMARK_COMMAND_PATH {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../../assets/icons/remcmd-wordmark-command.svg"
+            ))));
+        }
+
         Ok(IconName::from_asset_path(path)
             .map(build_svg)
             .map(String::into_bytes)
@@ -276,6 +304,35 @@ pub(crate) fn icon_with_color(name: IconName, color: Hsla, size: f32) -> AnyElem
         .into_any_element()
 }
 
+pub(crate) fn app_icon(size: f32) -> AnyElement {
+    img(APP_ICON_PATH).size(px(size)).into_any_element()
+}
+
+pub(crate) fn wordmark(theme: Theme, width: f32, height: f32) -> AnyElement {
+    div()
+        .relative()
+        .flex_none()
+        .w(px(width))
+        .h(px(height))
+        .child(
+            svg()
+                .absolute()
+                .inset_0()
+                .path(WORDMARK_REM_PATH)
+                .size_full()
+                .text_color(theme.text_primary),
+        )
+        .child(
+            svg()
+                .absolute()
+                .inset_0()
+                .path(WORDMARK_COMMAND_PATH)
+                .size_full()
+                .text_color(theme.accent),
+        )
+        .into_any_element()
+}
+
 fn build_svg(name: IconName) -> String {
     format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.333333" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
@@ -301,7 +358,9 @@ mod tests {
     fn asset_source_serves_known_icons_only() {
         let assets = RemCmdAssets;
 
+        assert!(assets.load(APP_ICON_PATH).unwrap().is_some());
         assert!(assets.load("icons/add.svg").unwrap().is_some());
+        assert!(assets.load("icons/about.svg").unwrap().is_some());
         assert!(assets.load("icons/check.svg").unwrap().is_some());
         assert!(assets.load("icons/copy.svg").unwrap().is_some());
         assert!(assets.load("icons/edit.svg").unwrap().is_some());
@@ -309,6 +368,25 @@ mod tests {
         assert!(assets.load("icons/performance.svg").unwrap().is_some());
         assert!(assets.load("icons/picker.svg").unwrap().is_some());
         assert!(assets.load("icons/view.svg").unwrap().is_some());
+        assert!(assets.load(WORDMARK_REM_PATH).unwrap().is_some());
+        assert!(assets.load(WORDMARK_COMMAND_PATH).unwrap().is_some());
         assert!(assets.load("icons/unknown.svg").unwrap().is_none());
+    }
+
+    #[test]
+    fn wordmark_uses_vector_paths_without_font_dependencies() {
+        let rem = std::str::from_utf8(include_bytes!(
+            "../../../assets/icons/remcmd-wordmark-rem.svg"
+        ))
+        .expect("Rem wordmark SVG is UTF-8");
+        let command = std::str::from_utf8(include_bytes!(
+            "../../../assets/icons/remcmd-wordmark-command.svg"
+        ))
+        .expect("Cmd wordmark SVG is UTF-8");
+
+        assert!(rem.contains(r#"viewBox="0 0 128 28""#));
+        assert!(command.contains(r#"stroke-width="3.5""#));
+        assert!(!rem.contains("<text"));
+        assert!(!command.contains("<text"));
     }
 }
