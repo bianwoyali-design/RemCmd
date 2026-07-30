@@ -307,19 +307,20 @@ async fn event_receiver_preserves_event_order() {
         Some(ConnectionEvent::StateChanged(SessionState::Connecting))
     );
     assert_eq!(
-        receiver.next_event().await,
+        receiver.try_next_event(),
         Some(ConnectionEvent::StateChanged(SessionState::Authenticating))
     );
     assert_eq!(
-        receiver.next_event().await,
+        receiver.try_next_event(),
         Some(ConnectionEvent::Resized(resized))
     );
     assert_eq!(
-        receiver.next_event().await,
+        receiver.try_next_event(),
         Some(ConnectionEvent::Shell(ShellEvent::Output(
             b"prompt".to_vec()
         )))
     );
+    assert_eq!(receiver.try_next_event(), None);
 }
 
 fn test_profile(port: u16) -> ConnectionProfile {

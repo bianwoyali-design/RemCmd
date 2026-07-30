@@ -8,7 +8,11 @@ use std::{
 };
 
 use remcmd_core::ConnectionProfile;
-use tokio::{runtime::Handle, sync::mpsc};
+use tokio::{
+    runtime::Handle,
+    sync::mpsc,
+    time::{Instant, sleep_until},
+};
 
 use crate::{
     AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteDirectoryTree, RemoteFile,
@@ -21,6 +25,7 @@ use crate::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Commands sent from the application to one running SSH session.
 ///
@@ -362,6 +367,11 @@ impl ConnectionEventReceiver {
     /// Waits for the next event, returning None after the worker exits.
     pub async fn next_event(&mut self) -> Option<ConnectionEvent> {
         self.event_rx.recv().await
+    }
+
+    /// Returns one already-buffered event without waiting.
+    pub fn try_next_event(&mut self) -> Option<ConnectionEvent> {
+        self.event_rx.try_recv().ok()
     }
 }
 
@@ -735,6 +745,11 @@ async fn run_connection(
     let mut sftp_available = None;
     let mut sftp_probe_pending = true;
     let mut sftp_probe = Box::pin(transport.check_sftp_availability());
+    let mut shell_probe_pending = true;
+    let mut shell_probe = Box::pin(transport.detect_shell());
+    let mut detected_shell = None;
+    let mut shell_output_seen = false;
+    let mut shell_integration_deadline = None;
     let mut performance_monitor = None;
 
     loop {
@@ -770,8 +785,48 @@ async fn run_connection(
                     }
                     continue;
                 }
+                shell = &mut shell_probe, if shell_probe_pending => {
+                    shell_probe_pending = false;
+                    if let Ok(Some(shell)) = shell {
+                        detected_shell = Some(shell);
+                        if shell_output_seen {
+                            shell_integration_deadline =
+                                Some(Instant::now() + SHELL_INTEGRATION_QUIET_PERIOD);
+                        }
+                    }
+                    continue;
+                }
+                _ = async {
+                    if let Some(deadline) = shell_integration_deadline {
+                        sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if shell_integration_deadline.is_some() => {
+                    shell_integration_deadline = None;
+                    if let Some(shell) = detected_shell.take() {
+                        reader.begin_integration_filter();
+                        if let Err(error) = writer.install_cwd_hook(shell).await {
+                            report_failure(&mut session, error, &events).await;
+                            close_resources(&transport, Some(&writer)).await;
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 shell_event = reader.next_event() => {
                     let is_closed = matches!(&shell_event, ShellEvent::Closed);
+                    let is_output = matches!(
+                        &shell_event,
+                        ShellEvent::Output(_) | ShellEvent::ExtendedOutput { .. }
+                    );
+                    if is_output {
+                        shell_output_seen = true;
+                        if detected_shell.is_some() {
+                            shell_integration_deadline =
+                                Some(Instant::now() + SHELL_INTEGRATION_QUIET_PERIOD);
+                        }
+                    }
 
                     if events
                         .send(ConnectionEvent::Shell(shell_event))

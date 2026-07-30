@@ -128,6 +128,10 @@ impl LocalTerminalEventReceiver {
     pub async fn next_event(&mut self) -> Option<LocalTerminalEvent> {
         self.events.recv().await
     }
+
+    pub fn try_next_event(&mut self) -> Option<LocalTerminalEvent> {
+        self.events.try_recv().ok()
+    }
 }
 
 pub struct LocalTerminal {

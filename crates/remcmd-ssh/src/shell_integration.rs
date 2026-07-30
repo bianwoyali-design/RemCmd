@@ -1,3 +1,31 @@
+pub(crate) const DETECT_SHELL_COMMAND: &str = r#"printf '%s\n' "${SHELL-}" "${0-}"; awk -F: -v u="$(id -un 2>/dev/null)" '$1 == u { print $7; exit }' /etc/passwd 2>/dev/null || true"#;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellKind {
+    Bash,
+    Zsh,
+    Ash,
+}
+
+pub(crate) fn detect_shell(output: &[u8]) -> Option<ShellKind> {
+    output
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter_map(|candidate| std::str::from_utf8(candidate).ok())
+        .find_map(|candidate| {
+            match candidate
+                .rsplit('/')
+                .next()
+                .unwrap_or(candidate)
+                .trim_start_matches('-')
+            {
+                "bash" => Some(ShellKind::Bash),
+                "zsh" => Some(ShellKind::Zsh),
+                "ash" => Some(ShellKind::Ash),
+                _ => None,
+            }
+        })
+}
+
 /// Adds cwd reporting after the user's normal interactive startup completes.
 ///
 /// The shell-specific branches preserve prompt variables and startup files so
@@ -11,6 +39,15 @@ pub(crate) fn install_command(ready_command: &str) -> String {
     format!(
         " if [ -n \"${{BASH_VERSION-}}\" ]; then eval {bash_command}; fi\r if [ -n \"${{ZSH_VERSION-}}\" ]; then eval {zsh_command}; fi\r case \"${{0##*/}}\" in *ash) eval {ash_command};; esac\r {ready_command}"
     )
+}
+
+pub(crate) fn install_command_for_shell(shell: ShellKind, ready_command: &str) -> String {
+    let hook = match shell {
+        ShellKind::Bash => BASH_INSTALL_COMMAND,
+        ShellKind::Zsh => ZSH_INSTALL_COMMAND,
+        ShellKind::Ash => ASH_INSTALL_COMMAND,
+    };
+    format!(" eval {}\r {ready_command}", shell_single_quote(hook))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -45,6 +82,29 @@ mod tests {
             assert!(!command.contains(".zshrc"));
             assert!(!command.contains("exec "));
         }
+    }
+
+    #[test]
+    fn shell_detection_accepts_login_shell_paths_and_rejects_unknown_shells() {
+        assert_eq!(detect_shell(b"\n-bash\n"), Some(ShellKind::Bash));
+        assert_eq!(detect_shell(b"\n-zsh\n"), Some(ShellKind::Zsh));
+        assert_eq!(detect_shell(b"/bin/ash\n"), Some(ShellKind::Ash));
+        assert_eq!(detect_shell(b"/usr/bin/fish\n"), None);
+    }
+
+    #[test]
+    fn shell_specific_install_only_contains_the_selected_hook() {
+        let bash = install_command_for_shell(ShellKind::Bash, ":");
+        assert!(bash.contains("PROMPT_COMMAND"));
+        assert!(!bash.contains("add-zsh-hook"));
+
+        let zsh = install_command_for_shell(ShellKind::Zsh, ":");
+        assert!(zsh.contains("add-zsh-hook"));
+        assert!(!zsh.contains("PROMPT_COMMAND"));
+
+        let ash = install_command_for_shell(ShellKind::Ash, ":");
+        assert!(ash.contains("cd(){"));
+        assert!(!ash.contains("PROMPT_COMMAND"));
     }
 
     #[test]

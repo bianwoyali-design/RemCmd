@@ -8,6 +8,8 @@ use rand::rng;
 use russh::{Channel, ChannelId, Pty, client, server};
 use tokio::{net::TcpListener, task::JoinHandle};
 
+use crate::shell_integration::ShellKind;
+
 use super::{PtySize, ShellEvent, SshShell};
 
 /// Values observed by the temporary SSH server.
@@ -21,6 +23,7 @@ struct TestServerState {
     input: Vec<u8>,
     integration_input: Vec<u8>,
     delay_integration_ready: bool,
+    suppress_integration_ready: bool,
     require_integration_before_shell_success: bool,
 }
 
@@ -117,17 +120,22 @@ impl server::Handler for TestServer {
             .windows(b"remcmd-shell-ready".len())
             .any(|window| window == b"remcmd-shell-ready")
         {
-            let (delay_ready, deferred_success) = {
+            let (delay_ready, suppress_ready, deferred_success) = {
                 let mut state = self.state.lock().expect("test state lock");
                 state.integration_input.extend_from_slice(data);
                 (
                     state.delay_integration_ready,
+                    state.suppress_integration_ready,
                     state.require_integration_before_shell_success,
                 )
             };
             if deferred_success {
                 session.channel_success(channel)?;
                 session.data(channel, b"welcome\r\ninitial-starship-prompt".to_vec())?;
+            }
+            if suppress_ready {
+                session.data(channel, b"unsupported-shell\r\nfish> ".to_vec())?;
+                return Ok(());
             }
             if delay_ready {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -424,7 +432,7 @@ async fn shell_integration_is_queued_before_shell_reply() {
 }
 
 #[tokio::test]
-async fn shell_integration_preserves_native_shell_and_stays_hidden() {
+async fn delayed_shell_integration_preserves_startup_output_and_stays_hidden() {
     let (address, server_task, state) = start_test_server().await;
     let mut handle = client::connect(Arc::new(client::Config::default()), address, TestClient)
         .await
@@ -441,14 +449,21 @@ async fn shell_integration_preserves_native_shell_and_stays_hidden() {
         .lock()
         .expect("test state lock")
         .delay_integration_ready = true;
-    let shell = tokio::time::timeout(
-        Duration::from_millis(250),
-        SshShell::open(&handle, PtySize::default(), true),
-    )
-    .await
-    .expect("opening the shell must not wait for the cwd marker")
-    .expect("integrated shell");
+    let shell = SshShell::open(&handle, PtySize::default(), false)
+        .await
+        .expect("interactive shell");
     let (mut reader, writer) = shell.split();
+
+    assert_eq!(
+        reader.next_event().await,
+        ShellEvent::Output(b"ready\r\n".to_vec())
+    );
+
+    reader.begin_integration_filter();
+    writer
+        .install_cwd_hook(ShellKind::Bash)
+        .await
+        .expect("install cwd hook");
 
     assert_eq!(
         reader.next_event().await,
@@ -464,6 +479,65 @@ async fn shell_integration_preserves_native_shell_and_stays_hidden() {
         assert!(!integration_input.contains("PS1"));
         assert!(!integration_input.contains("PROMPT="));
     }
+
+    writer
+        .send_input(b"exit\r".to_vec())
+        .await
+        .expect("exit command");
+    assert_eq!(reader.next_event().await, ShellEvent::ExitStatus(0));
+    assert_eq!(reader.next_event().await, ShellEvent::Eof);
+    assert_eq!(reader.next_event().await, ShellEvent::Closed);
+
+    handle
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .expect("test disconnect");
+    tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("test server should stop")
+        .expect("test server task");
+}
+
+#[tokio::test]
+async fn shell_integration_falls_back_without_exposing_probe_output() {
+    let (address, server_task, state) = start_test_server().await;
+    let mut handle = client::connect(Arc::new(client::Config::default()), address, TestClient)
+        .await
+        .expect("test client connection");
+    assert!(
+        handle
+            .authenticate_none("tester")
+            .await
+            .expect("test authentication")
+            .success()
+    );
+
+    state
+        .lock()
+        .expect("test state lock")
+        .suppress_integration_ready = true;
+    let shell = SshShell::open(&handle, PtySize::default(), true)
+        .await
+        .expect("integrated shell");
+    let (mut reader, writer) = shell.split();
+
+    let output = tokio::time::timeout(Duration::from_secs(2), reader.next_event())
+        .await
+        .expect("startup output should be released after the integration timeout");
+    let ShellEvent::Output(output) = output else {
+        panic!("expected buffered startup output");
+    };
+    assert_eq!(output, b"fish> ");
+    assert!(
+        !output
+            .windows(17)
+            .any(|window| window == b"unsupported-shell")
+    );
+    assert!(
+        !output
+            .windows(b"remcmd-shell-ready".len())
+            .any(|window| window == b"remcmd-shell-ready")
+    );
 
     writer
         .send_input(b"exit\r".to_vec())

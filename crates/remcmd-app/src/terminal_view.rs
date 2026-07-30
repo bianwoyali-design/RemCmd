@@ -149,19 +149,29 @@ impl TerminalViewModel {
         Self::from_snapshot_with_selection(snapshot, None, TerminalPalette::dark())
     }
 
+    #[cfg(test)]
     pub(crate) fn from_snapshot_with_selection(
         snapshot: &TerminalSnapshot,
         selection: Option<TerminalSelection>,
         palette: TerminalPalette,
     ) -> Self {
         let rows = (0..snapshot.size.rows())
-            .map(|row| build_row(snapshot, row, selection, palette))
+            .map(|row| Self::row_from_snapshot(snapshot, row, selection, palette))
             .collect();
 
         Self {
             rows,
             background: palette.background,
         }
+    }
+
+    pub(crate) fn row_from_snapshot(
+        snapshot: &TerminalSnapshot,
+        row: usize,
+        selection: Option<TerminalSelection>,
+        palette: TerminalPalette,
+    ) -> TerminalRow {
+        build_row(snapshot, row, selection, palette)
     }
 }
 

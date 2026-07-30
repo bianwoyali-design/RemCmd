@@ -28,10 +28,12 @@ use terminal_input::{
 };
 
 mod terminal_canvas;
-use terminal_canvas::{TerminalCanvasFrame, TerminalCellMetrics};
+use terminal_canvas::{
+    TerminalCanvasCache, TerminalCanvasFrame, TerminalCanvasInput, TerminalCellMetrics,
+};
 
 mod terminal_view;
-use terminal_view::{TerminalPalette, TerminalViewModel, palette_color};
+use terminal_view::{TerminalPalette, palette_color};
 
 #[cfg(target_os = "macos")]
 mod private_key_picker;
@@ -40,9 +42,11 @@ mod private_key_picker;
 mod macos_symbols;
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -78,8 +82,8 @@ use remcmd_storage::{
     load_settings, save_credential, save_profiles, save_settings,
 };
 use remcmd_terminal::{
-    Clipboard as TerminalClipboard, Scroll as TerminalScroll, TerminalEngine, TerminalEvent,
-    TerminalModes, TerminalPoint, TerminalSelection, TerminalSnapshot, TextAreaSize,
+    Clipboard as TerminalClipboard, Scroll as TerminalScroll, TerminalDamage, TerminalEngine,
+    TerminalEvent, TerminalModes, TerminalPoint, TerminalSelection, TerminalSnapshot, TextAreaSize,
 };
 
 const TERMINAL_COLUMNS: u32 = 80;
@@ -88,6 +92,14 @@ const LOCAL_PROFILE_ID: &str = "__remcmd_local_terminal__";
 const TERMINAL_CELL_WIDTH: u16 = 8;
 const TERMINAL_CELL_HEIGHT: u16 = 19;
 const TERMINAL_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+const TERMINAL_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_EVENT_BATCH_LIMIT: usize = 64;
+const MOTION_INSTANT_DURATION: Duration = Duration::from_millis(1);
+const MOTION_FAST_DURATION: Duration = Duration::from_millis(120);
+const MOTION_STANDARD_DURATION: Duration = Duration::from_millis(180);
+const MOTION_EMPHASIZED_DURATION: Duration = Duration::from_millis(240);
+const SELECT_MENU_ROW_HEIGHT: f32 = 28.0;
+const SELECT_MENU_MAX_VISIBLE_ROWS: usize = 9;
 const SFTP_ERROR_HINT_DURATION: Duration = Duration::from_secs(3);
 const SIDEBAR_DEFAULT_WIDTH: f32 = 300.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
@@ -180,7 +192,11 @@ struct RemCmdApp {
     hovered_titlebar_tab_id: Option<TabId>,
     hovered_titlebar_close_id: Option<TabId>,
     titlebar_tabs_scroll_handle: ScrollHandle,
-    titlebar_tabs_scroll_task: Option<Task<()>>,
+    titlebar_tabs_scroll_transition_id: u64,
+    titlebar_tabs_scroll_start: gpui::Point<Pixels>,
+    titlebar_tabs_scroll_active: bool,
+    titlebar_tabs_scroll_cleanup_task: Option<Task<()>>,
+    terminal_redraw_task: Option<Task<()>>,
     next_tab_id: u64,
     panes: Vec<TerminalPane>,
     active_pane_id: Option<PaneId>,
@@ -190,13 +206,14 @@ struct RemCmdApp {
     connections_expanded: bool,
     sidebar_width: f32,
     left_sidebar_open: bool,
-    left_sidebar_progress: f32,
-    left_sidebar_animation_task: Option<Task<()>>,
+    left_sidebar_transition_id: u64,
     sidebar_resize: Option<SidebarResize>,
     right_sidebar_open: bool,
     right_sidebar_width: f32,
     right_sidebar_resize: Option<SidebarResize>,
     right_sidebar_transition_id: u64,
+    right_sidebar_rendered: bool,
+    right_sidebar_animation_task: Option<Task<()>>,
     right_sidebar_view: RightSidebarView,
     credential_lookup_task: Option<Task<()>>,
     credential_lookup_session_id: Option<SessionId>,
@@ -223,6 +240,8 @@ struct RemCmdApp {
     focused_terminal_session_id: Option<SessionId>,
     profile_auth_selector_open: bool,
     open_settings_selector: Option<SettingsSelector>,
+    settings_selector_scroll_handle: ScrollHandle,
+    settings_virtual_selector_scroll_handle: UniformListScrollHandle,
     settings_focus_handle: FocusHandle,
     theme: Theme,
     settings_path: PathBuf,
@@ -422,6 +441,9 @@ struct ActiveTerminal {
     cell_height: f32,
     viewport_bounds: Option<Bounds<Pixels>>,
     was_connected: bool,
+    render_damage: RefCell<TerminalDamage>,
+    render_snapshot: RefCell<Option<Rc<TerminalSnapshot>>>,
+    canvas_cache: Rc<RefCell<TerminalCanvasCache>>,
 }
 
 struct CommandTooltip {
@@ -454,7 +476,8 @@ impl ActiveTerminal {
     fn new(profile_id: String, size: PtySize) -> Self {
         let columns = usize::try_from(size.columns).expect("PTY columns fit usize");
         let rows = usize::try_from(size.rows).expect("PTY rows fit usize");
-        let engine = TerminalEngine::new(columns, rows).expect("valid initial terminal size");
+        let mut engine = TerminalEngine::new(columns, rows).expect("valid initial terminal size");
+        let _ = engine.take_damage();
 
         Self {
             profile_id,
@@ -467,21 +490,56 @@ impl ActiveTerminal {
             cell_height: f32::from(TERMINAL_CELL_HEIGHT),
             viewport_bounds: None,
             was_connected: false,
+            render_damage: RefCell::new(TerminalDamage::Full),
+            render_snapshot: RefCell::new(None),
+            canvas_cache: Rc::new(RefCell::new(TerminalCanvasCache::default())),
         }
     }
 
     fn process(&mut self, bytes: &[u8]) -> Vec<TerminalEvent> {
         self.engine.process(bytes);
+        self.capture_damage();
         self.engine.drain_events()
     }
 
     fn reset(&mut self) {
         self.engine.reset();
         self.title = None;
+        *self.render_damage.borrow_mut() = TerminalDamage::Full;
+        self.render_snapshot.borrow_mut().take();
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
         self.engine.snapshot()
+    }
+
+    fn snapshot_for_render(&self) -> (Rc<TerminalSnapshot>, TerminalDamage) {
+        let damage = self
+            .render_damage
+            .replace(TerminalDamage::Partial(Vec::new()));
+        let can_reuse = matches!(&damage, TerminalDamage::Partial(ranges) if ranges.is_empty());
+        let snapshot = if can_reuse {
+            self.render_snapshot.borrow().clone()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            let snapshot = Rc::new(self.engine.snapshot());
+            *self.render_snapshot.borrow_mut() = Some(snapshot.clone());
+            snapshot
+        });
+
+        (snapshot, damage)
+    }
+
+    fn scroll(&mut self, scroll: TerminalScroll) {
+        self.engine.scroll(scroll);
+        self.capture_damage();
+    }
+
+    fn capture_damage(&mut self) {
+        let damage = self.engine.take_damage();
+        merge_terminal_damage(&mut self.render_damage.borrow_mut(), damage);
     }
 
     fn text_area_size(&self) -> TextAreaSize {
@@ -519,6 +577,7 @@ impl ActiveTerminal {
                     usize::try_from(size.rows).expect("PTY rows fit usize"),
                 )
                 .expect("measured terminal size is valid");
+            self.capture_damage();
         }
 
         self.pty_size = size;
@@ -526,6 +585,27 @@ impl ActiveTerminal {
             self.pending_pty_size = None;
         }
         dimensions_changed
+    }
+}
+
+fn merge_terminal_damage(current: &mut TerminalDamage, incoming: TerminalDamage) {
+    match (&mut *current, incoming) {
+        (TerminalDamage::Full, _) | (_, TerminalDamage::Full) => {
+            *current = TerminalDamage::Full;
+        }
+        (TerminalDamage::Partial(current), TerminalDamage::Partial(incoming)) => {
+            for range in incoming {
+                if let Some(existing) = current
+                    .iter_mut()
+                    .find(|existing| existing.row == range.row)
+                {
+                    existing.left = existing.left.min(range.left);
+                    existing.right = existing.right.max(range.right);
+                } else {
+                    current.push(range);
+                }
+            }
+        }
     }
 }
 
@@ -1987,7 +2067,11 @@ impl RemCmdApp {
             hovered_titlebar_tab_id: None,
             hovered_titlebar_close_id: None,
             titlebar_tabs_scroll_handle: ScrollHandle::new(),
-            titlebar_tabs_scroll_task: None,
+            titlebar_tabs_scroll_transition_id: 0,
+            titlebar_tabs_scroll_start: point(px(0.0), px(0.0)),
+            titlebar_tabs_scroll_active: false,
+            titlebar_tabs_scroll_cleanup_task: None,
+            terminal_redraw_task: None,
             next_tab_id: 1,
             panes: Vec::new(),
             active_pane_id: None,
@@ -1997,13 +2081,14 @@ impl RemCmdApp {
             connections_expanded: true,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             left_sidebar_open: true,
-            left_sidebar_progress: 1.0,
-            left_sidebar_animation_task: None,
+            left_sidebar_transition_id: 0,
             sidebar_resize: None,
             right_sidebar_open: false,
             right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
             right_sidebar_resize: None,
             right_sidebar_transition_id: 0,
+            right_sidebar_rendered: false,
+            right_sidebar_animation_task: None,
             right_sidebar_view: RightSidebarView::Sftp,
             credential_lookup_task: None,
             credential_lookup_session_id: None,
@@ -2030,6 +2115,8 @@ impl RemCmdApp {
             focused_terminal_session_id: None,
             profile_auth_selector_open: false,
             open_settings_selector: None,
+            settings_selector_scroll_handle: ScrollHandle::new(),
+            settings_virtual_selector_scroll_handle: UniformListScrollHandle::new(),
             settings_focus_handle,
             theme,
             settings_path,
@@ -2177,33 +2264,26 @@ impl RemCmdApp {
 
     fn effective_right_sidebar_width(&self, window: &Window) -> f32 {
         let viewport_width = f32::from(window.viewport_size().width);
-        let left_sidebar_width =
-            clamp_sidebar_width(self.sidebar_width, viewport_width) * self.left_sidebar_progress;
+        let left_sidebar_width = if self.left_sidebar_open {
+            clamp_sidebar_width(self.sidebar_width, viewport_width)
+        } else {
+            0.0
+        };
         clamp_right_sidebar_width(self.right_sidebar_width, viewport_width, left_sidebar_width)
     }
 
     fn titlebar_leading_width(&self, window: &Window) -> f32 {
-        COLLAPSED_TITLEBAR_LEADING_WIDTH
-            + (self.effective_sidebar_width(window) - COLLAPSED_TITLEBAR_LEADING_WIDTH)
-                * self.left_sidebar_progress
+        if self.left_sidebar_open {
+            self.effective_sidebar_width(window)
+        } else {
+            COLLAPSED_TITLEBAR_LEADING_WIDTH
+        }
     }
 
     fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
         self.left_sidebar_open = !self.left_sidebar_open;
+        self.left_sidebar_transition_id += 1;
         self.sidebar_resize = None;
-        let start = self.left_sidebar_progress;
-        let end = if self.left_sidebar_open { 1.0 } else { 0.0 };
-        self.left_sidebar_animation_task = Some(cx.spawn(async move |this, cx| {
-            for frame in 1..=12 {
-                Timer::after(Duration::from_millis(15)).await;
-                let progress = ease_in_out(frame as f32 / 12.0);
-                let value = start + (end - start) * progress;
-                let _ = this.update(cx, |this, cx| {
-                    this.left_sidebar_progress = value;
-                    cx.notify();
-                });
-            }
-        }));
         cx.notify();
     }
 
@@ -2213,7 +2293,7 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.left_sidebar_progress < 1.0 {
+        if !self.left_sidebar_open {
             cx.stop_propagation();
             return;
         }
@@ -2283,7 +2363,11 @@ impl RemCmdApp {
         let width = clamp_right_sidebar_width(
             requested_width,
             f32::from(window.viewport_size().width),
-            self.effective_sidebar_width(window) * self.left_sidebar_progress,
+            if self.left_sidebar_open {
+                self.effective_sidebar_width(window)
+            } else {
+                0.0
+            },
         );
         if self.right_sidebar_width != width {
             self.right_sidebar_width = width;
@@ -2358,12 +2442,28 @@ impl RemCmdApp {
     fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
         self.right_sidebar_open = !self.right_sidebar_open;
         self.right_sidebar_transition_id += 1;
+        let transition_id = self.right_sidebar_transition_id;
         self.right_sidebar_resize = None;
-        if self.right_sidebar_open
-            && self.right_sidebar_view == RightSidebarView::Sftp
-            && let Some(session_id) = self.active_session_id
-        {
-            self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
+        self.right_sidebar_animation_task = None;
+        if self.right_sidebar_open {
+            self.right_sidebar_rendered = true;
+            if self.right_sidebar_view == RightSidebarView::Sftp
+                && let Some(session_id) = self.active_session_id
+            {
+                self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
+            }
+        } else {
+            self.right_sidebar_animation_task = Some(cx.spawn(async move |this, cx| {
+                Timer::after(MOTION_STANDARD_DURATION).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.right_sidebar_transition_id == transition_id && !this.right_sidebar_open
+                    {
+                        this.right_sidebar_rendered = false;
+                        this.right_sidebar_animation_task = None;
+                        cx.notify();
+                    }
+                });
+            }));
         }
         self.sync_performance_monitoring();
         cx.notify();
@@ -3592,21 +3692,23 @@ impl RemCmdApp {
             return;
         }
 
+        self.titlebar_tabs_scroll_start = self.titlebar_tabs_scroll_handle.offset();
+        self.titlebar_tabs_scroll_transition_id += 1;
+        self.titlebar_tabs_scroll_active = true;
+        let transition_id = self.titlebar_tabs_scroll_transition_id;
         let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
-        self.titlebar_tabs_scroll_task = Some(cx.spawn(async move |this, cx| {
-            // Let GPUI lay out the new tab before reading the track's final overflow.
-            Timer::after(Duration::from_millis(16)).await;
-
-            let start = scroll_handle.offset();
-            let easing = ease_out_quint();
-            for frame in 1..=10 {
-                let progress = easing(frame as f32 / 10.0);
-                let target_x = -scroll_handle.max_offset().width;
-                scroll_handle.set_offset(point(start.x + (target_x - start.x) * progress, start.y));
-                let _ = this.update(cx, |_, cx| cx.notify());
-                Timer::after(Duration::from_millis(16)).await;
-            }
+        self.titlebar_tabs_scroll_cleanup_task = Some(cx.spawn(async move |this, cx| {
+            Timer::after(MOTION_STANDARD_DURATION + TERMINAL_REDRAW_INTERVAL).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.titlebar_tabs_scroll_transition_id == transition_id {
+                    scroll_handle.set_offset(point(-scroll_handle.max_offset().width, px(0.0)));
+                    this.titlebar_tabs_scroll_active = false;
+                    this.titlebar_tabs_scroll_cleanup_task = None;
+                    cx.notify();
+                }
+            });
         }));
+        cx.notify();
     }
 
     fn pane(&self, pane_id: PaneId) -> Option<&TerminalPane> {
@@ -4006,11 +4108,41 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_settings_selector = if self.open_settings_selector == Some(selector) {
-            None
+        if self.open_settings_selector == Some(selector) {
+            self.open_settings_selector = None;
         } else {
-            Some(selector)
-        };
+            self.settings_selector_scroll_handle = ScrollHandle::new();
+            self.settings_virtual_selector_scroll_handle = UniformListScrollHandle::new();
+            let (selected_index, option_count) = if selector == SettingsSelector::TerminalFont {
+                (
+                    self.terminal_font_families
+                        .iter()
+                        .position(|family| *family == self.terminal_font_family),
+                    self.terminal_font_families.len(),
+                )
+            } else {
+                let selected_value = self.settings_value(selector);
+                (
+                    selector
+                        .options()
+                        .iter()
+                        .position(|option| option.value == selected_value),
+                    selector.options().len(),
+                )
+            };
+            if let Some(selected_index) = selected_index {
+                if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
+                    self.settings_virtual_selector_scroll_handle
+                        .scroll_to_item_strict(selected_index, gpui::ScrollStrategy::Center);
+                } else {
+                    self.settings_selector_scroll_handle.set_offset(point(
+                        px(0.0),
+                        px(-select_menu_scroll_offset(selected_index, option_count)),
+                    ));
+                }
+            }
+            self.open_settings_selector = Some(selector);
+        }
         self.settings_focus_handle.focus(window);
         cx.notify();
     }
@@ -4321,9 +4453,19 @@ impl RemCmdApp {
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
+                let mut batch = Vec::with_capacity(TERMINAL_EVENT_BATCH_LIMIT);
+                batch.push(event);
+                while batch.len() < TERMINAL_EVENT_BATCH_LIMIT {
+                    let Some(event) = events.try_next_event() else {
+                        break;
+                    };
+                    batch.push(event);
+                }
                 if this
-                    .update(cx, |this, cx| {
-                        this.handle_local_terminal_event(session_id, event, cx);
+                    .update(cx, move |this, cx| {
+                        for event in batch {
+                            this.handle_local_terminal_event(session_id, event, cx);
+                        }
                     })
                     .is_err()
                 {
@@ -5164,9 +5306,19 @@ impl RemCmdApp {
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
+                let mut batch = Vec::with_capacity(TERMINAL_EVENT_BATCH_LIMIT);
+                batch.push(event);
+                while batch.len() < TERMINAL_EVENT_BATCH_LIMIT {
+                    let Some(event) = events.try_next_event() else {
+                        break;
+                    };
+                    batch.push(event);
+                }
                 if this
-                    .update(cx, |this, cx| {
-                        this.handle_connection_event(session_id, event, cx);
+                    .update(cx, move |this, cx| {
+                        for event in batch {
+                            this.handle_connection_event(session_id, event, cx);
+                        }
                     })
                     .is_err()
                 {
@@ -5823,7 +5975,7 @@ impl RemCmdApp {
             .and_then(|session| session.terminal.as_mut())
             && terminal.engine.display_offset() != 0
         {
-            terminal.engine.scroll(TerminalScroll::Bottom);
+            terminal.scroll(TerminalScroll::Bottom);
             cx.notify();
         }
 
@@ -5978,7 +6130,7 @@ impl RemCmdApp {
             let Some(terminal) = session.terminal.as_mut() else {
                 return;
             };
-            terminal.engine.scroll(TerminalScroll::Lines(lines));
+            terminal.scroll(TerminalScroll::Lines(lines));
             cx.notify();
         }
     }
@@ -5988,10 +6140,10 @@ impl RemCmdApp {
         session_id: SessionId,
         data: &[u8],
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let events = {
             let Some(session) = self.session_mut(session_id) else {
-                return;
+                return false;
             };
             if !data.is_empty()
                 && session
@@ -6010,9 +6162,43 @@ impl RemCmdApp {
                 .unwrap_or_default()
         };
 
+        let mut ui_state_changed = false;
         for event in events {
-            self.handle_terminal_event(session_id, event, cx);
+            ui_state_changed |= self.handle_terminal_event(session_id, event, cx);
         }
+        ui_state_changed
+    }
+
+    fn terminal_session_is_rendered(&self, session_id: SessionId) -> bool {
+        if self.bottom_panel_open && self.quick_terminal_session_id == Some(session_id) {
+            return true;
+        }
+        if self.active_panel != ActivePanel::Connection
+            || self.active_tab_view() != TerminalTabView::Terminal
+        {
+            return false;
+        }
+        let Some(active_tab_id) = self.active_tab_id else {
+            return false;
+        };
+
+        self.panes
+            .iter()
+            .any(|pane| pane.tab_id == active_tab_id && pane.session_id == session_id)
+    }
+
+    fn schedule_terminal_redraw(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_redraw_task.is_some() {
+            return;
+        }
+
+        self.terminal_redraw_task = Some(cx.spawn(async move |this, cx| {
+            Timer::after(TERMINAL_REDRAW_INTERVAL).await;
+            let _ = this.update(cx, |this, cx| {
+                this.terminal_redraw_task = None;
+                cx.notify();
+            });
+        }));
     }
 
     fn handle_terminal_event(
@@ -6020,7 +6206,7 @@ impl RemCmdApp {
         session_id: SessionId,
         event: TerminalEvent,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         match event {
             TerminalEvent::TitleChanged(title) => {
                 if let Some(terminal) = self
@@ -6029,6 +6215,7 @@ impl RemCmdApp {
                 {
                     terminal.title = title;
                 }
+                true
             }
             TerminalEvent::WorkingDirectoryChanged(path) => {
                 if let Some(terminal) = self
@@ -6046,17 +6233,22 @@ impl RemCmdApp {
                         self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Center, cx);
                     }
                 }
+                true
             }
             TerminalEvent::ClipboardStore {
                 clipboard,
                 contents,
-            } => self.write_terminal_clipboard(clipboard, contents, cx),
+            } => {
+                self.write_terminal_clipboard(clipboard, contents, cx);
+                false
+            }
             TerminalEvent::ClipboardLoad(request) => {
                 let contents = self
                     .read_terminal_clipboard(request.clipboard, cx)
                     .and_then(|item| item.text())
                     .unwrap_or_default();
                 self.send_terminal_response(session_id, request.response(&contents));
+                false
             }
             TerminalEvent::ColorRequest(request) => {
                 let palette = self.terminal_palette();
@@ -6069,8 +6261,12 @@ impl RemCmdApp {
                 if let Some(color) = color {
                     self.send_terminal_response(session_id, request.response(color));
                 }
+                false
             }
-            TerminalEvent::WriteToPty(data) => self.send_terminal_response(session_id, data),
+            TerminalEvent::WriteToPty(data) => {
+                self.send_terminal_response(session_id, data);
+                false
+            }
             TerminalEvent::TextAreaSizeRequest(request) => {
                 let size = self
                     .session(session_id)
@@ -6079,17 +6275,20 @@ impl RemCmdApp {
                 if let Some(size) = size {
                     self.send_terminal_response(session_id, request.response(size));
                 }
+                false
             }
             TerminalEvent::Bell => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some("Remote terminal bell".into());
                 }
+                true
             }
             TerminalEvent::ExitRequested => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some("Remote terminal requested exit".into());
                     session.terminal_end_reason = Some("Remote terminal requested exit".into());
                 }
+                true
             }
             TerminalEvent::ChildExited(status) => {
                 if let Some(session) = self.session_mut(session_id) {
@@ -6100,10 +6299,11 @@ impl RemCmdApp {
                         .connection_message
                         .clone_from(&session.terminal_end_reason);
                 }
+                true
             }
             TerminalEvent::MouseCursorDirty
             | TerminalEvent::CursorBlinkingChanged
-            | TerminalEvent::Wakeup => {}
+            | TerminalEvent::Wakeup => false,
         }
     }
 
@@ -6494,8 +6694,11 @@ impl RemCmdApp {
             ConnectionEvent::Shell(
                 ShellEvent::Output(data) | ShellEvent::ExtendedOutput { data, .. },
             ) => {
-                self.process_terminal_output(session_id, &data, cx);
-                true
+                let ui_state_changed = self.process_terminal_output(session_id, &data, cx);
+                if ui_state_changed || self.terminal_session_is_rendered(session_id) {
+                    self.schedule_terminal_redraw(cx);
+                }
+                false
             }
             ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
                 let message = format!("Remote shell exited with status {status}");
@@ -6554,7 +6757,7 @@ impl RemCmdApp {
             return;
         }
 
-        match event {
+        let should_notify = match event {
             LocalTerminalEvent::Started => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_state = SessionState::Connected;
@@ -6563,9 +6766,14 @@ impl RemCmdApp {
                         terminal.was_connected = true;
                     }
                 }
+                true
             }
             LocalTerminalEvent::Output(data) => {
-                self.process_terminal_output(session_id, &data, cx);
+                let ui_state_changed = self.process_terminal_output(session_id, &data, cx);
+                if ui_state_changed || self.terminal_session_is_rendered(session_id) {
+                    self.schedule_terminal_redraw(cx);
+                }
+                false
             }
             LocalTerminalEvent::Resized(size) => {
                 let size = ssh_pty_size(size);
@@ -6577,6 +6785,7 @@ impl RemCmdApp {
                     session.terminal_selection = None;
                     session.terminal_selecting = false;
                 }
+                true
             }
             LocalTerminalEvent::Exited { exit_code, signal } => {
                 let should_remove = {
@@ -6597,6 +6806,7 @@ impl RemCmdApp {
                 if should_remove {
                     self.remove_session(session_id, cx);
                 }
+                true
             }
             LocalTerminalEvent::Failed(error) => {
                 let should_remove = {
@@ -6612,10 +6822,13 @@ impl RemCmdApp {
                 if should_remove {
                     self.remove_session(session_id, cx);
                 }
+                true
             }
-        }
+        };
 
-        cx.notify();
+        if should_notify {
+            cx.notify();
+        }
     }
 }
 
@@ -6654,15 +6867,41 @@ impl Render for RemCmdApp {
                 cx.listener(Self::finish_bottom_panel_resize),
             );
 
-        let rendered_left_sidebar_width = sidebar_width * self.left_sidebar_progress;
+        let left_sidebar_open = self.left_sidebar_open;
+        let left_transition_id = self.left_sidebar_transition_id;
+        let left_start_width = if left_transition_id == 0 || left_sidebar_open {
+            0.0
+        } else {
+            sidebar_width
+        };
+        let left_end_width = if left_sidebar_open {
+            sidebar_width
+        } else {
+            0.0
+        };
         root = root.child(
             div()
                 .flex()
                 .flex_none()
-                .w(px(rendered_left_sidebar_width))
                 .h_full()
                 .overflow_hidden()
-                .child(self.render_sidebar(sidebar_width, cx)),
+                .child(self.render_sidebar(sidebar_width, cx))
+                .with_animation(
+                    SharedString::from(format!(
+                        "left-sidebar-layout-{left_transition_id}-{left_sidebar_open}"
+                    )),
+                    Animation::new(if left_transition_id == 0 {
+                        MOTION_INSTANT_DURATION
+                    } else {
+                        MOTION_STANDARD_DURATION
+                    })
+                    .with_easing(ease_in_out),
+                    move |this, delta| {
+                        this.w(px(
+                            left_start_width + (left_end_width - left_start_width) * delta
+                        ))
+                    },
+                ),
         );
         root = root.child(self.render_detail_panel(selected_profile, cx));
         let right_sidebar_open = self.right_sidebar_open;
@@ -6678,7 +6917,7 @@ impl Render for RemCmdApp {
             0.0
         };
         let mut right_sidebar = div().flex().flex_none().h_full().overflow_hidden();
-        if right_sidebar_open {
+        if self.right_sidebar_rendered {
             right_sidebar = right_sidebar.child(self.render_right_sidebar(right_sidebar_width, cx));
         }
         root = root.child(
@@ -6687,9 +6926,9 @@ impl Render for RemCmdApp {
                     "right-sidebar-layout-{right_transition_id}-{right_sidebar_open}"
                 )),
                 Animation::new(if right_transition_id == 0 {
-                    Duration::from_millis(1)
+                    MOTION_INSTANT_DURATION
                 } else {
-                    Duration::from_millis(180)
+                    MOTION_STANDARD_DURATION
                 })
                 .with_easing(ease_in_out),
                 move |this, delta| {
@@ -6700,13 +6939,11 @@ impl Render for RemCmdApp {
             ),
         );
         root = root.child(self.render_titlebar_tabs(window, cx));
-        if self.right_sidebar_open {
+        if self.right_sidebar_rendered {
             root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, cx));
         }
-        if self.left_sidebar_progress > 0.0 {
-            root = root.child(self.render_sidebar_resize_handle(rendered_left_sidebar_width, cx));
-        }
-        if self.right_sidebar_open {
+        root = root.child(self.render_sidebar_resize_handle(sidebar_width, cx));
+        if self.right_sidebar_rendered {
             root = root.child(self.render_right_sidebar_resize_handle(right_sidebar_width, cx));
         }
         if self.active_panel == ActivePanel::Settings && self.open_settings_selector.is_some() {
@@ -7100,6 +7337,9 @@ impl RemCmdApp {
         width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let open = self.right_sidebar_open;
+        let start_width = if open { 0.0 } else { width };
+        let end_width = if open { width } else { 0.0 };
         let mut tabs = div()
             .id("right_sidebar_titlebar_tabs")
             .relative()
@@ -7189,12 +7429,16 @@ impl RemCmdApp {
                     self.right_sidebar_transition_id
                 )),
                 Animation::new(if self.right_sidebar_transition_id == 0 {
-                    Duration::from_millis(1)
+                    MOTION_INSTANT_DURATION
                 } else {
-                    Duration::from_millis(180)
+                    MOTION_STANDARD_DURATION
                 })
                 .with_easing(ease_in_out),
-                move |this, delta| this.w(px(width * delta)).opacity(delta),
+                move |this, delta| {
+                    let progress = if open { delta } else { 1.0 - delta };
+                    this.w(px(start_width + (end_width - start_width) * delta))
+                        .opacity(progress)
+                },
             )
     }
 
@@ -7251,15 +7495,17 @@ impl RemCmdApp {
         };
         let end_width = if open { expanded_width } else { 0.0 };
 
-        titlebar.with_animation(
-            SharedString::from(format!("titlebar-right-edge-{transition_id}-{open}")),
-            Animation::new(if transition_id == 0 {
-                Duration::from_millis(1)
-            } else {
-                Duration::from_millis(180)
-            })
-            .with_easing(ease_in_out),
-            move |this, delta| this.right(px(start_width + (end_width - start_width) * delta)),
+        titlebar.child(
+            div().flex_none().h_full().with_animation(
+                SharedString::from(format!("titlebar-right-spacer-{transition_id}-{open}")),
+                Animation::new(if transition_id == 0 {
+                    MOTION_INSTANT_DURATION
+                } else {
+                    MOTION_STANDARD_DURATION
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| this.w(px(start_width + (end_width - start_width) * delta)),
+            ),
         )
     }
 
@@ -7298,15 +7544,38 @@ impl RemCmdApp {
             .shadow(self.titlebar_control_shadow())
             .overflow_hidden()
             .child(left_sidebar_button);
+        let leading_transition_id = self.left_sidebar_transition_id;
+        let leading_open = self.left_sidebar_open;
+        let leading_start_width = if leading_transition_id == 0 || leading_open {
+            COLLAPSED_TITLEBAR_LEADING_WIDTH
+        } else {
+            self.effective_sidebar_width(window)
+        };
+        let leading_end_width = leading_width;
         let leading = div()
             .flex()
             .flex_none()
             .items_center()
-            .w(px(leading_width))
             .h_full()
             .child(drag_area().flex_1())
             .child(left_sidebar_group)
-            .child(drag_area().w(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP)));
+            .child(drag_area().w(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP)))
+            .with_animation(
+                SharedString::from(format!(
+                    "titlebar-left-edge-{leading_transition_id}-{leading_open}"
+                )),
+                Animation::new(if leading_transition_id == 0 {
+                    MOTION_INSTANT_DURATION
+                } else {
+                    MOTION_STANDARD_DURATION
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| {
+                    this.w(px(
+                        leading_start_width + (leading_end_width - leading_start_width) * delta
+                    ))
+                },
+            );
         let titlebar = div()
             .id("window_titlebar")
             .absolute()
@@ -7468,7 +7737,7 @@ impl RemCmdApp {
                 )
                 .with_animation(
                     SharedString::from(format!("titlebar-tab-terminal-{}-{show_close}", tab_id.0)),
-                    Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                    Animation::new(MOTION_FAST_DURATION).with_easing(ease_out_quint()),
                     move |this, delta| this.opacity(if show_close { 1.0 - delta } else { delta }),
                 );
             let tab_content = if is_active {
@@ -7523,7 +7792,7 @@ impl RemCmdApp {
             };
             let tab_content = tab_content.with_animation(
                 SharedString::from(content_animation_id),
-                Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
+                Animation::new(MOTION_EMPHASIZED_DURATION).with_easing(ease_in_out),
                 move |this, delta| {
                     this.opacity(content_start_opacity + (1.0 - content_start_opacity) * delta)
                 },
@@ -7576,7 +7845,7 @@ impl RemCmdApp {
             }
             let close_control = close_control.with_animation(
                 SharedString::from(format!("titlebar-tab-close-{}-{show_close}", tab_id.0)),
-                Animation::new(Duration::from_millis(120)).with_easing(ease_out_quint()),
+                Animation::new(MOTION_FAST_DURATION).with_easing(ease_out_quint()),
                 move |this, delta| this.opacity(if show_close { delta } else { 1.0 - delta }),
             );
 
@@ -7614,7 +7883,7 @@ impl RemCmdApp {
                             }])
                             .with_animation(
                                 SharedString::from(format!("titlebar-tab-selection-{}", tab_id.0)),
-                                Animation::new(Duration::from_millis(280)).with_easing(ease_in_out),
+                                Animation::new(MOTION_EMPHASIZED_DURATION).with_easing(ease_in_out),
                                 |this, delta| this.opacity(0.72 + 0.28 * delta),
                             ),
                     )
@@ -7636,7 +7905,7 @@ impl RemCmdApp {
 
             let tab_element = tab_element.with_animation(
                 SharedString::from(format!("titlebar-tab-entry-{}", tab_id.0)),
-                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                Animation::new(MOTION_STANDARD_DURATION).with_easing(ease_out_quint()),
                 |this, delta| {
                     this.left(px((1.0 - delta) * 10.0))
                         .opacity(0.72 + 0.28 * delta)
@@ -7658,7 +7927,7 @@ impl RemCmdApp {
                 .child(tab_element)
                 .with_animation(
                     SharedString::from(layout_animation_id),
-                    Animation::new(Duration::from_millis(300)).with_easing(ease_in_out),
+                    Animation::new(MOTION_EMPHASIZED_DURATION).with_easing(ease_in_out),
                     move |this, delta| {
                         let basis = start_tab_basis + (end_tab_basis - start_tab_basis) * delta;
                         let min_width =
@@ -7678,7 +7947,25 @@ impl RemCmdApp {
             .gap(px(8.0))
             .px(px(12.0));
         if !self.tabs.is_empty() {
-            controls = controls.child(tabs);
+            if self.titlebar_tabs_scroll_active {
+                let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
+                let scroll_start = self.titlebar_tabs_scroll_start;
+                let transition_id = self.titlebar_tabs_scroll_transition_id;
+                controls = controls.child(tabs.with_animation(
+                    SharedString::from(format!("titlebar-tabs-scroll-{transition_id}")),
+                    Animation::new(MOTION_STANDARD_DURATION).with_easing(ease_out_quint()),
+                    move |this, delta| {
+                        let target_x = -scroll_handle.max_offset().width;
+                        scroll_handle.set_offset(point(
+                            scroll_start.x + (target_x - scroll_start.x) * delta,
+                            scroll_start.y,
+                        ));
+                        this
+                    },
+                ));
+            } else {
+                controls = controls.child(tabs);
+            }
         } else {
             controls = controls.child(drag_area().flex_1());
         }
@@ -7909,15 +8196,18 @@ impl RemCmdApp {
         let session = self.session(session_id);
         let terminal_font_size = f32::from(self.terminal_font_size);
         let terminal_line_height = terminal_font_size * TERMINAL_FONT_LINE_HEIGHT_FACTOR;
-        let model = session.and_then(|session| {
+        let render_state = session.and_then(|session| {
             session.terminal.as_ref().map(|terminal| {
-                TerminalViewModel::from_snapshot_with_selection(
-                    &terminal.snapshot(),
+                let (snapshot, damage) = terminal.snapshot_for_render();
+                (
+                    snapshot,
+                    damage,
                     session.terminal_selection,
-                    palette,
+                    terminal.canvas_cache.clone(),
                 )
             })
         });
+        let terminal_font_family = self.terminal_font_family.clone();
         let input_entity = cx.entity();
         let layout_entity = input_entity.clone();
         let input_focus_handle = focus_handle.clone();
@@ -7930,7 +8220,21 @@ impl RemCmdApp {
                     metrics.width,
                     metrics.height,
                 );
-                let frame = model.map(|model| TerminalCanvasFrame::prepare(model, metrics, window));
+                let frame = render_state.map(|(snapshot, damage, selection, cache)| {
+                    TerminalCanvasFrame::prepare(
+                        TerminalCanvasInput {
+                            cache: &cache,
+                            snapshot: &snapshot,
+                            damage,
+                            selection,
+                            palette,
+                            font_family: terminal_font_family,
+                            font_size: terminal_font_size,
+                            metrics,
+                        },
+                        window,
+                    )
+                });
 
                 (layout, frame)
             },
@@ -8772,13 +9076,21 @@ impl RemCmdApp {
 
     fn render_sidebar_resize_handle(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = self.theme.border_strong;
+        let transition_id = self.left_sidebar_transition_id;
+        let open = self.left_sidebar_open;
+        let start_width = if transition_id == 0 || open {
+            0.0
+        } else {
+            width
+        };
+        let end_width = if open { width } else { 0.0 };
         let resting = if self.sidebar_resize.is_some() {
             self.theme.border_strong
         } else {
             self.theme.transparent
         };
 
-        div()
+        let handle = div()
             .id("sidebar_resize_handle")
             .absolute()
             .top_0()
@@ -8789,10 +9101,31 @@ impl RemCmdApp {
             .justify_center()
             .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
             .bg(self.theme.transparent)
-            .cursor(CursorStyle::ResizeLeftRight)
-            .hover(move |this| this.bg(hover))
-            .child(div().w(px(1.0)).h_full().bg(resting))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_sidebar_resize))
+            .child(div().w(px(1.0)).h_full().bg(resting));
+        let handle = if open {
+            handle
+                .cursor(CursorStyle::ResizeLeftRight)
+                .hover(move |this| this.bg(hover))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_sidebar_resize))
+        } else {
+            handle
+        };
+
+        handle.with_animation(
+            SharedString::from(format!("left-sidebar-resize-handle-{transition_id}")),
+            Animation::new(if transition_id == 0 {
+                MOTION_INSTANT_DURATION
+            } else {
+                MOTION_STANDARD_DURATION
+            })
+            .with_easing(ease_in_out),
+            move |this, delta| {
+                let animated_width = start_width + (end_width - start_width) * delta;
+                let progress = if open { delta } else { 1.0 - delta };
+                this.left(px(animated_width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
+                    .opacity(progress)
+            },
+        )
     }
 
     fn render_right_sidebar_resize_handle(
@@ -8802,14 +9135,20 @@ impl RemCmdApp {
     ) -> impl IntoElement {
         let hover = self.theme.border_strong;
         let transition_id = self.right_sidebar_transition_id;
-        let start_width = if transition_id == 0 { width } else { 0.0 };
+        let open = self.right_sidebar_open;
+        let start_width = if transition_id == 0 || open {
+            0.0
+        } else {
+            width
+        };
+        let end_width = if open { width } else { 0.0 };
         let resting = if self.right_sidebar_resize.is_some() {
             self.theme.border_strong
         } else {
             self.theme.transparent
         };
 
-        div()
+        let handle = div()
             .id("right_sidebar_resize_handle")
             .absolute()
             .top_0()
@@ -8819,26 +9158,34 @@ impl RemCmdApp {
             .justify_center()
             .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
             .bg(self.theme.transparent)
-            .cursor(CursorStyle::ResizeLeftRight)
-            .hover(move |this| this.bg(hover))
-            .child(div().w(px(1.0)).h_full().bg(resting))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(Self::begin_right_sidebar_resize),
-            )
-            .with_animation(
-                SharedString::from(format!("right-sidebar-resize-handle-{transition_id}")),
-                Animation::new(if transition_id == 0 {
-                    Duration::from_millis(1)
-                } else {
-                    Duration::from_millis(180)
-                })
-                .with_easing(ease_in_out),
-                move |this, delta| {
-                    let animated_width = start_width + (width - start_width) * delta;
-                    this.right(px(animated_width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
-                },
-            )
+            .child(div().w(px(1.0)).h_full().bg(resting));
+        let handle = if open {
+            handle
+                .cursor(CursorStyle::ResizeLeftRight)
+                .hover(move |this| this.bg(hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(Self::begin_right_sidebar_resize),
+                )
+        } else {
+            handle
+        };
+
+        handle.with_animation(
+            SharedString::from(format!("right-sidebar-resize-handle-{transition_id}")),
+            Animation::new(if transition_id == 0 {
+                MOTION_INSTANT_DURATION
+            } else {
+                MOTION_STANDARD_DURATION
+            })
+            .with_easing(ease_in_out),
+            move |this, delta| {
+                let animated_width = start_width + (end_width - start_width) * delta;
+                let progress = if open { delta } else { 1.0 - delta };
+                this.right(px(animated_width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
+                    .opacity(progress)
+            },
+        )
     }
 
     fn render_server_performance(&self, session_id: SessionId) -> AnyElement {
@@ -9543,9 +9890,10 @@ impl RemCmdApp {
                     .child("No connections yet"),
             );
         } else {
-            for (index, profile) in self.profiles.iter().take(6).enumerate() {
+            let visible_profile_count = self.profiles.len().min(6);
+            for (index, profile) in self.profiles.iter().take(visible_profile_count).enumerate() {
                 let profile_id = profile.id.clone();
-                let hover = self.theme.list_hover_bg;
+                let hover = self.theme.control_hover_bg;
                 connections = connections.child(
                     div()
                         .id(SharedString::from(format!("home-profile-{}", profile.id)))
@@ -9555,6 +9903,10 @@ impl RemCmdApp {
                         .gap_3()
                         .h(px(52.0))
                         .px_3()
+                        .when(index == 0, |this| this.rounded_t_lg())
+                        .when(index + 1 == visible_profile_count, |this| {
+                            this.rounded_b_lg()
+                        })
                         .cursor_pointer()
                         .hover(move |this| this.bg(hover))
                         .child(self.render_sidebar_icon(IconName::Server, 19.0))
@@ -9580,7 +9932,7 @@ impl RemCmdApp {
                                 ),
                         )
                         .child(self.render_sidebar_icon(IconName::Expand, 14.0))
-                        .when(index + 1 < self.profiles.len().min(6), |this| {
+                        .when(index + 1 < visible_profile_count, |this| {
                             this.child(
                                 div()
                                     .absolute()
@@ -10215,7 +10567,9 @@ impl RemCmdApp {
         let max_control_width = selector.control_width();
         let menu_width = selector.menu_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
-        let mut menu = self
+        let option_count = selector.options().len();
+        let menu_height = select_menu_height(option_count);
+        let menu = self
             .glass_floating_surface()
             .id(SharedString::from(format!(
                 "{}-menu",
@@ -10225,61 +10579,36 @@ impl RemCmdApp {
             .top(px(26.0))
             .right_0()
             .w(px(menu_width))
+            .h(px(menu_height))
             .flex()
             .flex_col()
-            .max_h(px(260.0))
-            .overflow_y_scroll()
             .p_1()
             .text_sm()
             .occlude();
-        let selected_value = self.settings_value(selector);
-        let option_hover = self.theme.accent;
-        let option_pressed = self.theme.accent_hover;
-        let on_accent = self.theme.on_accent;
-        for (index, option) in selector.options().iter().copied().enumerate() {
-            let is_selected = option.value == selected_value;
-            let hover_group: SharedString =
-                format!("{}-option-{index}-hover", selector.element_id()).into();
-            let mut check = div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(px(16.0));
-            if is_selected {
-                check = check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+        let menu = if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
+            menu.overflow_hidden().child(
+                uniform_list(
+                    SharedString::from(format!("{}-virtual-options", selector.element_id())),
+                    option_count,
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                        this.render_virtual_settings_selector_rows(selector, range, cx)
+                    }),
+                )
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .track_scroll(self.settings_virtual_selector_scroll_handle.clone()),
+            )
+        } else {
+            let mut menu = menu
+                .overflow_y_scroll()
+                .track_scroll(&self.settings_selector_scroll_handle);
+            for (index, option) in selector.options().iter().copied().enumerate() {
+                menu = menu
+                    .child(self.render_settings_selector_row(selector, index, option, false, cx));
             }
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "{}-option-{index}",
-                        selector.element_id()
-                    )))
-                    .group(hover_group.clone())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(28.0))
-                    .px_2()
-                    .rounded_md()
-                    .when(is_selected, |this| {
-                        this.bg(self.theme.accent).text_color(self.theme.on_accent)
-                    })
-                    .cursor_pointer()
-                    .hover(move |this| this.bg(option_hover).text_color(on_accent))
-                    .active(move |this| this.bg(option_pressed).text_color(on_accent))
-                    .child(check)
-                    .child(self.render_select_menu_label(
-                        option.label.into(),
-                        is_selected,
-                        hover_group,
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.apply_settings_value(option.value, window, cx);
-                    })),
-            );
-        }
+            menu
+        };
 
         let button_hover = self.theme.control_hover_bg;
         let button_pressed = self.theme.control_pressed_bg;
@@ -10346,12 +10675,82 @@ impl RemCmdApp {
             .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
     }
 
+    fn render_settings_selector_row(
+        &self,
+        selector: SettingsSelector,
+        index: usize,
+        option: SettingsOption,
+        virtualized: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_selected = option.value == self.settings_value(selector);
+        let hover_group: SharedString =
+            format!("{}-option-{index}-hover", selector.element_id()).into();
+        let check = self.render_select_menu_check(is_selected, hover_group.clone());
+        let label = if virtualized {
+            self.render_virtual_select_menu_label(
+                option.label.into(),
+                hover_group.clone(),
+                selector.menu_width() - 40.0,
+            )
+        } else {
+            self.render_select_menu_label(option.label.into(), hover_group.clone())
+        };
+        let option_hover = self.theme.accent;
+        let option_pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
+
+        let row = div()
+            .id(SharedString::from(format!(
+                "{}-option-{index}",
+                selector.element_id()
+            )))
+            .group(hover_group)
+            .flex()
+            .flex_none()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .h(px(SELECT_MENU_ROW_HEIGHT))
+            .px_2()
+            .rounded_md()
+            .text_color(self.theme.text_primary)
+            .cursor_pointer()
+            .hover(move |this| this.bg(option_hover).text_color(on_accent))
+            .active(move |this| this.bg(option_pressed).text_color(on_accent))
+            .child(check)
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.apply_settings_value(option.value, window, cx);
+            }));
+
+        row.into_any_element()
+    }
+
+    fn render_virtual_settings_selector_rows(
+        &self,
+        selector: SettingsSelector,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        range
+            .filter_map(|index| {
+                selector.options().get(index).copied().map(|option| {
+                    self.render_settings_selector_row(selector, index, option, true, cx)
+                })
+            })
+            .collect()
+    }
+
     fn render_terminal_font_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
         let selector = SettingsSelector::TerminalFont;
         let is_open = self.open_settings_selector == Some(selector);
         let max_control_width = selector.control_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
-        let mut menu = self
+        let option_count = self.terminal_font_families.len();
+        let menu_height = select_menu_height(option_count);
+        let menu = self
             .glass_floating_surface()
             .id(SharedString::from(format!(
                 "{}-menu",
@@ -10361,57 +10760,35 @@ impl RemCmdApp {
             .top(px(26.0))
             .right_0()
             .w(px(selector.menu_width()))
-            .max_h(px(260.0))
+            .h(px(menu_height))
             .flex()
             .flex_col()
-            .overflow_y_scroll()
             .p_1()
             .text_sm()
             .occlude();
-        let option_hover = self.theme.accent;
-        let option_pressed = self.theme.accent_hover;
-        let on_accent = self.theme.on_accent;
-        for (index, family) in self.terminal_font_families.iter().cloned().enumerate() {
-            let is_selected = family == self.terminal_font_family;
-            let hover_group: SharedString =
-                format!("{}-option-{index}-hover", selector.element_id()).into();
-            let mut check = div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(px(16.0));
-            if is_selected {
-                check = check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
+        let menu = if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
+            menu.overflow_hidden().child(
+                uniform_list(
+                    "settings-terminal-font-virtual-options",
+                    option_count,
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                        this.render_virtual_terminal_font_selector_rows(range, cx)
+                    }),
+                )
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .track_scroll(self.settings_virtual_selector_scroll_handle.clone()),
+            )
+        } else {
+            let mut menu = menu
+                .overflow_y_scroll()
+                .track_scroll(&self.settings_selector_scroll_handle);
+            for (index, family) in self.terminal_font_families.iter().cloned().enumerate() {
+                menu = menu.child(self.render_terminal_font_selector_row(index, family, false, cx));
             }
-            let selected_family = family.clone();
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "{}-option-{index}",
-                        selector.element_id()
-                    )))
-                    .group(hover_group.clone())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(28.0))
-                    .px_2()
-                    .rounded_md()
-                    .when(is_selected, |this| {
-                        this.bg(self.theme.accent).text_color(self.theme.on_accent)
-                    })
-                    .cursor_pointer()
-                    .hover(move |this| this.bg(option_hover).text_color(on_accent))
-                    .active(move |this| this.bg(option_pressed).text_color(on_accent))
-                    .child(check)
-                    .child(self.render_select_menu_label(family, is_selected, hover_group))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_terminal_font_family(selected_family.clone(), cx);
-                    })),
-            );
-        }
+            menu
+        };
 
         let button_hover = self.theme.control_hover_bg;
         let button_pressed = self.theme.control_pressed_bg;
@@ -10477,17 +10854,80 @@ impl RemCmdApp {
             .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
     }
 
+    fn render_terminal_font_selector_row(
+        &self,
+        index: usize,
+        family: SharedString,
+        virtualized: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selector = SettingsSelector::TerminalFont;
+        let is_selected = family == self.terminal_font_family;
+        let hover_group: SharedString =
+            format!("{}-option-{index}-hover", selector.element_id()).into();
+        let check = self.render_select_menu_check(is_selected, hover_group.clone());
+        let label = if virtualized {
+            self.render_virtual_select_menu_label(
+                family.clone(),
+                hover_group.clone(),
+                selector.menu_width() - 40.0,
+            )
+        } else {
+            self.render_select_menu_label(family.clone(), hover_group.clone())
+        };
+        let selected_family = family;
+        let option_hover = self.theme.accent;
+        let option_pressed = self.theme.accent_hover;
+        let on_accent = self.theme.on_accent;
+
+        let row = div()
+            .id(SharedString::from(format!(
+                "{}-option-{index}",
+                selector.element_id()
+            )))
+            .group(hover_group)
+            .flex()
+            .flex_none()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .h(px(SELECT_MENU_ROW_HEIGHT))
+            .px_2()
+            .rounded_md()
+            .text_color(self.theme.text_primary)
+            .cursor_pointer()
+            .hover(move |this| this.bg(option_hover).text_color(on_accent))
+            .active(move |this| this.bg(option_pressed).text_color(on_accent))
+            .child(check)
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_terminal_font_family(selected_family.clone(), cx);
+            }));
+
+        row.into_any_element()
+    }
+
+    fn render_virtual_terminal_font_selector_rows(
+        &self,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        range
+            .filter_map(|index| {
+                self.terminal_font_families
+                    .get(index)
+                    .cloned()
+                    .map(|family| self.render_terminal_font_selector_row(index, family, true, cx))
+            })
+            .collect()
+    }
+
     fn render_select_menu_label(
         &self,
         label: SharedString,
-        selected: bool,
         hover_group: SharedString,
     ) -> gpui::Div {
-        let base_color = if selected {
-            self.theme.on_accent
-        } else {
-            self.theme.text_primary
-        };
         let hover_label = label.clone();
 
         div()
@@ -10503,7 +10943,7 @@ impl RemCmdApp {
                     .size_full()
                     .min_w(px(0.0))
                     .truncate()
-                    .text_color(base_color)
+                    .text_color(self.theme.text_primary)
                     .group_hover(hover_group.clone(), |style| style.opacity(0.0))
                     .child(label),
             )
@@ -10519,6 +10959,85 @@ impl RemCmdApp {
                     .text_color(self.theme.on_accent)
                     .group_hover(hover_group, |style| style.opacity(1.0))
                     .child(hover_label),
+            )
+    }
+
+    fn render_virtual_select_menu_label(
+        &self,
+        label: SharedString,
+        hover_group: SharedString,
+        max_width: f32,
+    ) -> gpui::Div {
+        let hover_label = label.clone();
+
+        div()
+            .relative()
+            .flex()
+            .flex_none()
+            .min_w(px(0.0))
+            .max_w(px(max_width))
+            .h_full()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_w(px(0.0))
+                    .max_w(px(max_width))
+                    .h_full()
+                    .truncate()
+                    .text_color(self.theme.text_primary)
+                    .group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .min_w(px(0.0))
+                    .max_w(px(max_width))
+                    .truncate()
+                    .opacity(0.0)
+                    .text_color(self.theme.on_accent)
+                    .group_hover(hover_group, |style| style.opacity(1.0))
+                    .child(hover_label),
+            )
+    }
+
+    fn render_select_menu_check(&self, selected: bool, hover_group: SharedString) -> gpui::Div {
+        let check = div()
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(16.0));
+        if !selected {
+            return check;
+        }
+
+        check
+            .child(
+                div()
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_full()
+                    .group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                    .child(icon_with_color(IconName::Check, self.theme.accent, 15.0)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_full()
+                    .opacity(0.0)
+                    .group_hover(hover_group, |style| style.opacity(1.0))
+                    .child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0)),
             )
     }
 
@@ -10994,9 +11513,8 @@ impl RemCmdApp {
         };
         let on_accent = self.theme.on_accent;
         let base_color = match tone {
-            IconTone::Danger => self.theme.danger,
             IconTone::Accent => self.theme.accent,
-            IconTone::Default => self.theme.text_primary,
+            IconTone::Danger | IconTone::Default => self.theme.text_primary,
         };
         let hover_group = SharedString::from(format!("{id}-hover"));
         div()
@@ -11284,16 +11802,7 @@ impl RemCmdApp {
                 let is_selected = prompt.selected_profile_ids.contains(profile_id);
                 let hover_group: SharedString =
                     format!("quick-command-target-option-{index}-hover").into();
-                let mut check = div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(16.0));
-                if is_selected {
-                    check =
-                        check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
-                }
+                let check = self.render_select_menu_check(is_selected, hover_group.clone());
                 let target_profile_id = profile_id.clone();
                 menu = menu.child(
                     div()
@@ -11302,23 +11811,19 @@ impl RemCmdApp {
                         )))
                         .group(hover_group.clone())
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap_2()
                         .h(px(28.0))
                         .px_2()
                         .rounded_md()
-                        .when(is_selected, |this| {
-                            this.bg(self.theme.accent).text_color(self.theme.on_accent)
-                        })
                         .cursor_pointer()
                         .hover(move |this| this.bg(option_hover).text_color(on_accent))
                         .active(move |this| this.bg(option_pressed).text_color(on_accent))
                         .child(check)
-                        .child(self.render_select_menu_label(
-                            profile.name.clone().into(),
-                            is_selected,
-                            hover_group,
-                        ))
+                        .child(
+                            self.render_select_menu_label(profile.name.clone().into(), hover_group),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle_quick_command_target(target_profile_id.clone(), cx);
@@ -12719,38 +13224,23 @@ impl RemCmdApp {
             {
                 let is_selected = auth_kind == selected;
                 let hover_group: SharedString = format!("profile-auth-option-{index}-hover").into();
-                let mut check = div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(16.0));
-                if is_selected {
-                    check =
-                        check.child(icon_with_color(IconName::Check, self.theme.on_accent, 15.0));
-                }
+                let check = self.render_select_menu_check(is_selected, hover_group.clone());
                 menu = menu.child(
                     div()
                         .id(SharedString::from(format!("profile-auth-option-{index}")))
                         .group(hover_group.clone())
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap_2()
                         .h(px(28.0))
                         .px_2()
                         .rounded_md()
-                        .when(is_selected, |this| {
-                            this.bg(self.theme.accent).text_color(self.theme.on_accent)
-                        })
                         .cursor_pointer()
                         .hover(move |this| this.bg(option_hover).text_color(on_accent))
                         .active(move |this| this.bg(option_pressed).text_color(on_accent))
                         .child(check)
-                        .child(self.render_select_menu_label(
-                            label.into(),
-                            is_selected,
-                            hover_group,
-                        ))
+                        .child(self.render_select_menu_label(label.into(), hover_group))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.select_auth_method(auth_kind, window, cx);
@@ -12999,6 +13489,18 @@ fn clamp_sidebar_width(requested: f32, viewport_width: f32) -> f32 {
     } else {
         requested.clamp(SIDEBAR_MIN_WIDTH, available_width)
     }
+}
+
+fn select_menu_height(option_count: usize) -> f32 {
+    option_count.clamp(1, SELECT_MENU_MAX_VISIBLE_ROWS) as f32 * SELECT_MENU_ROW_HEIGHT + 8.0
+}
+
+fn select_menu_scroll_offset(selected_index: usize, option_count: usize) -> f32 {
+    let visible_rows = option_count.min(SELECT_MENU_MAX_VISIBLE_ROWS);
+    let first_visible = selected_index
+        .saturating_sub(visible_rows / 2)
+        .min(option_count.saturating_sub(visible_rows));
+    first_visible as f32 * SELECT_MENU_ROW_HEIGHT
 }
 
 fn clamp_right_sidebar_width(requested: f32, viewport_width: f32, left_sidebar_width: f32) -> f32 {
@@ -13896,6 +14398,76 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remcmd_terminal::DamageRange;
+
+    #[test]
+    fn terminal_damage_merge_coalesces_rows_and_preserves_full_repaints() {
+        let mut damage = TerminalDamage::Partial(vec![DamageRange {
+            row: 3,
+            left: 5,
+            right: 8,
+        }]);
+
+        merge_terminal_damage(
+            &mut damage,
+            TerminalDamage::Partial(vec![
+                DamageRange {
+                    row: 3,
+                    left: 2,
+                    right: 6,
+                },
+                DamageRange {
+                    row: 7,
+                    left: 1,
+                    right: 4,
+                },
+            ]),
+        );
+
+        assert_eq!(
+            damage,
+            TerminalDamage::Partial(vec![
+                DamageRange {
+                    row: 3,
+                    left: 2,
+                    right: 8,
+                },
+                DamageRange {
+                    row: 7,
+                    left: 1,
+                    right: 4,
+                },
+            ])
+        );
+
+        merge_terminal_damage(&mut damage, TerminalDamage::Full);
+        assert_eq!(damage, TerminalDamage::Full);
+    }
+
+    #[test]
+    fn terminal_render_snapshot_is_reused_until_screen_damage_arrives() {
+        let mut terminal = ActiveTerminal::new("profile".into(), PtySize::default());
+
+        let (first, first_damage) = terminal.snapshot_for_render();
+        assert_eq!(first_damage, TerminalDamage::Full);
+
+        let (second, second_damage) = terminal.snapshot_for_render();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(second_damage, TerminalDamage::Partial(Vec::new()));
+
+        terminal.process(b"changed");
+        let (third, third_damage) = terminal.snapshot_for_render();
+        assert!(!Rc::ptr_eq(&second, &third));
+        assert!(matches!(third_damage, TerminalDamage::Partial(ranges) if !ranges.is_empty()));
+    }
+
+    #[test]
+    fn select_menu_scroll_offset_centers_and_clamps_the_selected_option() {
+        assert_eq!(select_menu_scroll_offset(0, 17), 0.0);
+        assert_eq!(select_menu_scroll_offset(8, 17), 4.0 * 28.0);
+        assert_eq!(select_menu_scroll_offset(16, 17), 8.0 * 28.0);
+        assert_eq!(select_menu_scroll_offset(2, 3), 0.0);
+    }
 
     #[test]
     fn application_menu_exposes_workspace_operations() {

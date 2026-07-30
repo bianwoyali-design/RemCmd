@@ -1,11 +1,18 @@
+use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
+
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, FontStyle, FontWeight, Pixels, ShapedLine, TextStyle,
-    Window, fill, outline, point, px, rgb, size,
+    App, BorderStyle, Bounds, ContentMask, FontStyle, FontWeight, Pixels, ShapedLine, SharedString,
+    TextStyle, Window, fill, outline, point, px, rgb, size,
 };
 
-use remcmd_terminal::CursorShape;
+use remcmd_terminal::{
+    CursorShape, PaletteOverrides, TerminalCursor, TerminalDamage, TerminalSelection, TerminalSize,
+    TerminalSnapshot,
+};
 
-use crate::terminal_view::{TerminalRunStyle, TerminalViewModel, ViewColor};
+use crate::terminal_view::{
+    TerminalPalette, TerminalRow, TerminalRunStyle, TerminalViewModel, ViewColor,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TerminalCellMetrics {
@@ -29,15 +36,47 @@ impl TerminalCellMetrics {
 }
 
 pub(crate) struct TerminalCanvasFrame {
-    rows: Vec<PreparedRow>,
+    rows: Vec<Arc<PreparedRow>>,
     default_background: ViewColor,
     metrics: TerminalCellMetrics,
 }
 
+pub(crate) struct TerminalCanvasInput<'a> {
+    pub(crate) cache: &'a Rc<RefCell<TerminalCanvasCache>>,
+    pub(crate) snapshot: &'a TerminalSnapshot,
+    pub(crate) damage: TerminalDamage,
+    pub(crate) selection: Option<TerminalSelection>,
+    pub(crate) palette: TerminalPalette,
+    pub(crate) font_family: SharedString,
+    pub(crate) font_size: f32,
+    pub(crate) metrics: TerminalCellMetrics,
+}
+
+#[derive(Default)]
+pub(crate) struct TerminalCanvasCache {
+    key: Option<TerminalCanvasCacheKey>,
+    cursor: Option<TerminalCursor>,
+    rows: Vec<Arc<PreparedRow>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TerminalCanvasCacheKey {
+    size: TerminalSize,
+    display_offset: usize,
+    palette_overrides: PaletteOverrides,
+    palette: TerminalPalette,
+    selection: Option<TerminalSelection>,
+    font_family: SharedString,
+    font_size: f32,
+    metrics: TerminalCellMetrics,
+}
+
+#[derive(Clone)]
 struct PreparedRow {
     cells: Vec<PreparedCell>,
 }
 
+#[derive(Clone)]
 struct PreparedCell {
     column: usize,
     width: usize,
@@ -46,48 +85,80 @@ struct PreparedCell {
 }
 
 impl TerminalCanvasFrame {
-    pub(crate) fn prepare(
-        model: TerminalViewModel,
-        metrics: TerminalCellMetrics,
-        window: &mut Window,
-    ) -> Self {
+    pub(crate) fn prepare(input: TerminalCanvasInput<'_>, window: &mut Window) -> Self {
+        let TerminalCanvasInput {
+            cache,
+            snapshot,
+            damage,
+            selection,
+            palette,
+            font_family,
+            font_size: terminal_font_size,
+            metrics,
+        } = input;
+        let key = TerminalCanvasCacheKey {
+            size: snapshot.size,
+            display_offset: snapshot.display_offset,
+            palette_overrides: snapshot.palette_overrides.clone(),
+            palette,
+            selection,
+            font_family,
+            font_size: terminal_font_size,
+            metrics,
+        };
+        let mut cache = cache.borrow_mut();
         let base_style = window.text_style().clone();
         let font_size = base_style.font_size.to_pixels(window.rem_size());
-        let rows = model
-            .rows
-            .into_iter()
-            .map(|row| PreparedRow {
-                cells: row
-                    .cells
+        let full_rebuild = cache.key.as_ref() != Some(&key)
+            || matches!(damage, TerminalDamage::Full)
+            || cache.rows.len() != snapshot.size.rows();
+        let mut damaged_rows = BTreeSet::new();
+        if let TerminalDamage::Partial(ranges) = damage {
+            damaged_rows.extend(
+                ranges
                     .into_iter()
-                    .map(|cell| {
-                        let line = if cell.text.chars().all(|character| character == ' ') {
-                            None
-                        } else {
-                            let style = text_style_for_cell(&base_style, cell.style);
-                            let run = style.to_run(cell.text.len());
-                            Some(window.text_system().shape_line(
-                                cell.text.into(),
-                                font_size,
-                                &[run],
-                                None,
-                            ))
-                        };
+                    .map(|range| range.row)
+                    .filter(|row| *row < snapshot.size.rows()),
+            );
+        }
+        if cache.cursor != snapshot.cursor {
+            if let Some(cursor) = cache.cursor {
+                damaged_rows.insert(cursor.row);
+            }
+            if let Some(cursor) = snapshot.cursor {
+                damaged_rows.insert(cursor.row);
+            }
+        }
 
-                        PreparedCell {
-                            column: cell.column,
-                            width: cell.width,
-                            line,
-                            style: cell.style,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        if full_rebuild {
+            cache.rows = (0..snapshot.size.rows())
+                .map(|row| {
+                    Arc::new(prepare_row(
+                        TerminalViewModel::row_from_snapshot(snapshot, row, selection, palette),
+                        &base_style,
+                        font_size,
+                        window,
+                    ))
+                })
+                .collect();
+        } else {
+            for row in damaged_rows {
+                if let Some(slot) = cache.rows.get_mut(row) {
+                    *slot = Arc::new(prepare_row(
+                        TerminalViewModel::row_from_snapshot(snapshot, row, selection, palette),
+                        &base_style,
+                        font_size,
+                        window,
+                    ));
+                }
+            }
+        }
+        cache.key = Some(key);
+        cache.cursor = snapshot.cursor;
 
         Self {
-            rows,
-            default_background: model.background,
+            rows: cache.rows.clone(),
+            default_background: palette.background,
             metrics,
         }
     }
@@ -190,6 +261,40 @@ impl TerminalCanvasFrame {
                 px(self.metrics.height),
             ),
         )
+    }
+}
+
+fn prepare_row(
+    row: TerminalRow,
+    base_style: &TextStyle,
+    font_size: Pixels,
+    window: &mut Window,
+) -> PreparedRow {
+    PreparedRow {
+        cells: row
+            .cells
+            .into_iter()
+            .map(|cell| {
+                let line = if cell.text.chars().all(|character| character == ' ') {
+                    None
+                } else {
+                    let style = text_style_for_cell(base_style, cell.style);
+                    let run = style.to_run(cell.text.len());
+                    Some(
+                        window
+                            .text_system()
+                            .shape_line(cell.text.into(), font_size, &[run], None),
+                    )
+                };
+
+                PreparedCell {
+                    column: cell.column,
+                    width: cell.width,
+                    line,
+                    style: cell.style,
+                }
+            })
+            .collect(),
     }
 }
 

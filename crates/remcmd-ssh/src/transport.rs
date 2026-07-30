@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -20,8 +21,14 @@ use russh::keys::agent::{AgentIdentity, client::AgentClient};
 
 use russh_sftp::client::SftpSession;
 use secrecy::{ExposeSecret, SecretString};
+use tokio::{
+    net::{TcpStream, lookup_host},
+    task::JoinSet,
+};
 
-use crate::{AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell};
+use crate::{
+    AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell, shell_integration,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -199,7 +206,11 @@ impl SshTransport {
             profile.port,
             unknown_server_key.clone(),
         );
-        let connection = client::connect(config, (profile.host.as_str(), profile.port), handler);
+        let connection = async {
+            let socket = connect_tcp(&profile.host, profile.port).await?;
+            let _ = socket.set_nodelay(true);
+            client::connect_stream(config, socket, handler).await
+        };
 
         let result = tokio::time::timeout(timeout, connection)
             .await
@@ -543,9 +554,21 @@ impl SshTransport {
     }
 
     pub async fn open_shell(&self, size: PtySize) -> Result<SshShell, SshError> {
-        tokio::time::timeout(SHELL_OPEN_TIMEOUT, SshShell::open(&self.handle, size, true))
-            .await
-            .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote shell timed out"))?
+        tokio::time::timeout(
+            SHELL_OPEN_TIMEOUT,
+            SshShell::open(&self.handle, size, false),
+        )
+        .await
+        .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote shell timed out"))?
+    }
+
+    pub(crate) async fn detect_shell(
+        &self,
+    ) -> Result<Option<shell_integration::ShellKind>, SshError> {
+        let output = self
+            .execute(shell_integration::DETECT_SHELL_COMMAND)
+            .await?;
+        Ok(shell_integration::detect_shell(&output))
     }
 
     pub(crate) async fn open_sftp(&self) -> Result<SftpSession, SshError> {
@@ -657,6 +680,53 @@ impl SshTransport {
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
     }
+}
+
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
+    let addresses = lookup_host((host, port)).await.map_err(|error| {
+        SshError::new(
+            SshErrorKind::Network,
+            format!("failed to resolve {host}:{port}: {error}"),
+        )
+    })?;
+    race_tcp_connections(addresses).await
+}
+
+async fn race_tcp_connections(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Result<TcpStream, SshError> {
+    let mut attempts = JoinSet::new();
+    let mut unique_addresses = Vec::new();
+    for address in addresses {
+        if !unique_addresses.contains(&address) {
+            unique_addresses.push(address);
+            attempts.spawn(async move { (address, TcpStream::connect(address).await) });
+        }
+    }
+
+    if unique_addresses.is_empty() {
+        return Err(SshError::new(
+            SshErrorKind::Network,
+            "the SSH host did not resolve to an address",
+        ));
+    }
+
+    let mut failures = Vec::new();
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok((_, Ok(stream))) => {
+                attempts.abort_all();
+                return Ok(stream);
+            }
+            Ok((address, Err(error))) => failures.push(format!("{address}: {error}")),
+            Err(error) => failures.push(format!("connection attempt failed: {error}")),
+        }
+    }
+
+    Err(SshError::new(
+        SshErrorKind::Network,
+        format!("all SSH addresses failed: {}", failures.join("; ")),
+    ))
 }
 
 fn append_command_output(output: &mut Vec<u8>, data: &[u8]) -> Result<(), SshError> {
@@ -834,6 +904,24 @@ mod tests {
 
         assert_eq!(error.kind(), SshErrorKind::HostKeyUntrusted);
         assert!(error.message().contains("localhost:22"));
+    }
+
+    #[tokio::test]
+    async fn tcp_connection_uses_the_first_reachable_resolved_address() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reachable listener");
+        let reachable = listener.local_addr().expect("reachable address");
+        let refused_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("temporary refused address");
+        let refused = refused_listener.local_addr().expect("refused address");
+        drop(refused_listener);
+
+        let stream = race_tcp_connections([refused, reachable])
+            .await
+            .expect("one resolved address should connect");
+
+        assert_eq!(stream.peer_addr().expect("peer address"), reachable);
     }
 
     #[tokio::test]
