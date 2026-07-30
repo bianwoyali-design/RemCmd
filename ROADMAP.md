@@ -1,7 +1,7 @@
 # Roadmap
 
-RemCmd has reached its first public alpha release. The roadmap below describes
-the delivered foundations and the work that remains before a stable release.
+RemCmd is entering public beta. The roadmap below describes the delivered
+foundations and the work that remains before a stable release.
 
 ## Completed
 
@@ -16,7 +16,8 @@ the delivered foundations and the work that remains before a stable release.
 
 ### SSH and Terminal
 
-- Password, private-key, passwordless, and SSH Agent authentication.
+- Password, private-key, and passwordless authentication, plus SSH Agent
+  authentication on macOS and Linux.
 - Host-key verification and explicit first-use fingerprint trust.
 - Interactive PTY shell, ANSI rendering, clipboard, selection, scrollback,
   terminal tabs, and nested splits.
@@ -35,7 +36,7 @@ the delivered foundations and the work that remains before a stable release.
 
 ## Current Focus
 
-The alpha channel focuses on installation validation, compatibility fixes, and
+The beta channel focuses on installation validation, compatibility fixes, and
 feedback from real SSH and SFTP workloads across macOS, Windows, and Linux.
 
 ## Before Stable
@@ -43,6 +44,6 @@ feedback from real SSH and SFTP workloads across macOS, Windows, and Linux.
 - Developer ID signing and notarization for macOS.
 - Authenticode signing for Windows.
 - Broader installation and upgrade testing across supported platforms.
-- Documentation and compatibility improvements driven by alpha feedback.
+- Documentation and compatibility improvements driven by beta feedback.
 
 The roadmap is directional rather than a promise of dates or feature order.

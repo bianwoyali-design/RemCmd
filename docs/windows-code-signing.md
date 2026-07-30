@@ -12,20 +12,21 @@ user-facing Cargo version may use SemVer prerelease labels. The WiX-only
 `cargo-packager`'s automatic `Packager.toml` discovery, so the WiX-only version
 cannot create an extra macOS or Linux package.
 
-For `v0.1.0-alpha.1`, the Cargo version remains `0.1.0-alpha.1`, while the
-MSI version is `0.0.0.1`. This keeps the alpha installer older than the future
-`0.1.0` final installer. Before publishing another prerelease, update the
-Windows version monotonically: `alpha.N` uses `0.0.0.N`, `beta.N` uses
+For `v0.1.0-beta.1`, the Cargo version is `0.1.0-beta.1`, while the WiX
+configuration uses `0.0.1+1`, which produces MSI `ProductVersion` `0.0.1.1`.
+This keeps the beta installer newer than alpha installers and older than the
+future `0.1.0` final installer. Before publishing another prerelease, update
+the Windows version monotonically: `alpha.N` uses `0.0.0.N`, `beta.N` uses
 `0.0.1.N`, and `rc.N` uses `0.0.2.N`. Replace it with `0.1.0` for the final
 `v0.1.0` release.
 
 The generated installer is renamed after packaging for release distribution,
 so its filename remains user-facing SemVer, for example
-`RemCmd-v0.1.0-alpha.1-windows-x86_64.msi`. Only the internal MSI
+`RemCmd-v0.1.0-beta.1-windows-x86_64.msi`. Only the internal MSI
 `ProductVersion` needs the numeric value.
 
-Do not use `0.1.0.1` for an alpha of `0.1.0`: Windows Installer considers it
-newer than the eventual `0.1.0` release.
+Do not use `0.1.0.1` for a prerelease of `0.1.0`: Windows Installer considers
+it newer than the eventual `0.1.0` release.
 
 ## Future SignPath Configuration
 

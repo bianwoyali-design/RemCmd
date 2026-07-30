@@ -2,7 +2,7 @@
 
 Download the latest RemCmd package from the
 [GitHub Releases page](https://github.com/bianwoyali-design/RemCmd/releases).
-Release builds are alpha software. Verify that the release and downloaded file
+Release builds are beta software. Verify that the release and downloaded file
 come from the official `bianwoyali-design/RemCmd` repository before installing.
 
 ## macOS
@@ -18,10 +18,14 @@ one-time confirmation for both the DMG and the app.
 
 ## Windows
 
-Download and run the `RemCmd-v*-windows-x86_64.msi` installer. The current installer is not yet
-Authenticode-signed, so Microsoft Defender SmartScreen can require an explicit
-confirmation. Check that the installer came from the official release before
-choosing **More info** and **Run anyway**.
+Download and run the `RemCmd-v*-windows-x86_64.msi` installer. The current
+installer is not yet Authenticode-signed, so Microsoft Defender SmartScreen can
+require an explicit confirmation. Check that the installer came from the
+official release before choosing **More info** and **Run anyway**.
+
+Windows supports Password, Private Key, and Passwordless authentication. The
+current SSH Agent integration uses `SSH_AUTH_SOCK` on Unix and does not support
+Windows OpenSSH Agent or Pageant.
 
 ## Linux
 
