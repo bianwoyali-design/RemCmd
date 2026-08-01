@@ -124,7 +124,6 @@ const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
 const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
 const TITLEBAR_LEFT_CONTROL_EDGE_GAP: f32 = 10.0;
 const WINDOWS_CHROME_HEIGHT: f32 = 34.0;
-const WINDOWS_MENU_BAR_HEIGHT: f32 = 30.0;
 const WINDOWS_TITLEBAR_BUTTON_WIDTH: f32 = 46.0;
 const WINDOWS_TITLEBAR_CONTROLS_WIDTH: f32 = WINDOWS_TITLEBAR_BUTTON_WIDTH * 3.0;
 const WINDOWS_MENU_WIDTH: f32 = 236.0;
@@ -144,7 +143,7 @@ const TERMINAL_FONT_LINE_HEIGHT_FACTOR: f32 = 19.0 / 14.0;
 
 const fn platform_chrome_height() -> f32 {
     if cfg!(target_os = "windows") {
-        WINDOWS_CHROME_HEIGHT + WINDOWS_MENU_BAR_HEIGHT
+        WINDOWS_CHROME_HEIGHT
     } else {
         0.0
     }
@@ -7111,9 +7110,7 @@ impl Render for RemCmdApp {
             root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, cx));
         }
         if cfg!(target_os = "windows") {
-            root = root
-                .child(self.render_windows_chrome())
-                .child(self.render_windows_menu_bar(cx));
+            root = root.child(self.render_windows_chrome(cx));
         }
         root = root.child(self.render_sidebar_resize_handle(sidebar_width, cx));
         if self.right_sidebar_rendered {
@@ -7314,7 +7311,7 @@ impl RemCmdApp {
         }
     }
 
-    fn render_windows_chrome(&self) -> impl IntoElement {
+    fn render_windows_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let drag_area = div()
             .flex_1()
             .h_full()
@@ -7351,29 +7348,14 @@ impl RemCmdApp {
                             .child("RemCmd"),
                     ),
             )
-            .child(drag_area)
-            .child(self.render_windows_titlebar_controls())
-    }
-
-    fn render_windows_menu_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("windows_menu_bar")
-            .absolute()
-            .top(px(WINDOWS_CHROME_HEIGHT - 1.0))
-            .left_0()
-            .right_0()
-            .h(px(WINDOWS_MENU_BAR_HEIGHT + 1.0))
-            .flex()
-            .items_center()
-            .px(px(6.0))
-            .bg(self.solid_sidebar_background())
             .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Edit, "Edit", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Terminal, "Terminal", cx))
             .child(self.render_windows_menu_button(WindowsMenu::View, "View", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Window, "Window", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Help, "Help", cx))
-            .child(div().flex_1().h_full())
+            .child(drag_area)
+            .child(self.render_windows_titlebar_controls())
     }
 
     fn render_windows_menu_button(
@@ -7432,12 +7414,12 @@ impl RemCmdApp {
             return div().into_any_element();
         };
         let left = match menu {
-            WindowsMenu::File => 6.0,
-            WindowsMenu::Edit => 49.0,
-            WindowsMenu::Terminal => 92.0,
-            WindowsMenu::View => 158.0,
-            WindowsMenu::Window => 203.0,
-            WindowsMenu::Help => 267.0,
+            WindowsMenu::File => 94.0,
+            WindowsMenu::Edit => 137.0,
+            WindowsMenu::Terminal => 180.0,
+            WindowsMenu::View => 246.0,
+            WindowsMenu::Window => 291.0,
+            WindowsMenu::Help => 355.0,
         };
         let mut popup = self
             .glass_floating_surface()

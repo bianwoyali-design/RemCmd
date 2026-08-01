@@ -12,8 +12,8 @@ All notable changes to RemCmd are documented in this file.
   in the sidebar and native application menu.
 - A Windows-specific glass titlebar with the RemCmd icon and identity, standard
   minimize, maximize, and close hit targets, a persistent connection search
-  field, and a separate functional File, Edit, Terminal, View, Window, and Help
-  menu bar.
+  field, and integrated functional File, Edit, Terminal, View, Window, and Help
+  menus.
 
 ### Changed
 
