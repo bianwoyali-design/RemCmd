@@ -12,7 +12,8 @@ All notable changes to RemCmd are documented in this file.
   in the sidebar and native application menu.
 - A Windows-specific glass titlebar with the RemCmd icon and identity, standard
   minimize, maximize, and close hit targets, a persistent connection search
-  field, and functional File, Edit, Terminal, View, Window, and Help menus.
+  field, and a separate functional File, Edit, Terminal, View, Window, and Help
+  menu bar.
 
 ### Changed
 
@@ -33,6 +34,8 @@ All notable changes to RemCmd are documented in this file.
 - Single-select menus open near the selected option and retain full-width,
   theme-correct hover rows.
 - Home connection rows preserve their rounded hover corners.
+- Windows limits Mica to the draggable window titlebar; the menu and terminal
+  tab rows use opaque application surfaces with explicit menu text colors.
 
 ### Known Limitations
 
