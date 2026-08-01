@@ -35,6 +35,8 @@ use terminal_canvas::{
 mod terminal_view;
 use terminal_view::{TerminalPalette, palette_color};
 
+mod windows_chrome;
+
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
@@ -125,6 +127,7 @@ const TITLEBAR_CONTROL_HOVER_SIZE: f32 = 28.0;
 const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
 const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
 const TITLEBAR_LEFT_CONTROL_EDGE_GAP: f32 = 10.0;
+const TITLEBAR_EDGE_INSET: f32 = 12.0;
 const WINDOWS_CHROME_HEIGHT: f32 = 34.0;
 const WINDOWS_BRAND_WIDTH: f32 = 112.0;
 const WINDOWS_TITLEBAR_BUTTON_WIDTH: f32 = 46.0;
@@ -7309,9 +7312,13 @@ impl Render for RemCmdApp {
 impl RemCmdApp {
     fn render_windows_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let drag_area = div()
+            .id("windows_chrome_drag_area")
             .flex_1()
             .h_full()
-            .window_control_area(WindowControlArea::Drag);
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| windows_chrome::begin_drag(window)),
+            );
 
         div()
             .id("windows_chrome")
@@ -7335,7 +7342,10 @@ impl RemCmdApp {
                     .w(px(WINDOWS_BRAND_WIDTH))
                     .h_full()
                     .pl(px(12.0))
-                    .window_control_area(WindowControlArea::Drag)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, window, _| windows_chrome::begin_drag(window)),
+                    )
                     .child(wordmark(self.theme, 90.0, 20.0)),
             )
             .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
@@ -7345,7 +7355,7 @@ impl RemCmdApp {
             .child(self.render_windows_menu_button(WindowsMenu::Window, "Window", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Help, "Help", cx))
             .child(drag_area)
-            .child(self.render_windows_titlebar_controls())
+            .child(self.render_windows_titlebar_controls(cx))
     }
 
     fn render_windows_menu_button(
@@ -7765,7 +7775,7 @@ impl RemCmdApp {
         })
     }
 
-    fn render_windows_titlebar_controls(&self) -> gpui::Div {
+    fn render_windows_titlebar_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
         let hover = self.theme.control_hover_bg;
         let pressed = self.theme.control_pressed_bg;
         let glyph = self.theme.text_muted;
@@ -7778,10 +7788,11 @@ impl RemCmdApp {
             .justify_center()
             .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
             .h_full()
-            .window_control_area(WindowControlArea::Min)
+            .cursor_pointer()
             .hover(move |this| this.bg(hover))
             .active(move |this| this.bg(pressed))
-            .child(div().w(px(10.0)).h(px(1.0)).bg(glyph));
+            .child(div().w(px(10.0)).h(px(1.0)).bg(glyph))
+            .on_click(cx.listener(|_, _, window, _| window.minimize_window()));
         let maximize = div()
             .id("maximize_window")
             .flex()
@@ -7790,7 +7801,7 @@ impl RemCmdApp {
             .justify_center()
             .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
             .h_full()
-            .window_control_area(WindowControlArea::Max)
+            .cursor_pointer()
             .hover(move |this| this.bg(hover))
             .active(move |this| this.bg(pressed))
             .child(
@@ -7799,7 +7810,8 @@ impl RemCmdApp {
                     .border_1()
                     .border_color(glyph)
                     .rounded(px(1.0)),
-            );
+            )
+            .on_click(cx.listener(|_, _, window, _| window.zoom_window()));
         let close_hover = self.theme.danger;
         let close_pressed = self.theme.danger_hover;
         let close = div()
@@ -7810,10 +7822,11 @@ impl RemCmdApp {
             .justify_center()
             .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
             .h_full()
-            .window_control_area(WindowControlArea::Close)
+            .cursor_pointer()
             .hover(move |this| this.bg(close_hover))
             .active(move |this| this.bg(close_pressed))
-            .child(icon_with_color(IconName::Cancel, glyph, 11.0));
+            .child(icon_with_color(IconName::Cancel, glyph, 11.0))
+            .on_click(cx.listener(|_, _, window, _| window.remove_window()));
 
         div()
             .flex()
@@ -8171,10 +8184,31 @@ impl RemCmdApp {
             .child(left_sidebar_button);
         let leading_transition_id = self.left_sidebar_transition_id;
         let leading_open = self.left_sidebar_open;
+        let expanded_sidebar_width = self.effective_sidebar_width(window);
+        let open_button_offset =
+            (expanded_sidebar_width - TITLEBAR_TAB_GROUP_HEIGHT - TITLEBAR_LEFT_CONTROL_EDGE_GAP)
+                .max(TITLEBAR_EDGE_INSET);
+        let closed_button_offset = TITLEBAR_EDGE_INSET;
+        let button_start_offset = if leading_transition_id == 0 {
+            if leading_open {
+                open_button_offset
+            } else {
+                closed_button_offset
+            }
+        } else if leading_open {
+            closed_button_offset
+        } else {
+            open_button_offset
+        };
+        let button_end_offset = if leading_open {
+            open_button_offset
+        } else {
+            closed_button_offset
+        };
         let leading_start_width = if leading_transition_id == 0 || leading_open {
             COLLAPSED_TITLEBAR_LEADING_WIDTH
         } else {
-            self.effective_sidebar_width(window)
+            expanded_sidebar_width
         };
         let leading_end_width = leading_width;
         let leading = div()
@@ -8182,12 +8216,29 @@ impl RemCmdApp {
             .flex_none()
             .items_center()
             .h_full()
-            .pr(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP))
             .when(cfg!(target_os = "windows") && !leading_open, |this| {
                 this.bg(self.theme.panel_bg)
             })
-            .child(drag_area().flex_1())
+            .child(
+                div().flex_none().h_full().with_animation(
+                    SharedString::from(format!(
+                        "titlebar-left-button-offset-{leading_transition_id}-{leading_open}"
+                    )),
+                    Animation::new(if leading_transition_id == 0 {
+                        MOTION_INSTANT_DURATION
+                    } else {
+                        MOTION_STANDARD_DURATION
+                    })
+                    .with_easing(ease_in_out),
+                    move |this, delta| {
+                        this.w(px(
+                            button_start_offset + (button_end_offset - button_start_offset) * delta
+                        ))
+                    },
+                ),
+            )
             .child(left_sidebar_group)
+            .child(drag_area().flex_1())
             .with_animation(
                 SharedString::from(format!(
                     "titlebar-left-edge-{leading_transition_id}-{leading_open}"
@@ -8213,6 +8264,9 @@ impl RemCmdApp {
             .h(px(TITLEBAR_HEIGHT))
             .flex()
             .items_center()
+            .when(cfg!(target_os = "windows"), |this| {
+                this.bg(self.theme.sidebar_bg)
+            })
             .child(leading);
 
         if self.tab_layout == TabLayout::Vertical {
@@ -8231,7 +8285,7 @@ impl RemCmdApp {
                 })
                 .child(drag_area().flex_1())
                 .child(self.render_titlebar_action_group(cx))
-                .child(drag_area().w(px(12.0)));
+                .child(drag_area().w(px(TITLEBAR_EDGE_INSET)));
             let titlebar = titlebar.child(center);
             return self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width);
         }
@@ -8586,7 +8640,7 @@ impl RemCmdApp {
             .h_full()
             .items_center()
             .gap(px(8.0))
-            .px(px(12.0));
+            .px(px(TITLEBAR_EDGE_INSET));
         if !self.tabs.is_empty() {
             if self.titlebar_tabs_scroll_active {
                 let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
@@ -9764,7 +9818,7 @@ impl RemCmdApp {
             surface.child(
                 div()
                     .absolute()
-                    .top(px(WINDOWS_CHROME_HEIGHT))
+                    .top(px(content_top_inset() - 1.0))
                     .right_0()
                     .bottom_0()
                     .left_0()
@@ -11093,7 +11147,7 @@ impl RemCmdApp {
             panel = panel.child(
                 div()
                     .absolute()
-                    .top(px(WINDOWS_CHROME_HEIGHT))
+                    .top(px(content_top_inset() - 1.0))
                     .right_0()
                     .bottom_0()
                     .left_0()
