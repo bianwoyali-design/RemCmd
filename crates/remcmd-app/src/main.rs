@@ -7116,7 +7116,7 @@ impl Render for RemCmdApp {
             root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, cx));
         }
         if cfg!(target_os = "windows") {
-            root = root.child(self.render_windows_chrome(cx));
+            root = root.child(self.render_windows_chrome(window, cx));
         }
         root = root.child(self.render_sidebar_resize_handle(sidebar_width, cx));
         if self.right_sidebar_rendered {
@@ -7310,15 +7310,16 @@ impl Render for RemCmdApp {
 }
 
 impl RemCmdApp {
-    fn render_windows_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let drag_area = div()
+    fn render_titlebar_drag_area(&self) -> gpui::Div {
+        div().h_full().window_control_area(WindowControlArea::Drag)
+    }
+
+    fn render_windows_chrome(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_maximized = window.is_maximized();
+        let drag_area = self
+            .render_titlebar_drag_area()
             .id("windows_chrome_drag_area")
-            .flex_1()
-            .h_full()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| windows_chrome::begin_drag(window)),
-            );
+            .flex_1();
 
         div()
             .id("windows_chrome")
@@ -7333,8 +7334,9 @@ impl RemCmdApp {
             .rounded_tl(px(10.0))
             .rounded_tr(px(10.0))
             .bg(self.theme.sidebar_bg)
+            .occlude()
             .child(
-                div()
+                self.render_titlebar_drag_area()
                     .flex()
                     .flex_none()
                     .items_center()
@@ -7342,10 +7344,6 @@ impl RemCmdApp {
                     .w(px(WINDOWS_BRAND_WIDTH))
                     .h_full()
                     .pl(px(12.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, window, _| windows_chrome::begin_drag(window)),
-                    )
                     .child(wordmark(self.theme, 90.0, 20.0)),
             )
             .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
@@ -7355,7 +7353,7 @@ impl RemCmdApp {
             .child(self.render_windows_menu_button(WindowsMenu::Window, "Window", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Help, "Help", cx))
             .child(drag_area)
-            .child(self.render_windows_titlebar_controls(cx))
+            .child(self.render_windows_titlebar_controls(is_maximized, cx))
     }
 
     fn render_windows_menu_button(
@@ -7775,7 +7773,11 @@ impl RemCmdApp {
         })
     }
 
-    fn render_windows_titlebar_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_windows_titlebar_controls(
+        &self,
+        is_maximized: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let hover = self.theme.control_hover_bg;
         let pressed = self.theme.control_pressed_bg;
         let glyph = self.theme.text_muted;
@@ -7793,6 +7795,39 @@ impl RemCmdApp {
             .active(move |this| this.bg(pressed))
             .child(div().w(px(10.0)).h(px(1.0)).bg(glyph))
             .on_click(cx.listener(|_, _, window, _| window.minimize_window()));
+        let maximize_symbol = if is_maximized {
+            div()
+                .relative()
+                .size(px(12.0))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .size(px(8.0))
+                        .border_1()
+                        .border_color(glyph)
+                        .rounded(px(1.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .size(px(8.0))
+                        .border_1()
+                        .border_color(glyph)
+                        .rounded(px(1.0)),
+                )
+        } else {
+            div()
+                .size(px(10.0))
+                .border_1()
+                .border_color(glyph)
+                .rounded(px(1.0))
+        };
+        let maximize_tooltip = if is_maximized { "Restore" } else { "Maximize" };
+        let tooltip_theme = self.theme;
         let maximize = div()
             .id("maximize_window")
             .flex()
@@ -7804,14 +7839,15 @@ impl RemCmdApp {
             .cursor_pointer()
             .hover(move |this| this.bg(hover))
             .active(move |this| this.bg(pressed))
-            .child(
-                div()
-                    .size(px(10.0))
-                    .border_1()
-                    .border_color(glyph)
-                    .rounded(px(1.0)),
-            )
-            .on_click(cx.listener(|_, _, window, _| window.zoom_window()));
+            .child(maximize_symbol)
+            .tooltip(move |_, cx| -> AnyView {
+                cx.new(|_| CommandTooltip {
+                    label: maximize_tooltip.into(),
+                    theme: tooltip_theme,
+                })
+                .into()
+            })
+            .on_click(cx.listener(|_, _, window, _| windows_chrome::toggle_maximize(window)));
         let close_hover = self.theme.danger;
         let close_pressed = self.theme.danger_hover;
         let close = div()
@@ -8156,7 +8192,6 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let drag_area = || div().h_full().window_control_area(WindowControlArea::Drag);
         let leading_width = self.titlebar_leading_width(window);
         let expanded_right_sidebar_width = self.effective_right_sidebar_width(window);
         let expanded_right_titlebar_width = expanded_right_sidebar_width;
@@ -8238,7 +8273,7 @@ impl RemCmdApp {
                 ),
             )
             .child(left_sidebar_group)
-            .child(drag_area().flex_1())
+            .child(self.render_titlebar_drag_area().flex_1())
             .with_animation(
                 SharedString::from(format!(
                     "titlebar-left-edge-{leading_transition_id}-{leading_open}"
@@ -8283,9 +8318,9 @@ impl RemCmdApp {
                             this.rounded_tr(px(10.0))
                         })
                 })
-                .child(drag_area().flex_1())
+                .child(self.render_titlebar_drag_area().flex_1())
                 .child(self.render_titlebar_action_group(cx))
-                .child(drag_area().w(px(TITLEBAR_EDGE_INSET)));
+                .child(self.render_titlebar_drag_area().w(px(TITLEBAR_EDGE_INSET)));
             let titlebar = titlebar.child(center);
             return self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width);
         }
@@ -8662,7 +8697,7 @@ impl RemCmdApp {
                 controls = controls.child(tabs);
             }
         } else {
-            controls = controls.child(drag_area().flex_1());
+            controls = controls.child(self.render_titlebar_drag_area().flex_1());
         }
 
         let center = div()

@@ -5,21 +5,23 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
     Foundation::HWND,
-    UI::{
-        Input::KeyboardAndMouse::ReleaseCapture,
-        WindowsAndMessaging::{HTCAPTION, PostMessageW, WM_NCLBUTTONDOWN},
-    },
+    UI::WindowsAndMessaging::{PostMessageW, SC_MAXIMIZE, SC_RESTORE, WM_SYSCOMMAND},
 };
 
 #[cfg(target_os = "windows")]
-pub(crate) fn begin_drag(window: &Window) {
+pub(crate) fn toggle_maximize(window: &Window) {
     let Some(hwnd) = window_hwnd(window) else {
+        window.zoom_window();
         return;
+    };
+    let command = if window.is_maximized() {
+        SC_RESTORE
+    } else {
+        SC_MAXIMIZE
     };
 
     unsafe {
-        let _ = ReleaseCapture();
-        let _ = PostMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        let _ = PostMessageW(hwnd, WM_SYSCOMMAND, command as usize, 0);
     }
 }
 
@@ -33,4 +35,6 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn begin_drag(_: &gpui::Window) {}
+pub(crate) fn toggle_maximize(window: &gpui::Window) {
+    window.zoom_window();
+}
