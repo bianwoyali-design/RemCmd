@@ -54,6 +54,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+use gpui::img;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
@@ -62,7 +64,7 @@ use gpui::{
     PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
     SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
     UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, img, point,
+    WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, point,
     prelude::*, px, rgb, size, uniform_list,
 };
 use secrecy::SecretString;

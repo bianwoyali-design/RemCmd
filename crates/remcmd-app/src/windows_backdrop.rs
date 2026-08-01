@@ -65,7 +65,7 @@ pub(crate) fn apply_mica(window: &Window, dark: bool) {
 }
 
 fn window_hwnd(window: &Window) -> Option<HWND> {
-    let handle = window.window_handle().ok()?;
+    let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
         return None;
     };
