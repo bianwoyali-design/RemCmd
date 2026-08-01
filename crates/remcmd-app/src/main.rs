@@ -35,6 +35,8 @@ use terminal_canvas::{
 mod terminal_view;
 use terminal_view::{TerminalPalette, palette_color};
 
+mod windows_chrome;
+
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 
@@ -51,6 +53,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+use gpui::img;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
@@ -59,7 +63,7 @@ use gpui::{
     PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
     SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
     UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, img, point,
+    WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, point,
     prelude::*, px, rgb, size, uniform_list,
 };
 use secrecy::SecretString;
@@ -123,8 +127,12 @@ const TITLEBAR_CONTROL_HOVER_SIZE: f32 = 28.0;
 const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
 const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
 const TITLEBAR_LEFT_CONTROL_EDGE_GAP: f32 = 10.0;
+const TITLEBAR_EDGE_INSET: f32 = 12.0;
+const WINDOWS_CHROME_HEIGHT: f32 = 34.0;
+const WINDOWS_BRAND_WIDTH: f32 = 112.0;
 const WINDOWS_TITLEBAR_BUTTON_WIDTH: f32 = 46.0;
 const WINDOWS_TITLEBAR_CONTROLS_WIDTH: f32 = WINDOWS_TITLEBAR_BUTTON_WIDTH * 3.0;
+const WINDOWS_MENU_MIN_WIDTH: f32 = 180.0;
 const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
 const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
 const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
@@ -138,6 +146,18 @@ const UI_MONOSPACE_FONT_FAMILY: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const UI_MONOSPACE_FONT_FAMILY: &str = "DejaVu Sans Mono";
 const TERMINAL_FONT_LINE_HEIGHT_FACTOR: f32 = 19.0 / 14.0;
+
+const fn platform_chrome_height() -> f32 {
+    if cfg!(target_os = "windows") {
+        WINDOWS_CHROME_HEIGHT
+    } else {
+        0.0
+    }
+}
+
+const fn content_top_inset() -> f32 {
+    TITLEBAR_HEIGHT + platform_chrome_height()
+}
 
 gpui::actions!(credential_prompt, [SubmitCredential, CancelCredential]);
 gpui::actions!(host_key_prompt, [CancelHostKeyVerification]);
@@ -233,6 +253,7 @@ struct RemCmdApp {
     profile_context_menu: Option<ProfileContextMenu>,
     sftp_context_menu: Option<SftpContextMenu>,
     terminal_context_menu: Option<TerminalContextMenu>,
+    windows_menu_open: Option<WindowsMenu>,
     sftp_create_prompt: Option<SftpCreatePrompt>,
     quick_command_prompt: Option<QuickCommandPrompt>,
     bottom_panel_open: bool,
@@ -257,6 +278,66 @@ struct RemCmdApp {
 struct RemCmdMainWindow(WindowHandle<RemCmdApp>);
 
 impl Global for RemCmdMainWindow {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsMenu {
+    File,
+    Edit,
+    Terminal,
+    View,
+    Window,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditCommand {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsMenuCommand {
+    NewConnection,
+    NewLocalTerminal,
+    NewRemoteTerminal,
+    ConnectSelectedProfile,
+    DisconnectActiveSession,
+    Edit(EditCommand),
+    SplitHorizontal,
+    SplitVertical,
+    ShowTerminalView,
+    ShowFilesView,
+    ResetActiveTerminal,
+    CloseActivePane,
+    CloseActiveTab,
+    ShowHome,
+    ToggleLeftSidebar,
+    ToggleConnectionSearch,
+    ShowSftpSidebar,
+    ShowPerformanceSidebar,
+    ToggleBottomPanel,
+    MinimizeWindow,
+    ZoomWindow,
+    ToggleFullscreen,
+    CloseWindow,
+    ShowSettings,
+    ShowAbout,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsMenuEntry {
+    Item {
+        label: &'static str,
+        shortcut: &'static str,
+        command: WindowsMenuCommand,
+    },
+    Separator,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SessionId(u64);
@@ -465,7 +546,7 @@ impl Render for CommandTooltip {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
+            .bg(self.theme.floating_glass_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(1.0)),
@@ -2166,6 +2247,7 @@ impl RemCmdApp {
             profile_context_menu: None,
             sftp_context_menu: None,
             terminal_context_menu: None,
+            windows_menu_open: None,
             sftp_create_prompt: None,
             quick_command_prompt: None,
             bottom_panel_open: false,
@@ -7033,9 +7115,41 @@ impl Render for RemCmdApp {
         if self.right_sidebar_rendered {
             root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, cx));
         }
+        if cfg!(target_os = "windows") {
+            root = root.child(self.render_windows_chrome(window, cx));
+        }
         root = root.child(self.render_sidebar_resize_handle(sidebar_width, cx));
         if self.right_sidebar_rendered {
             root = root.child(self.render_right_sidebar_resize_handle(right_sidebar_width, cx));
+        }
+        if cfg!(target_os = "windows") && self.windows_menu_open.is_some() {
+            root = root
+                .child(
+                    div()
+                        .id("windows_menu_dismiss_layer")
+                        .absolute()
+                        .top(px(platform_chrome_height()))
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(self.theme.transparent)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.windows_menu_open = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.windows_menu_open = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(deferred(self.render_windows_menu_popup(cx)).with_priority(30));
         }
         if self.active_panel == ActivePanel::Settings && self.open_settings_selector.is_some() {
             root = root.child(
@@ -7196,6 +7310,376 @@ impl Render for RemCmdApp {
 }
 
 impl RemCmdApp {
+    fn render_titlebar_drag_area(&self) -> gpui::Div {
+        div().h_full().window_control_area(WindowControlArea::Drag)
+    }
+
+    fn render_windows_chrome(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_maximized = window.is_maximized();
+        let drag_area = self
+            .render_titlebar_drag_area()
+            .id("windows_chrome_drag_area")
+            .flex_1();
+
+        div()
+            .id("windows_chrome")
+            .absolute()
+            .top(px(-1.0))
+            .left(px(-1.0))
+            .right(px(-1.0))
+            .h(px(WINDOWS_CHROME_HEIGHT + 1.0))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .rounded_tl(px(10.0))
+            .rounded_tr(px(10.0))
+            .bg(self.theme.sidebar_bg)
+            .occlude()
+            .child(
+                self.render_titlebar_drag_area()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_start()
+                    .w(px(WINDOWS_BRAND_WIDTH))
+                    .h_full()
+                    .pl(px(12.0))
+                    .child(wordmark(self.theme, 90.0, 20.0)),
+            )
+            .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
+            .child(self.render_windows_menu_button(WindowsMenu::Edit, "Edit", cx))
+            .child(self.render_windows_menu_button(WindowsMenu::Terminal, "Terminal", cx))
+            .child(self.render_windows_menu_button(WindowsMenu::View, "View", cx))
+            .child(self.render_windows_menu_button(WindowsMenu::Window, "Window", cx))
+            .child(self.render_windows_menu_button(WindowsMenu::Help, "Help", cx))
+            .child(drag_area)
+            .child(self.render_windows_titlebar_controls(is_maximized, cx))
+    }
+
+    fn render_windows_menu_button(
+        &self,
+        menu: WindowsMenu,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = self.windows_menu_open == Some(menu);
+        let hover = self.theme.control_hover_bg;
+        let pressed = self.theme.control_pressed_bg;
+        let width = windows_menu_button_width(menu);
+
+        div()
+            .id(SharedString::from(format!(
+                "windows-menu-{}",
+                label.to_ascii_lowercase()
+            )))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(width))
+            .h(px(24.0))
+            .rounded_md()
+            .text_size(px(12.0))
+            .text_color(self.theme.text_primary)
+            .bg(if selected {
+                self.theme.control_pressed_bg
+            } else {
+                self.theme.transparent
+            })
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover))
+            .active(move |this| this.bg(pressed))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered
+                    && this.windows_menu_open.is_some()
+                    && this.windows_menu_open != Some(menu)
+                {
+                    this.windows_menu_open = Some(menu);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.windows_menu_open = if this.windows_menu_open == Some(menu) {
+                    None
+                } else {
+                    Some(menu)
+                };
+                cx.notify();
+            }))
+            .child(label)
+    }
+
+    fn render_windows_menu_popup(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = self.windows_menu_open else {
+            return div().into_any_element();
+        };
+        let entries = windows_menu_entries(menu);
+        let left = windows_menu_left(menu);
+        let width = windows_menu_popup_width(&entries);
+        let mut popup = self
+            .glass_floating_surface()
+            .id("windows_menu_popup")
+            .absolute()
+            .left(px(left))
+            .top(px(platform_chrome_height() - 1.0))
+            .w(px(width))
+            .flex()
+            .flex_col()
+            .p_1()
+            .occlude();
+
+        for (index, entry) in entries.into_iter().enumerate() {
+            popup = match entry {
+                WindowsMenuEntry::Item {
+                    label,
+                    shortcut,
+                    command,
+                } => popup.child(self.render_windows_menu_item(
+                    SharedString::from(format!("windows-menu-entry-{menu:?}-{index}")),
+                    label,
+                    shortcut,
+                    command,
+                    cx,
+                )),
+                WindowsMenuEntry::Separator => popup.child(self.render_context_menu_separator()),
+            };
+        }
+
+        popup.into_any_element()
+    }
+
+    fn render_windows_menu_item(
+        &self,
+        id: SharedString,
+        label: &'static str,
+        shortcut: &'static str,
+        command: WindowsMenuCommand,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let enabled = self.windows_menu_command_enabled(command);
+        let hover_group = SharedString::from(format!("{id}-hover"));
+        let foreground = self.theme.text_primary;
+        let muted = self.theme.text_muted;
+        let on_accent = self.theme.on_accent;
+        let hover = self.theme.accent;
+        let pressed = self.theme.accent_hover;
+        let row = div()
+            .id(id)
+            .relative()
+            .flex()
+            .items_center()
+            .h(px(28.0))
+            .px_2()
+            .rounded_md()
+            .text_size(px(12.0))
+            .when(enabled, |this| {
+                this.group(hover_group.clone())
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .active(move |this| this.bg(pressed))
+            })
+            .when(!enabled, |this| this.opacity(0.42))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .when(enabled, |this| {
+                        this.group_hover(hover_group.clone(), |style| style.opacity(0.0))
+                    })
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_color(foreground)
+                            .child(label),
+                    )
+                    .when(!shortcut.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .text_color(muted)
+                                .child(shortcut),
+                        )
+                    }),
+            )
+            .when(enabled, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .opacity(0.0)
+                        .text_color(on_accent)
+                        .group_hover(hover_group, |style| style.opacity(1.0))
+                        .justify_between()
+                        .gap_4()
+                        .child(div().flex_none().whitespace_nowrap().child(label))
+                        .when(!shortcut.is_empty(), |this| {
+                            this.child(div().flex_none().whitespace_nowrap().child(shortcut))
+                        }),
+                )
+            });
+
+        if enabled {
+            row.on_click(cx.listener(move |this, _, window, cx| {
+                this.execute_windows_menu_command(command, window, cx);
+            }))
+        } else {
+            row
+        }
+    }
+
+    fn windows_menu_command_enabled(&self, command: WindowsMenuCommand) -> bool {
+        match command {
+            WindowsMenuCommand::NewRemoteTerminal | WindowsMenuCommand::ConnectSelectedProfile => {
+                self.selected_profile().is_some()
+            }
+            WindowsMenuCommand::DisconnectActiveSession => self
+                .active_session()
+                .is_some_and(|session| session.connection_state.can_disconnect()),
+            WindowsMenuCommand::SplitHorizontal
+            | WindowsMenuCommand::SplitVertical
+            | WindowsMenuCommand::ShowTerminalView
+            | WindowsMenuCommand::ShowFilesView
+            | WindowsMenuCommand::ResetActiveTerminal
+            | WindowsMenuCommand::CloseActivePane
+            | WindowsMenuCommand::CloseActiveTab => self.active_session().is_some(),
+            _ => true,
+        }
+    }
+
+    fn execute_windows_menu_command(
+        &mut self,
+        command: WindowsMenuCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.windows_menu_open = None;
+        match command {
+            WindowsMenuCommand::NewConnection => self.open_new_profile_editor(cx),
+            WindowsMenuCommand::NewLocalTerminal => self.open_local_terminal(window, cx),
+            WindowsMenuCommand::NewRemoteTerminal => {
+                self.connect_selected_profile_in_new_session(window, cx);
+            }
+            WindowsMenuCommand::ConnectSelectedProfile => {
+                self.connect_selected_profile(window, cx);
+            }
+            WindowsMenuCommand::DisconnectActiveSession => {
+                self.disconnect_active_connection(cx);
+            }
+            WindowsMenuCommand::Edit(command) => {
+                self.dispatch_edit_command(command, window, cx);
+            }
+            WindowsMenuCommand::SplitHorizontal => {
+                self.split_active_pane(SplitAxis::Horizontal, window, cx);
+            }
+            WindowsMenuCommand::SplitVertical => {
+                self.split_active_pane(SplitAxis::Vertical, window, cx);
+            }
+            WindowsMenuCommand::ShowTerminalView => {
+                self.set_active_tab_view(TerminalTabView::Terminal, window, cx);
+            }
+            WindowsMenuCommand::ShowFilesView => {
+                self.set_active_tab_view(TerminalTabView::Files, window, cx);
+            }
+            WindowsMenuCommand::ResetActiveTerminal => {
+                if let Some(session_id) = self.active_session_id {
+                    self.reset_terminal(session_id, cx);
+                }
+            }
+            WindowsMenuCommand::CloseActivePane => self.close_active_pane(window, cx),
+            WindowsMenuCommand::CloseActiveTab => {
+                if let Some(tab_id) = self.active_tab_id {
+                    self.close_tab(tab_id, cx);
+                }
+            }
+            WindowsMenuCommand::ShowHome => self.show_home(window, cx),
+            WindowsMenuCommand::ToggleLeftSidebar => self.toggle_left_sidebar(cx),
+            WindowsMenuCommand::ToggleConnectionSearch => {
+                self.toggle_sidebar_search(window, cx);
+            }
+            WindowsMenuCommand::ShowSftpSidebar => {
+                self.set_right_sidebar_view(RightSidebarView::Sftp, cx);
+                if !self.right_sidebar_open {
+                    self.toggle_right_sidebar(cx);
+                }
+            }
+            WindowsMenuCommand::ShowPerformanceSidebar => {
+                self.set_right_sidebar_view(RightSidebarView::Performance, cx);
+                if !self.right_sidebar_open {
+                    self.toggle_right_sidebar(cx);
+                }
+            }
+            WindowsMenuCommand::ToggleBottomPanel => self.toggle_bottom_panel(window, cx),
+            WindowsMenuCommand::MinimizeWindow => window.minimize_window(),
+            WindowsMenuCommand::ZoomWindow => window.zoom_window(),
+            WindowsMenuCommand::ToggleFullscreen => window.toggle_fullscreen(),
+            WindowsMenuCommand::CloseWindow => window.remove_window(),
+            WindowsMenuCommand::ShowSettings => self.show_settings(window, cx),
+            WindowsMenuCommand::ShowAbout => self.show_about(cx),
+            WindowsMenuCommand::Quit => cx.quit(),
+        }
+        cx.notify();
+    }
+
+    fn dispatch_edit_command(
+        &mut self,
+        command: EditCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session_id) = self.focused_terminal_session_id {
+            match command {
+                EditCommand::Copy => {
+                    self.copy_terminal_selection(session_id, cx);
+                    return;
+                }
+                EditCommand::Paste => {
+                    self.paste_into_terminal(session_id, cx);
+                    return;
+                }
+                EditCommand::SelectAll => {
+                    self.select_all_terminal(session_id, cx);
+                    return;
+                }
+                EditCommand::Undo | EditCommand::Redo | EditCommand::Cut => return,
+            }
+        }
+
+        match command {
+            EditCommand::Undo => {
+                window.dispatch_action(Box::new(file_editor::Undo), cx);
+            }
+            EditCommand::Redo => {
+                window.dispatch_action(Box::new(file_editor::Redo), cx);
+            }
+            EditCommand::Cut => {
+                window.dispatch_action(Box::new(text_field::Cut), cx);
+                window.dispatch_action(Box::new(file_editor::Cut), cx);
+            }
+            EditCommand::Copy => {
+                window.dispatch_action(Box::new(text_field::Copy), cx);
+                window.dispatch_action(Box::new(file_editor::Copy), cx);
+            }
+            EditCommand::Paste => {
+                window.dispatch_action(Box::new(text_field::Paste), cx);
+                window.dispatch_action(Box::new(file_editor::Paste), cx);
+            }
+            EditCommand::SelectAll => {
+                window.dispatch_action(Box::new(text_field::SelectAll), cx);
+                window.dispatch_action(Box::new(file_editor::SelectAll), cx);
+            }
+        }
+    }
+
     fn render_icon_button(
         &self,
         id: impl Into<gpui::ElementId>,
@@ -7289,7 +7773,11 @@ impl RemCmdApp {
         })
     }
 
-    fn render_windows_titlebar_controls(&self) -> gpui::Div {
+    fn render_windows_titlebar_controls(
+        &self,
+        is_maximized: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let hover = self.theme.control_hover_bg;
         let pressed = self.theme.control_pressed_bg;
         let glyph = self.theme.text_muted;
@@ -7302,10 +7790,44 @@ impl RemCmdApp {
             .justify_center()
             .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
             .h_full()
-            .window_control_area(WindowControlArea::Min)
+            .cursor_pointer()
             .hover(move |this| this.bg(hover))
             .active(move |this| this.bg(pressed))
-            .child(div().w(px(10.0)).h(px(1.0)).bg(glyph));
+            .child(div().w(px(10.0)).h(px(1.0)).bg(glyph))
+            .on_click(cx.listener(|_, _, window, _| window.minimize_window()));
+        let maximize_symbol = if is_maximized {
+            div()
+                .relative()
+                .size(px(12.0))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .size(px(8.0))
+                        .border_1()
+                        .border_color(glyph)
+                        .rounded(px(1.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .size(px(8.0))
+                        .border_1()
+                        .border_color(glyph)
+                        .rounded(px(1.0)),
+                )
+        } else {
+            div()
+                .size(px(10.0))
+                .border_1()
+                .border_color(glyph)
+                .rounded(px(1.0))
+        };
+        let maximize_tooltip = if is_maximized { "Restore" } else { "Maximize" };
+        let tooltip_theme = self.theme;
         let maximize = div()
             .id("maximize_window")
             .flex()
@@ -7314,16 +7836,18 @@ impl RemCmdApp {
             .justify_center()
             .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
             .h_full()
-            .window_control_area(WindowControlArea::Max)
+            .cursor_pointer()
             .hover(move |this| this.bg(hover))
             .active(move |this| this.bg(pressed))
-            .child(
-                div()
-                    .size(px(10.0))
-                    .border_1()
-                    .border_color(glyph)
-                    .rounded(px(1.0)),
-            );
+            .child(maximize_symbol)
+            .tooltip(move |_, cx| -> AnyView {
+                cx.new(|_| CommandTooltip {
+                    label: maximize_tooltip.into(),
+                    theme: tooltip_theme,
+                })
+                .into()
+            })
+            .on_click(cx.listener(|_, _, window, _| windows_chrome::toggle_maximize(window)));
         let close_hover = self.theme.danger;
         let close_pressed = self.theme.danger_hover;
         let close = div()
@@ -7334,10 +7858,11 @@ impl RemCmdApp {
             .justify_center()
             .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
             .h_full()
-            .window_control_area(WindowControlArea::Close)
+            .cursor_pointer()
             .hover(move |this| this.bg(close_hover))
             .active(move |this| this.bg(close_pressed))
-            .child(icon_with_color(IconName::Cancel, glyph, 11.0));
+            .child(icon_with_color(IconName::Cancel, glyph, 11.0))
+            .on_click(cx.listener(|_, _, window, _| window.remove_window()));
 
         div()
             .flex()
@@ -7489,13 +8014,7 @@ impl RemCmdApp {
         width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let titlebar_width = (width
-            - if cfg!(target_os = "windows") {
-                WINDOWS_TITLEBAR_CONTROLS_WIDTH
-            } else {
-                0.0
-            })
-        .max(0.0);
+        let titlebar_width = width;
         let open = self.right_sidebar_open;
         let start_width = if open { 0.0 } else { titlebar_width };
         let end_width = if open { titlebar_width } else { 0.0 };
@@ -7573,12 +8092,8 @@ impl RemCmdApp {
         div()
             .id("right_sidebar_titlebar")
             .absolute()
-            .top(px(-1.0))
-            .right(px(if cfg!(target_os = "windows") {
-                WINDOWS_TITLEBAR_CONTROLS_WIDTH
-            } else {
-                0.0
-            }))
+            .top(px(platform_chrome_height() - 1.0))
+            .right_0()
             .flex()
             .items_center()
             .justify_center()
@@ -7658,22 +8173,18 @@ impl RemCmdApp {
         };
         let end_width = if open { expanded_width } else { 0.0 };
 
-        titlebar
-            .child(
-                div().flex_none().h_full().with_animation(
-                    SharedString::from(format!("titlebar-right-spacer-{transition_id}-{open}")),
-                    Animation::new(if transition_id == 0 {
-                        MOTION_INSTANT_DURATION
-                    } else {
-                        MOTION_STANDARD_DURATION
-                    })
-                    .with_easing(ease_in_out),
-                    move |this, delta| this.w(px(start_width + (end_width - start_width) * delta)),
-                ),
-            )
-            .when(cfg!(target_os = "windows"), |this| {
-                this.child(self.render_windows_titlebar_controls())
-            })
+        titlebar.child(
+            div().flex_none().h_full().with_animation(
+                SharedString::from(format!("titlebar-right-spacer-{transition_id}-{open}")),
+                Animation::new(if transition_id == 0 {
+                    MOTION_INSTANT_DURATION
+                } else {
+                    MOTION_STANDARD_DURATION
+                })
+                .with_easing(ease_in_out),
+                move |this, delta| this.w(px(start_width + (end_width - start_width) * delta)),
+            ),
+        )
     }
 
     fn render_titlebar_tabs(
@@ -7681,21 +8192,9 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let drag_area = || {
-            div()
-                .flex_none()
-                .h_full()
-                .window_control_area(WindowControlArea::Drag)
-        };
         let leading_width = self.titlebar_leading_width(window);
         let expanded_right_sidebar_width = self.effective_right_sidebar_width(window);
-        let windows_titlebar_controls_width = if cfg!(target_os = "windows") {
-            WINDOWS_TITLEBAR_CONTROLS_WIDTH
-        } else {
-            0.0
-        };
-        let expanded_right_titlebar_width =
-            (expanded_right_sidebar_width - windows_titlebar_controls_width).max(0.0);
+        let expanded_right_titlebar_width = expanded_right_sidebar_width;
         let titlebar_right_inset = if self.right_sidebar_open {
             expanded_right_titlebar_width
         } else {
@@ -7720,10 +8219,31 @@ impl RemCmdApp {
             .child(left_sidebar_button);
         let leading_transition_id = self.left_sidebar_transition_id;
         let leading_open = self.left_sidebar_open;
+        let expanded_sidebar_width = self.effective_sidebar_width(window);
+        let open_button_offset =
+            (expanded_sidebar_width - TITLEBAR_TAB_GROUP_HEIGHT - TITLEBAR_LEFT_CONTROL_EDGE_GAP)
+                .max(TITLEBAR_EDGE_INSET);
+        let closed_button_offset = TITLEBAR_EDGE_INSET;
+        let button_start_offset = if leading_transition_id == 0 {
+            if leading_open {
+                open_button_offset
+            } else {
+                closed_button_offset
+            }
+        } else if leading_open {
+            closed_button_offset
+        } else {
+            open_button_offset
+        };
+        let button_end_offset = if leading_open {
+            open_button_offset
+        } else {
+            closed_button_offset
+        };
         let leading_start_width = if leading_transition_id == 0 || leading_open {
             COLLAPSED_TITLEBAR_LEADING_WIDTH
         } else {
-            self.effective_sidebar_width(window)
+            expanded_sidebar_width
         };
         let leading_end_width = leading_width;
         let leading = div()
@@ -7731,13 +8251,29 @@ impl RemCmdApp {
             .flex_none()
             .items_center()
             .h_full()
-            .when(
-                cfg!(target_os = "windows") && self.left_sidebar_open,
-                |this| this.child(self.render_sidebar_wordmark()),
+            .when(cfg!(target_os = "windows") && !leading_open, |this| {
+                this.bg(self.theme.panel_bg)
+            })
+            .child(
+                div().flex_none().h_full().with_animation(
+                    SharedString::from(format!(
+                        "titlebar-left-button-offset-{leading_transition_id}-{leading_open}"
+                    )),
+                    Animation::new(if leading_transition_id == 0 {
+                        MOTION_INSTANT_DURATION
+                    } else {
+                        MOTION_STANDARD_DURATION
+                    })
+                    .with_easing(ease_in_out),
+                    move |this, delta| {
+                        this.w(px(
+                            button_start_offset + (button_end_offset - button_start_offset) * delta
+                        ))
+                    },
+                ),
             )
-            .child(drag_area().flex_1())
             .child(left_sidebar_group)
-            .child(drag_area().w(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP)))
+            .child(self.render_titlebar_drag_area().flex_1())
             .with_animation(
                 SharedString::from(format!(
                     "titlebar-left-edge-{leading_transition_id}-{leading_open}"
@@ -7757,7 +8293,7 @@ impl RemCmdApp {
         let titlebar = div()
             .id("window_titlebar")
             .absolute()
-            .top(px(-1.0))
+            .top(px(platform_chrome_height() - 1.0))
             .left_0()
             .right_0()
             .h(px(TITLEBAR_HEIGHT))
@@ -7769,10 +8305,23 @@ impl RemCmdApp {
             .child(leading);
 
         if self.tab_layout == TabLayout::Vertical {
-            let titlebar = titlebar
-                .child(drag_area().flex_1())
+            let center = div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .items_center()
+                .when(cfg!(target_os = "windows"), |this| {
+                    this.bg(self.theme.panel_bg)
+                        .when(self.left_sidebar_open, |this| this.rounded_tl(px(10.0)))
+                        .when(self.right_sidebar_rendered, |this| {
+                            this.rounded_tr(px(10.0))
+                        })
+                })
+                .child(self.render_titlebar_drag_area().flex_1())
                 .child(self.render_titlebar_action_group(cx))
-                .child(drag_area().w(px(12.0)));
+                .child(self.render_titlebar_drag_area().w(px(TITLEBAR_EDGE_INSET)));
+            let titlebar = titlebar.child(center);
             return self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width);
         }
 
@@ -7788,7 +8337,6 @@ impl RemCmdApp {
         let track_width = (f32::from(window.viewport_size().width)
             - leading_width
             - titlebar_right_inset
-            - windows_titlebar_controls_width
             - 24.0
             - 8.0
             - TITLEBAR_ACTION_GROUP_WIDTH)
@@ -8127,7 +8675,7 @@ impl RemCmdApp {
             .h_full()
             .items_center()
             .gap(px(8.0))
-            .px(px(12.0));
+            .px(px(TITLEBAR_EDGE_INSET));
         if !self.tabs.is_empty() {
             if self.titlebar_tabs_scroll_active {
                 let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
@@ -8149,10 +8697,24 @@ impl RemCmdApp {
                 controls = controls.child(tabs);
             }
         } else {
-            controls = controls.child(drag_area().flex_1());
+            controls = controls.child(self.render_titlebar_drag_area().flex_1());
         }
 
-        let titlebar = titlebar.child(controls.child(self.render_titlebar_action_group(cx)));
+        let center = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .items_center()
+            .when(cfg!(target_os = "windows"), |this| {
+                this.bg(self.theme.panel_bg)
+                    .when(self.left_sidebar_open, |this| this.rounded_tl(px(10.0)))
+                    .when(self.right_sidebar_rendered, |this| {
+                        this.rounded_tr(px(10.0))
+                    })
+            })
+            .child(controls.child(self.render_titlebar_action_group(cx)));
+        let titlebar = titlebar.child(center);
         self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width)
     }
 
@@ -9166,7 +9728,7 @@ impl RemCmdApp {
         self.glass_sidebar_surface()
             .w(px(width))
             .px_3()
-            .pt(px(TITLEBAR_HEIGHT))
+            .pt(px(content_top_inset()))
             .when(!cfg!(target_os = "windows"), |this| {
                 this.child(
                     div()
@@ -9279,13 +9841,27 @@ impl RemCmdApp {
     }
 
     fn glass_sidebar_surface(&self) -> gpui::Div {
-        div()
+        let surface = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_none()
             .min_w(px(0.0))
-            .h_full()
-            .bg(self.theme.sidebar_bg)
+            .h_full();
+
+        if cfg!(target_os = "windows") {
+            surface.child(
+                div()
+                    .absolute()
+                    .top(px(content_top_inset() - 1.0))
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .bg(self.theme.sidebar_bg),
+            )
+        } else {
+            surface.bg(self.theme.sidebar_bg)
+        }
     }
 
     fn glass_floating_surface(&self) -> gpui::Div {
@@ -9293,7 +9869,7 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
+            .bg(self.theme.floating_glass_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(1.0)),
@@ -9321,7 +9897,7 @@ impl RemCmdApp {
         let handle = div()
             .id("sidebar_resize_handle")
             .absolute()
-            .top_0()
+            .top(px(platform_chrome_height()))
             .bottom_0()
             .left(px(width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
             .flex()
@@ -9379,7 +9955,7 @@ impl RemCmdApp {
         let handle = div()
             .id("right_sidebar_resize_handle")
             .absolute()
-            .top_0()
+            .top(px(platform_chrome_height()))
             .bottom_0()
             .flex()
             .items_center()
@@ -9917,7 +10493,7 @@ impl RemCmdApp {
         self.glass_sidebar_surface()
             .id("right_sidebar")
             .w(px(width))
-            .pt(px(TITLEBAR_HEIGHT))
+            .pt(px(content_top_inset()))
             .px_3()
             .pb_3()
             .child(content)
@@ -10591,13 +11167,8 @@ impl RemCmdApp {
     }
 
     fn detail_panel_shell(&self) -> gpui::Div {
-        let mut shadows = vec![BoxShadow {
-            color: self.theme.shadow,
-            offset: point(px(-1.0), px(0.0)),
-            blur_radius: px(4.0),
-            spread_radius: px(-2.0),
-        }];
         let mut panel = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -10605,22 +11176,42 @@ impl RemCmdApp {
             .h_full()
             .px_4()
             .pb_4()
-            .pt(px(TITLEBAR_HEIGHT))
-            .bg(self.theme.panel_bg)
-            .border_l_1()
-            .border_color(self.theme.border_strong);
+            .pt(px(content_top_inset()));
 
-        if self.right_sidebar_open {
-            panel = panel.border_r_1();
-            shadows.push(BoxShadow {
+        if cfg!(target_os = "windows") {
+            panel = panel.child(
+                div()
+                    .absolute()
+                    .top(px(content_top_inset() - 1.0))
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .bg(self.theme.panel_bg),
+            );
+        } else {
+            let mut shadows = vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(1.0), px(0.0)),
+                offset: point(px(-1.0), px(0.0)),
                 blur_radius: px(4.0),
                 spread_radius: px(-2.0),
-            });
+            }];
+            panel = panel
+                .bg(self.theme.panel_bg)
+                .border_l_1()
+                .border_color(self.theme.border_strong);
+            if self.right_sidebar_open {
+                panel = panel.border_r_1();
+                shadows.push(BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(1.0), px(0.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(-2.0),
+                });
+            }
+            panel = panel.shadow(shadows);
         }
 
-        panel.shadow(shadows)
+        panel
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -13731,6 +14322,239 @@ fn select_menu_scroll_offset(selected_index: usize, option_count: usize) -> f32 
     first_visible as f32 * SELECT_MENU_ROW_HEIGHT
 }
 
+const fn windows_menu_button_width(menu: WindowsMenu) -> f32 {
+    match menu {
+        WindowsMenu::File | WindowsMenu::Edit | WindowsMenu::Help => 43.0,
+        WindowsMenu::Terminal => 66.0,
+        WindowsMenu::View => 45.0,
+        WindowsMenu::Window => 64.0,
+    }
+}
+
+fn windows_menu_left(menu: WindowsMenu) -> f32 {
+    let menus = [
+        WindowsMenu::File,
+        WindowsMenu::Edit,
+        WindowsMenu::Terminal,
+        WindowsMenu::View,
+        WindowsMenu::Window,
+        WindowsMenu::Help,
+    ];
+    WINDOWS_BRAND_WIDTH
+        + menus
+            .into_iter()
+            .take_while(|candidate| *candidate != menu)
+            .map(windows_menu_button_width)
+            .sum::<f32>()
+}
+
+fn windows_menu_popup_width(entries: &[WindowsMenuEntry]) -> f32 {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            WindowsMenuEntry::Item {
+                label, shortcut, ..
+            } => Some(
+                28.0 + estimated_windows_menu_text_width(label)
+                    + if shortcut.is_empty() {
+                        0.0
+                    } else {
+                        20.0 + estimated_windows_menu_text_width(shortcut)
+                    },
+            ),
+            WindowsMenuEntry::Separator => None,
+        })
+        .fold(WINDOWS_MENU_MIN_WIDTH, f32::max)
+        .ceil()
+}
+
+fn estimated_windows_menu_text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|character| if character.is_ascii() { 7.25 } else { 12.0 })
+        .sum()
+}
+
+fn windows_menu_entries(menu: WindowsMenu) -> Vec<WindowsMenuEntry> {
+    use WindowsMenuCommand as Command;
+    use WindowsMenuEntry::{Item, Separator};
+
+    match menu {
+        WindowsMenu::File => vec![
+            Item {
+                label: "New Connection",
+                shortcut: "Ctrl+N",
+                command: Command::NewConnection,
+            },
+            Item {
+                label: "New Local Terminal",
+                shortcut: "Ctrl+T",
+                command: Command::NewLocalTerminal,
+            },
+            Item {
+                label: "New SSH Terminal",
+                shortcut: "Ctrl+Shift+T",
+                command: Command::NewRemoteTerminal,
+            },
+            Separator,
+            Item {
+                label: "Connect Selected Server",
+                shortcut: "Ctrl+Enter",
+                command: Command::ConnectSelectedProfile,
+            },
+            Item {
+                label: "Disconnect Active Session",
+                shortcut: "Ctrl+Shift+X",
+                command: Command::DisconnectActiveSession,
+            },
+            Separator,
+            Item {
+                label: "Settings",
+                shortcut: "Ctrl+,",
+                command: Command::ShowSettings,
+            },
+            Item {
+                label: "Exit",
+                shortcut: "Ctrl+Q",
+                command: Command::Quit,
+            },
+        ],
+        WindowsMenu::Edit => vec![
+            Item {
+                label: "Undo",
+                shortcut: "Ctrl+Z",
+                command: Command::Edit(EditCommand::Undo),
+            },
+            Item {
+                label: "Redo",
+                shortcut: "Ctrl+Y",
+                command: Command::Edit(EditCommand::Redo),
+            },
+            Separator,
+            Item {
+                label: "Cut",
+                shortcut: "Ctrl+X",
+                command: Command::Edit(EditCommand::Cut),
+            },
+            Item {
+                label: "Copy",
+                shortcut: "Ctrl+C",
+                command: Command::Edit(EditCommand::Copy),
+            },
+            Item {
+                label: "Paste",
+                shortcut: "Ctrl+V",
+                command: Command::Edit(EditCommand::Paste),
+            },
+            Item {
+                label: "Select All",
+                shortcut: "Ctrl+A",
+                command: Command::Edit(EditCommand::SelectAll),
+            },
+        ],
+        WindowsMenu::Terminal => vec![
+            Item {
+                label: "Split Horizontally",
+                shortcut: "Ctrl+D",
+                command: Command::SplitHorizontal,
+            },
+            Item {
+                label: "Split Vertically",
+                shortcut: "Ctrl+Shift+D",
+                command: Command::SplitVertical,
+            },
+            Separator,
+            Item {
+                label: "Show Terminal",
+                shortcut: "Ctrl+1",
+                command: Command::ShowTerminalView,
+            },
+            Item {
+                label: "Show Remote Files",
+                shortcut: "Ctrl+2",
+                command: Command::ShowFilesView,
+            },
+            Separator,
+            Item {
+                label: "Reset Terminal",
+                shortcut: "Ctrl+R",
+                command: Command::ResetActiveTerminal,
+            },
+            Item {
+                label: "Close Active Split",
+                shortcut: "Ctrl+Alt+W",
+                command: Command::CloseActivePane,
+            },
+            Item {
+                label: "Close Active Tab",
+                shortcut: "Ctrl+Shift+W",
+                command: Command::CloseActiveTab,
+            },
+        ],
+        WindowsMenu::View => vec![
+            Item {
+                label: "Home",
+                shortcut: "Ctrl+Shift+H",
+                command: Command::ShowHome,
+            },
+            Separator,
+            Item {
+                label: "Toggle Connections Sidebar",
+                shortcut: "Ctrl+Shift+S",
+                command: Command::ToggleLeftSidebar,
+            },
+            Item {
+                label: "Search Connections",
+                shortcut: "Ctrl+F",
+                command: Command::ToggleConnectionSearch,
+            },
+            Separator,
+            Item {
+                label: "Show Remote Files Sidebar",
+                shortcut: "Ctrl+Shift+F",
+                command: Command::ShowSftpSidebar,
+            },
+            Item {
+                label: "Show Server Performance",
+                shortcut: "Ctrl+Shift+P",
+                command: Command::ShowPerformanceSidebar,
+            },
+            Item {
+                label: "Toggle Bottom Terminal",
+                shortcut: "Ctrl+J",
+                command: Command::ToggleBottomPanel,
+            },
+        ],
+        WindowsMenu::Window => vec![
+            Item {
+                label: "Minimize",
+                shortcut: "",
+                command: Command::MinimizeWindow,
+            },
+            Item {
+                label: "Maximize or Restore",
+                shortcut: "",
+                command: Command::ZoomWindow,
+            },
+            Item {
+                label: "Toggle Full Screen",
+                shortcut: "Ctrl+Alt+F",
+                command: Command::ToggleFullscreen,
+            },
+            Separator,
+            Item {
+                label: "Close Window",
+                shortcut: "Ctrl+W",
+                command: Command::CloseWindow,
+            },
+        ],
+        WindowsMenu::Help => vec![Item {
+            label: "About RemCmd",
+            shortcut: "",
+            command: Command::ShowAbout,
+        }],
+    }
+}
+
 fn clamp_right_sidebar_width(requested: f32, viewport_width: f32, left_sidebar_width: f32) -> f32 {
     let available_width = (viewport_width
         - left_sidebar_width
@@ -13746,7 +14570,7 @@ fn clamp_right_sidebar_width(requested: f32, viewport_width: f32, left_sidebar_w
 }
 
 fn clamp_bottom_panel_height(requested: f32, viewport_height: f32) -> f32 {
-    let available_height = (viewport_height - TITLEBAR_HEIGHT - 100.0)
+    let available_height = (viewport_height - content_top_inset() - 100.0)
         .clamp(BOTTOM_PANEL_MIN_HEIGHT, BOTTOM_PANEL_MAX_HEIGHT);
     requested.clamp(BOTTOM_PANEL_MIN_HEIGHT, available_height)
 }
@@ -14412,6 +15236,12 @@ fn bind_profile_editor_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", SaveProfileEditor, Some("ProfileEditor")),
         KeyBinding::new("escape", CancelProfileEditor, Some("ProfileEditor")),
     ]);
+    #[cfg(target_os = "windows")]
+    cx.bind_keys([KeyBinding::new(
+        "ctrl-s",
+        SaveProfileEditor,
+        Some("ProfileEditor"),
+    )]);
 }
 
 fn application_menus() -> Vec<Menu> {
@@ -14519,6 +15349,32 @@ fn configure_application_menu(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", ShowPerformanceSidebar, None),
         KeyBinding::new("cmd-j", ToggleBottomPanel, None),
         KeyBinding::new("cmd-q", Quit, None),
+    ]);
+    #[cfg(target_os = "windows")]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-,", ShowSettings, None),
+        KeyBinding::new("ctrl-shift-h", ShowHome, None),
+        KeyBinding::new("ctrl-n", NewConnection, None),
+        KeyBinding::new("ctrl-t", NewLocalTerminal, None),
+        KeyBinding::new("ctrl-shift-t", NewRemoteTerminal, None),
+        KeyBinding::new("ctrl-enter", ConnectSelectedProfile, None),
+        KeyBinding::new("ctrl-shift-x", DisconnectActiveSession, None),
+        KeyBinding::new("ctrl-d", SplitHorizontal, None),
+        KeyBinding::new("ctrl-shift-d", SplitVertical, None),
+        KeyBinding::new("ctrl-alt-w", CloseActivePane, None),
+        KeyBinding::new("ctrl-shift-w", CloseActiveTab, None),
+        KeyBinding::new("ctrl-w", CloseWindow, None),
+        KeyBinding::new("ctrl-r", ResetActiveTerminal, None),
+        KeyBinding::new("ctrl-1", ShowTerminalView, None),
+        KeyBinding::new("ctrl-2", ShowFilesView, None),
+        KeyBinding::new("ctrl-shift-s", ToggleLeftSidebar, None),
+        KeyBinding::new("ctrl-m", MinimizeWindow, None),
+        KeyBinding::new("ctrl-alt-f", ToggleFullscreen, None),
+        KeyBinding::new("ctrl-f", ToggleConnectionSearch, None),
+        KeyBinding::new("ctrl-shift-f", ShowSftpSidebar, None),
+        KeyBinding::new("ctrl-shift-p", ShowPerformanceSidebar, None),
+        KeyBinding::new("ctrl-j", ToggleBottomPanel, None),
+        KeyBinding::new("ctrl-q", Quit, None),
     ]);
     cx.on_action(|_: &ShowSettings, cx| {
         dispatch_main_window_action(cx, |this, window, cx| this.show_settings(window, cx));
@@ -14751,6 +15607,93 @@ mod tests {
             &menus[0].items[0],
             MenuItem::Action { name, .. } if name.as_ref() == "About RemCmd"
         ));
+    }
+
+    #[test]
+    fn windows_titlebar_menus_expose_expected_command_groups() {
+        let file_entries = windows_menu_entries(WindowsMenu::File);
+        let edit_entries = windows_menu_entries(WindowsMenu::Edit);
+        let help_entries = windows_menu_entries(WindowsMenu::Help);
+
+        assert!(file_entries.iter().any(|entry| matches!(
+            entry,
+            WindowsMenuEntry::Item {
+                command: WindowsMenuCommand::NewConnection,
+                ..
+            }
+        )));
+        assert!(edit_entries.iter().any(|entry| matches!(
+            entry,
+            WindowsMenuEntry::Item {
+                command: WindowsMenuCommand::Edit(EditCommand::Paste),
+                ..
+            }
+        )));
+        assert_eq!(
+            help_entries,
+            vec![WindowsMenuEntry::Item {
+                label: "About RemCmd",
+                shortcut: "",
+                command: WindowsMenuCommand::ShowAbout,
+            }]
+        );
+    }
+
+    #[test]
+    fn windows_titlebar_menus_do_not_start_or_end_with_separators() {
+        for menu in [
+            WindowsMenu::File,
+            WindowsMenu::Edit,
+            WindowsMenu::Terminal,
+            WindowsMenu::View,
+            WindowsMenu::Window,
+            WindowsMenu::Help,
+        ] {
+            let entries = windows_menu_entries(menu);
+            assert!(!matches!(
+                entries.first(),
+                Some(WindowsMenuEntry::Separator)
+            ));
+            assert!(!matches!(entries.last(), Some(WindowsMenuEntry::Separator)));
+        }
+    }
+
+    #[test]
+    fn windows_titlebar_menu_geometry_fits_labels_and_tracks_buttons() {
+        let menus = [
+            WindowsMenu::File,
+            WindowsMenu::Edit,
+            WindowsMenu::Terminal,
+            WindowsMenu::View,
+            WindowsMenu::Window,
+            WindowsMenu::Help,
+        ];
+        let mut expected_left = WINDOWS_BRAND_WIDTH;
+
+        for menu in menus {
+            assert_eq!(windows_menu_left(menu), expected_left);
+            expected_left += windows_menu_button_width(menu);
+
+            let entries = windows_menu_entries(menu);
+            let width = windows_menu_popup_width(&entries);
+            assert!(width >= WINDOWS_MENU_MIN_WIDTH);
+            for entry in entries {
+                let WindowsMenuEntry::Item {
+                    label, shortcut, ..
+                } = entry
+                else {
+                    continue;
+                };
+                let required = 28.0
+                    + estimated_windows_menu_text_width(label)
+                    + if shortcut.is_empty() {
+                        0.0
+                    } else {
+                        20.0 + estimated_windows_menu_text_width(shortcut)
+                    };
+                assert!(width >= required.ceil());
+            }
+        }
     }
 
     #[test]

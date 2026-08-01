@@ -39,6 +39,13 @@ foundations and the work that remains before a stable release.
 The beta channel focuses on installation validation, compatibility fixes, and
 feedback from real SSH and SFTP workloads across macOS, Windows, and Linux.
 
+## Planned Capabilities
+
+- Internationalization and localized user interfaces.
+- Importing connection profiles from OpenSSH `~/.ssh/config` files.
+- Structured diagnostics and user-accessible logs with credential redaction.
+- SSH proxy and jump-host support.
+
 ## Before Stable
 
 - Developer ID signing and notarization for macOS.

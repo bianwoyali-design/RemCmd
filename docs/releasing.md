@@ -33,7 +33,7 @@ smoke-test the applicable artifacts before merging the release branch.
 At minimum, verify:
 
 - the displayed version and package filenames;
-- application startup and standard window controls;
+- application startup, standard window controls, and the Windows titlebar menus;
 - creation of local and SSH terminals;
 - password, private-key, passwordless, and SSH Agent authentication where
   supported;

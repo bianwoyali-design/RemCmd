@@ -33,6 +33,7 @@ pub struct Theme {
     pub status_warn: Hsla,
 
     pub sidebar_bg: Hsla,
+    pub floating_glass_bg: Hsla,
     pub panel_bg: Hsla,
     pub surface_bg: Hsla,
     pub overlay_bg: Hsla,
@@ -95,6 +96,7 @@ impl Theme {
             status_warn: opaque(0xfde68a),
 
             sidebar_bg: alpha(0x212121e8),
+            floating_glass_bg: alpha(0x212121f5),
             panel_bg: opaque(0x181818),
             surface_bg: alpha(0xffffff12),
             overlay_bg: alpha(0x0000008f),
@@ -155,6 +157,7 @@ impl Theme {
             status_warn: opaque(0xa16207),
 
             sidebar_bg: alpha(0xf1f1f3e8),
+            floating_glass_bg: alpha(0xf1f1f3f5),
             panel_bg: opaque(0xffffff),
             surface_bg: alpha(0x00000008),
             overlay_bg: alpha(0x00000059),
