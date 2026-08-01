@@ -7304,13 +7304,6 @@ impl Render for RemCmdApp {
 }
 
 impl RemCmdApp {
-    fn solid_sidebar_background(&self) -> Hsla {
-        Hsla {
-            a: 1.0,
-            ..self.theme.sidebar_bg
-        }
-    }
-
     fn render_windows_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let drag_area = div()
             .flex_1()
@@ -7367,6 +7360,12 @@ impl RemCmdApp {
         let selected = self.windows_menu_open == Some(menu);
         let hover = self.theme.control_hover_bg;
         let pressed = self.theme.control_pressed_bg;
+        let width = match menu {
+            WindowsMenu::File | WindowsMenu::Edit | WindowsMenu::Help => 43.0,
+            WindowsMenu::Terminal => 66.0,
+            WindowsMenu::View => 45.0,
+            WindowsMenu::Window => 64.0,
+        };
 
         div()
             .id(SharedString::from(format!(
@@ -7377,8 +7376,8 @@ impl RemCmdApp {
             .flex_none()
             .items_center()
             .justify_center()
+            .w(px(width))
             .h(px(24.0))
-            .px(px(8.0))
             .rounded_md()
             .text_size(px(12.0))
             .text_color(self.theme.text_primary)
@@ -7407,6 +7406,7 @@ impl RemCmdApp {
                 };
                 cx.notify();
             }))
+            .child(label)
     }
 
     fn render_windows_menu_popup(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -8213,7 +8213,7 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .when(cfg!(target_os = "windows"), |this| {
-                this.bg(self.solid_sidebar_background())
+                this.bg(self.theme.panel_bg)
             })
             .child(leading);
 
