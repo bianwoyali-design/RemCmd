@@ -41,6 +41,9 @@ mod private_key_picker;
 #[cfg(target_os = "macos")]
 mod macos_symbols;
 
+#[cfg(target_os = "windows")]
+mod windows_backdrop;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -124,9 +127,10 @@ const TITLEBAR_ADD_ICON_SIZE: f32 = 16.0;
 const TITLEBAR_SIDEBAR_ICON_SIZE: f32 = 20.0;
 const TITLEBAR_LEFT_CONTROL_EDGE_GAP: f32 = 10.0;
 const WINDOWS_CHROME_HEIGHT: f32 = 34.0;
+const WINDOWS_BRAND_WIDTH: f32 = 112.0;
 const WINDOWS_TITLEBAR_BUTTON_WIDTH: f32 = 46.0;
 const WINDOWS_TITLEBAR_CONTROLS_WIDTH: f32 = WINDOWS_TITLEBAR_BUTTON_WIDTH * 3.0;
-const WINDOWS_MENU_WIDTH: f32 = 236.0;
+const WINDOWS_MENU_MIN_WIDTH: f32 = 180.0;
 const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
 const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
 const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
@@ -2176,6 +2180,8 @@ impl RemCmdApp {
         ));
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
+        #[cfg(target_os = "windows")]
+        windows_backdrop::apply_mica(window, theme.appearance == theme::ThemeAppearance::Dark);
 
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
@@ -4140,6 +4146,11 @@ impl RemCmdApp {
 
         self.theme = Theme::resolve(self.theme_mode, window);
         set_global_theme(self.theme, cx);
+        #[cfg(target_os = "windows")]
+        windows_backdrop::apply_mica(
+            window,
+            self.theme.appearance == theme::ThemeAppearance::Dark,
+        );
         cx.notify();
     }
 
@@ -4147,6 +4158,11 @@ impl RemCmdApp {
         self.theme_mode = theme_mode;
         self.theme = Theme::resolve(theme_mode, window);
         set_global_theme(self.theme, cx);
+        #[cfg(target_os = "windows")]
+        windows_backdrop::apply_mica(
+            window,
+            self.theme.appearance == theme::ThemeAppearance::Dark,
+        );
 
         self.persist_settings();
         cx.notify();
@@ -7328,18 +7344,11 @@ impl RemCmdApp {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(7.0))
+                    .justify_start()
+                    .w(px(WINDOWS_BRAND_WIDTH))
                     .h_full()
-                    .pl(px(11.0))
-                    .pr(px(10.0))
-                    .child(app_icon(18.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(self.theme.text_primary)
-                            .child("RemCmd"),
-                    ),
+                    .pl(px(12.0))
+                    .child(wordmark(self.theme, 90.0, 20.0)),
             )
             .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
             .child(self.render_windows_menu_button(WindowsMenu::Edit, "Edit", cx))
@@ -7360,12 +7369,7 @@ impl RemCmdApp {
         let selected = self.windows_menu_open == Some(menu);
         let hover = self.theme.control_hover_bg;
         let pressed = self.theme.control_pressed_bg;
-        let width = match menu {
-            WindowsMenu::File | WindowsMenu::Edit | WindowsMenu::Help => 43.0,
-            WindowsMenu::Terminal => 66.0,
-            WindowsMenu::View => 45.0,
-            WindowsMenu::Window => 64.0,
-        };
+        let width = windows_menu_button_width(menu);
 
         div()
             .id(SharedString::from(format!(
@@ -7413,27 +7417,22 @@ impl RemCmdApp {
         let Some(menu) = self.windows_menu_open else {
             return div().into_any_element();
         };
-        let left = match menu {
-            WindowsMenu::File => 94.0,
-            WindowsMenu::Edit => 137.0,
-            WindowsMenu::Terminal => 180.0,
-            WindowsMenu::View => 246.0,
-            WindowsMenu::Window => 291.0,
-            WindowsMenu::Help => 355.0,
-        };
+        let entries = windows_menu_entries(menu);
+        let left = windows_menu_left(menu);
+        let width = windows_menu_popup_width(&entries);
         let mut popup = self
             .glass_floating_surface()
             .id("windows_menu_popup")
             .absolute()
             .left(px(left))
             .top(px(platform_chrome_height() - 1.0))
-            .w(px(WINDOWS_MENU_WIDTH))
+            .w(px(width))
             .flex()
             .flex_col()
             .p_1()
             .occlude();
 
-        for (index, entry) in windows_menu_entries(menu).into_iter().enumerate() {
+        for (index, entry) in entries.into_iter().enumerate() {
             popup = match entry {
                 WindowsMenuEntry::Item {
                     label,
@@ -7494,9 +7493,23 @@ impl RemCmdApp {
                     .when(enabled, |this| {
                         this.group_hover(hover_group.clone(), |style| style.opacity(0.0))
                     })
-                    .child(div().flex_1().text_color(foreground).child(label))
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_color(foreground)
+                            .child(label),
+                    )
                     .when(!shortcut.is_empty(), |this| {
-                        this.child(div().text_color(muted).child(shortcut))
+                        this.child(
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .text_color(muted)
+                                .child(shortcut),
+                        )
                     }),
             )
             .when(enabled, |this| {
@@ -7510,8 +7523,12 @@ impl RemCmdApp {
                         .opacity(0.0)
                         .text_color(on_accent)
                         .group_hover(hover_group, |style| style.opacity(1.0))
-                        .child(div().flex_1().child(label))
-                        .when(!shortcut.is_empty(), |this| this.child(shortcut)),
+                        .justify_between()
+                        .gap_4()
+                        .child(div().flex_none().whitespace_nowrap().child(label))
+                        .when(!shortcut.is_empty(), |this| {
+                            this.child(div().flex_none().whitespace_nowrap().child(shortcut))
+                        }),
                 )
             });
 
@@ -8213,15 +8230,28 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .when(cfg!(target_os = "windows"), |this| {
-                this.bg(self.theme.panel_bg)
+                this.bg(self.theme.sidebar_bg)
             })
             .child(leading);
 
         if self.tab_layout == TabLayout::Vertical {
-            let titlebar = titlebar
+            let center = div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .items_center()
+                .when(cfg!(target_os = "windows"), |this| {
+                    this.bg(self.theme.panel_bg)
+                        .rounded_tl(px(10.0))
+                        .when(self.right_sidebar_rendered, |this| {
+                            this.rounded_tr(px(10.0))
+                        })
+                })
                 .child(drag_area().flex_1())
                 .child(self.render_titlebar_action_group(cx))
                 .child(drag_area().w(px(12.0)));
+            let titlebar = titlebar.child(center);
             return self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width);
         }
 
@@ -8600,7 +8630,21 @@ impl RemCmdApp {
             controls = controls.child(drag_area().flex_1());
         }
 
-        let titlebar = titlebar.child(controls.child(self.render_titlebar_action_group(cx)));
+        let center = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .items_center()
+            .when(cfg!(target_os = "windows"), |this| {
+                this.bg(self.theme.panel_bg)
+                    .rounded_tl(px(10.0))
+                    .when(self.right_sidebar_rendered, |this| {
+                        this.rounded_tr(px(10.0))
+                    })
+            })
+            .child(controls.child(self.render_titlebar_action_group(cx)));
+        let titlebar = titlebar.child(center);
         self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width)
     }
 
@@ -9769,7 +9813,7 @@ impl RemCmdApp {
         let handle = div()
             .id("sidebar_resize_handle")
             .absolute()
-            .top_0()
+            .top(px(platform_chrome_height()))
             .bottom_0()
             .left(px(width - SIDEBAR_RESIZE_HANDLE_WIDTH / 2.0))
             .flex()
@@ -9827,7 +9871,7 @@ impl RemCmdApp {
         let handle = div()
             .id("right_sidebar_resize_handle")
             .absolute()
-            .top_0()
+            .top(px(platform_chrome_height()))
             .bottom_0()
             .flex()
             .items_center()
@@ -14179,6 +14223,58 @@ fn select_menu_scroll_offset(selected_index: usize, option_count: usize) -> f32 
     first_visible as f32 * SELECT_MENU_ROW_HEIGHT
 }
 
+const fn windows_menu_button_width(menu: WindowsMenu) -> f32 {
+    match menu {
+        WindowsMenu::File | WindowsMenu::Edit | WindowsMenu::Help => 43.0,
+        WindowsMenu::Terminal => 66.0,
+        WindowsMenu::View => 45.0,
+        WindowsMenu::Window => 64.0,
+    }
+}
+
+fn windows_menu_left(menu: WindowsMenu) -> f32 {
+    let menus = [
+        WindowsMenu::File,
+        WindowsMenu::Edit,
+        WindowsMenu::Terminal,
+        WindowsMenu::View,
+        WindowsMenu::Window,
+        WindowsMenu::Help,
+    ];
+    WINDOWS_BRAND_WIDTH
+        + menus
+            .into_iter()
+            .take_while(|candidate| *candidate != menu)
+            .map(windows_menu_button_width)
+            .sum::<f32>()
+}
+
+fn windows_menu_popup_width(entries: &[WindowsMenuEntry]) -> f32 {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            WindowsMenuEntry::Item {
+                label, shortcut, ..
+            } => Some(
+                28.0 + estimated_windows_menu_text_width(label)
+                    + if shortcut.is_empty() {
+                        0.0
+                    } else {
+                        20.0 + estimated_windows_menu_text_width(shortcut)
+                    },
+            ),
+            WindowsMenuEntry::Separator => None,
+        })
+        .fold(WINDOWS_MENU_MIN_WIDTH, f32::max)
+        .ceil()
+}
+
+fn estimated_windows_menu_text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|character| if character.is_ascii() { 7.25 } else { 12.0 })
+        .sum()
+}
+
 fn windows_menu_entries(menu: WindowsMenu) -> Vec<WindowsMenuEntry> {
     use WindowsMenuCommand as Command;
     use WindowsMenuEntry::{Item, Separator};
@@ -14984,7 +15080,11 @@ fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(720.0), px(480.0))),
-        window_background: WindowBackgroundAppearance::Blurred,
+        window_background: if cfg!(target_os = "windows") {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            WindowBackgroundAppearance::Blurred
+        },
         titlebar: Some(main_window_titlebar()),
         ..Default::default()
     }
@@ -15460,6 +15560,44 @@ mod tests {
                 Some(WindowsMenuEntry::Separator)
             ));
             assert!(!matches!(entries.last(), Some(WindowsMenuEntry::Separator)));
+        }
+    }
+
+    #[test]
+    fn windows_titlebar_menu_geometry_fits_labels_and_tracks_buttons() {
+        let menus = [
+            WindowsMenu::File,
+            WindowsMenu::Edit,
+            WindowsMenu::Terminal,
+            WindowsMenu::View,
+            WindowsMenu::Window,
+            WindowsMenu::Help,
+        ];
+        let mut expected_left = WINDOWS_BRAND_WIDTH;
+
+        for menu in menus {
+            assert_eq!(windows_menu_left(menu), expected_left);
+            expected_left += windows_menu_button_width(menu);
+
+            let entries = windows_menu_entries(menu);
+            let width = windows_menu_popup_width(&entries);
+            assert!(width >= WINDOWS_MENU_MIN_WIDTH);
+            for entry in entries {
+                let WindowsMenuEntry::Item {
+                    label, shortcut, ..
+                } = entry
+                else {
+                    continue;
+                };
+                let required = 28.0
+                    + estimated_windows_menu_text_width(label)
+                    + if shortcut.is_empty() {
+                        0.0
+                    } else {
+                        20.0 + estimated_windows_menu_text_width(shortcut)
+                    };
+                assert!(width >= required.ceil());
+            }
         }
     }
 
