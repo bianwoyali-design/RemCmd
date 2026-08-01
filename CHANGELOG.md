@@ -34,9 +34,9 @@ All notable changes to RemCmd are documented in this file.
 - Single-select menus open near the selected option and retain full-width,
   theme-correct hover rows.
 - Home connection rows preserve their rounded hover corners.
-- Windows keeps the glass material in the draggable titlebar and sidebar-aligned
-  tab gutters while the central tab surface stays opaque, with rounded sidebar
-  transitions and menu widths that fit their labels and shortcuts.
+- Windows uses one GPUI Acrylic treatment across the draggable titlebar,
+  sidebars, sidebar-aligned tab gutters, tooltips, and menus; the central tab
+  surface stays opaque, with rounded transitions and content-sized menus.
 
 ### Known Limitations
 

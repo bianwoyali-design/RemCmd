@@ -41,9 +41,6 @@ mod private_key_picker;
 #[cfg(target_os = "macos")]
 mod macos_symbols;
 
-#[cfg(target_os = "windows")]
-mod windows_backdrop;
-
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -546,7 +543,7 @@ impl Render for CommandTooltip {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
+            .bg(self.theme.floating_glass_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(1.0)),
@@ -2182,8 +2179,6 @@ impl RemCmdApp {
         ));
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
-        #[cfg(target_os = "windows")]
-        windows_backdrop::apply_mica(window, theme.appearance == theme::ThemeAppearance::Dark);
 
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
@@ -4148,11 +4143,6 @@ impl RemCmdApp {
 
         self.theme = Theme::resolve(self.theme_mode, window);
         set_global_theme(self.theme, cx);
-        #[cfg(target_os = "windows")]
-        windows_backdrop::apply_mica(
-            window,
-            self.theme.appearance == theme::ThemeAppearance::Dark,
-        );
         cx.notify();
     }
 
@@ -4160,11 +4150,6 @@ impl RemCmdApp {
         self.theme_mode = theme_mode;
         self.theme = Theme::resolve(theme_mode, window);
         set_global_theme(self.theme, cx);
-        #[cfg(target_os = "windows")]
-        windows_backdrop::apply_mica(
-            window,
-            self.theme.appearance == theme::ThemeAppearance::Dark,
-        );
 
         self.persist_settings();
         cx.notify();
@@ -7350,6 +7335,7 @@ impl RemCmdApp {
                     .w(px(WINDOWS_BRAND_WIDTH))
                     .h_full()
                     .pl(px(12.0))
+                    .window_control_area(WindowControlArea::Drag)
                     .child(wordmark(self.theme, 90.0, 20.0)),
             )
             .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
@@ -8157,14 +8143,7 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let drag_area = || {
-            div()
-                .flex_none()
-                .h_full()
-                .when(!cfg!(target_os = "windows"), |this| {
-                    this.window_control_area(WindowControlArea::Drag)
-                })
-        };
+        let drag_area = || div().h_full().window_control_area(WindowControlArea::Drag);
         let leading_width = self.titlebar_leading_width(window);
         let expanded_right_sidebar_width = self.effective_right_sidebar_width(window);
         let expanded_right_titlebar_width = expanded_right_sidebar_width;
@@ -8203,9 +8182,12 @@ impl RemCmdApp {
             .flex_none()
             .items_center()
             .h_full()
+            .pr(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP))
+            .when(cfg!(target_os = "windows") && !leading_open, |this| {
+                this.bg(self.theme.panel_bg)
+            })
             .child(drag_area().flex_1())
             .child(left_sidebar_group)
-            .child(drag_area().w(px(TITLEBAR_LEFT_CONTROL_EDGE_GAP)))
             .with_animation(
                 SharedString::from(format!(
                     "titlebar-left-edge-{leading_transition_id}-{leading_open}"
@@ -8231,9 +8213,6 @@ impl RemCmdApp {
             .h(px(TITLEBAR_HEIGHT))
             .flex()
             .items_center()
-            .when(cfg!(target_os = "windows"), |this| {
-                this.bg(self.theme.sidebar_bg)
-            })
             .child(leading);
 
         if self.tab_layout == TabLayout::Vertical {
@@ -8245,7 +8224,7 @@ impl RemCmdApp {
                 .items_center()
                 .when(cfg!(target_os = "windows"), |this| {
                     this.bg(self.theme.panel_bg)
-                        .rounded_tl(px(10.0))
+                        .when(self.left_sidebar_open, |this| this.rounded_tl(px(10.0)))
                         .when(self.right_sidebar_rendered, |this| {
                             this.rounded_tr(px(10.0))
                         })
@@ -8640,7 +8619,7 @@ impl RemCmdApp {
             .items_center()
             .when(cfg!(target_os = "windows"), |this| {
                 this.bg(self.theme.panel_bg)
-                    .rounded_tl(px(10.0))
+                    .when(self.left_sidebar_open, |this| this.rounded_tl(px(10.0)))
                     .when(self.right_sidebar_rendered, |this| {
                         this.rounded_tr(px(10.0))
                     })
@@ -9773,13 +9752,27 @@ impl RemCmdApp {
     }
 
     fn glass_sidebar_surface(&self) -> gpui::Div {
-        div()
+        let surface = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_none()
             .min_w(px(0.0))
-            .h_full()
-            .bg(self.theme.sidebar_bg)
+            .h_full();
+
+        if cfg!(target_os = "windows") {
+            surface.child(
+                div()
+                    .absolute()
+                    .top(px(WINDOWS_CHROME_HEIGHT))
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .bg(self.theme.sidebar_bg),
+            )
+        } else {
+            surface.bg(self.theme.sidebar_bg)
+        }
     }
 
     fn glass_floating_surface(&self) -> gpui::Div {
@@ -9787,7 +9780,7 @@ impl RemCmdApp {
             .rounded_lg()
             .border_1()
             .border_color(self.theme.border_strong)
-            .bg(self.theme.sidebar_bg)
+            .bg(self.theme.floating_glass_bg)
             .shadow(vec![BoxShadow {
                 color: self.theme.shadow,
                 offset: point(px(0.0), px(1.0)),
@@ -11085,13 +11078,8 @@ impl RemCmdApp {
     }
 
     fn detail_panel_shell(&self) -> gpui::Div {
-        let mut shadows = vec![BoxShadow {
-            color: self.theme.shadow,
-            offset: point(px(-1.0), px(0.0)),
-            blur_radius: px(4.0),
-            spread_radius: px(-2.0),
-        }];
         let mut panel = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -11099,22 +11087,42 @@ impl RemCmdApp {
             .h_full()
             .px_4()
             .pb_4()
-            .pt(px(content_top_inset()))
-            .bg(self.theme.panel_bg)
-            .border_l_1()
-            .border_color(self.theme.border_strong);
+            .pt(px(content_top_inset()));
 
-        if self.right_sidebar_open {
-            panel = panel.border_r_1();
-            shadows.push(BoxShadow {
+        if cfg!(target_os = "windows") {
+            panel = panel.child(
+                div()
+                    .absolute()
+                    .top(px(WINDOWS_CHROME_HEIGHT))
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .bg(self.theme.panel_bg),
+            );
+        } else {
+            let mut shadows = vec![BoxShadow {
                 color: self.theme.shadow,
-                offset: point(px(1.0), px(0.0)),
+                offset: point(px(-1.0), px(0.0)),
                 blur_radius: px(4.0),
                 spread_radius: px(-2.0),
-            });
+            }];
+            panel = panel
+                .bg(self.theme.panel_bg)
+                .border_l_1()
+                .border_color(self.theme.border_strong);
+            if self.right_sidebar_open {
+                panel = panel.border_r_1();
+                shadows.push(BoxShadow {
+                    color: self.theme.shadow,
+                    offset: point(px(1.0), px(0.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(-2.0),
+                });
+            }
+            panel = panel.shadow(shadows);
         }
 
-        panel.shadow(shadows)
+        panel
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -15082,11 +15090,7 @@ fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(720.0), px(480.0))),
-        window_background: if cfg!(target_os = "windows") {
-            WindowBackgroundAppearance::Opaque
-        } else {
-            WindowBackgroundAppearance::Blurred
-        },
+        window_background: WindowBackgroundAppearance::Blurred,
         titlebar: Some(main_window_titlebar()),
         ..Default::default()
     }

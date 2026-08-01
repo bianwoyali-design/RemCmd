@@ -5158,7 +5158,6 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
- "raw-window-handle",
  "remcmd-core",
  "remcmd-local",
  "remcmd-ssh",
@@ -5168,7 +5167,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-segmentation",
- "windows-sys 0.59.0",
  "winres",
 ]
 
