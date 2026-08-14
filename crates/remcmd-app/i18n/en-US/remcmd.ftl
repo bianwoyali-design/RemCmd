@@ -88,6 +88,7 @@ common-copy = Copy
 common-paste = Paste
 common-select-all = Select All
 common-view = View
+settings-back = Back to Settings
 common-maximize = Maximize
 common-restore = Restore
 

@@ -13059,6 +13059,8 @@ impl RemCmdApp {
                     .px(px(10.0))
                     .rounded_lg()
                     .bg(self.theme.settings_group_bg)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
                     .hover(|this| this.bg(self.theme.control_hover_bg))
                     .child(self.tr("import-openssh"))
@@ -13322,6 +13324,17 @@ impl RemCmdApp {
                     .map(|path| path.display().to_string())
                     .unwrap_or_default()
             });
+        let back = self
+            .render_icon_button(
+                "openssh-back-to-settings",
+                IconName::ArrowLeft,
+                self.tr("settings-back"),
+                IconTone::Default,
+                true,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_settings(window, cx);
+            }));
 
         self.detail_panel_shell().child(
             div()
@@ -13337,10 +13350,12 @@ impl RemCmdApp {
                         .items_center()
                         .justify_between()
                         .child(
-                            div()
-                                .text_xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(self.tr("import-title")),
+                            div().flex().items_center().gap_2().child(back).child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.tr("import-title")),
+                            ),
                         )
                         .child(div().flex().gap_2().child(browse).child(apply)),
                 )
