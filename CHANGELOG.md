@@ -4,6 +4,36 @@ All notable changes to RemCmd are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- English and Simplified Chinese Fluent catalogs, system-language detection,
+  English fallback, and immediate runtime language switching across app and
+  native menus.
+- Read-only OpenSSH configuration import with recursive includes, deterministic
+  safe `Match` handling, previews, ProxyJump dependency inclusion, and
+  conflict-aware re-import that preserves profile IDs.
+- HTTP CONNECT and SOCKS5 proxies, trusted ProxyCommand execution, and ordered
+  multi-hop SSH connections shared by terminals, SFTP, and performance
+  monitoring.
+- Redacted JSONL diagnostics with an in-memory fallback, seven-day retention,
+  runtime debug mode, filtering, clearing, and anonymized ZIP support bundles.
+- macOS, Windows, and Ubuntu workspace-test jobs in CI.
+
+### Changed
+
+- Connection events now identify proxy, jump, and target stages and report
+  independent authentication success for each SSH endpoint.
+- Profile and settings serialization remains backward-compatible; existing
+  profiles default to direct routing and settings default to system language.
+
+### Security
+
+- Proxy passwords and raw ProxyCommand text are stored only in the operating
+  system keychain. ProxyCommand execution requires a target-specific SHA-256
+  approval that is invalidated when the command or endpoint changes.
+- Diagnostic events and support bundles pass through centralized secret and
+  pattern redaction before entering memory, disk, or ZIP output.
+
 ## [0.1.0-beta.1] - 2026-08-01
 
 ### Added

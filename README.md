@@ -7,8 +7,7 @@
 <p align="center">
     A GPU-accelerated SSH terminal and SFTP client built with Rust.
     <br />
-    <a href="https://github.com/bianwoyali-design/RemCmd/actions/
-    workflows/ci.yml"><img alt="CI" src="https://github.com/bianwoyali-design/RemCmd/actions/workflows/ci.yml/badge.svg?branch=main" /></a>
+    <a href="https://github.com/bianwoyali-design/RemCmd/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/bianwoyali-design/RemCmd/actions/workflows/ci.yml/badge.svg?branch=main" /></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /></a>
     <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" />
     <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-1.96%2B-dea584?logo=rust&logoColor=white" /></a>
@@ -41,6 +40,14 @@ RemCmd is currently in beta. Download the latest build from the
   process counts, and sampling latency.
 - Light, Dark, and System themes, configurable terminal font settings, and
   horizontal or vertical terminal tabs.
+- English and Simplified Chinese interfaces that can follow the operating
+  system or switch immediately while the app is running.
+- OpenSSH configuration import and conflict-aware re-import from
+  `~/.ssh/config` or another selected file.
+- HTTP CONNECT, SOCKS5, ProxyCommand, and ordered jump-host chains for terminal,
+  SFTP, and server performance sessions.
+- Redacted JSONL diagnostics with filtering, seven-day retention, and
+  anonymized ZIP support-bundle export.
 
 ## Install
 
@@ -70,13 +77,19 @@ Reusable passwords and private-key passphrases are saved only after successful
 authentication in the operating system keychain. They are never written to the
 profile JSON file.
 
+Proxy passwords and ProxyCommand text follow the same rule: they live only in
+the operating system keychain. Profiles contain routing metadata and trust
+digests, never those secrets.
+
 ## Build From Source
 
 ### Prerequisites
 
 RemCmd requires **Rust 1.96.1** (install via [rustup](https://rustup.rs/)).
 
-**macOS** — Xcode Command Line Tools:
+**macOS** — full Xcode with its Metal Toolchain. If Xcode reports that the
+toolchain is missing, install it with `xcodebuild -downloadComponent
+MetalToolchain`.
 
 **Linux (Debian / Ubuntu)**:
 
@@ -125,6 +138,9 @@ App data lives under the platform-standard directory:
 
 - [Installation](docs/installation.md)
 - [macOS installation](docs/macos-installation.md)
+- [OpenSSH configuration import](docs/openssh-import.md)
+- [Proxies and jump hosts](docs/proxies-and-jump-hosts.md)
+- [Diagnostics and support bundles](docs/diagnostics.md)
 - [Windows packaging and future signing](docs/windows-code-signing.md)
 - [Release process](docs/releasing.md)
 - [Roadmap](ROADMAP.md)
