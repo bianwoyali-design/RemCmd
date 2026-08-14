@@ -45,6 +45,15 @@ impl ConnectionProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum LanguageMode {
+    #[default]
+    System,
+    EnUs,
+    ZhCn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
     #[default]
     System,
@@ -174,6 +183,18 @@ mod tests {
             serde_json::from_str(json).expect("old profile should remain valid");
 
         assert_eq!(profile.auth, AuthConfig::Password);
+    }
+
+    #[test]
+    fn language_mode_serializes_as_a_stable_value() {
+        assert_eq!(
+            serde_json::to_string(&LanguageMode::ZhCn).unwrap(),
+            r#""zh_cn""#
+        );
+        assert_eq!(
+            serde_json::from_str::<LanguageMode>(r#""en_us""#).unwrap(),
+            LanguageMode::EnUs
+        );
     }
 
     #[test]

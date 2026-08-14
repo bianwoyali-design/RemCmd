@@ -294,11 +294,12 @@ pub fn icon_button(
 /// for decisions whose outcome should not rely on icon recognition.
 pub fn text_button(
     id: impl Into<gpui::ElementId>,
-    label: &'static str,
+    label: impl Into<gpui::SharedString>,
     tone: TextButtonTone,
     enabled: bool,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
     let (text, background, pressed_background) = match tone {
         TextButtonTone::Primary => (
             theme.on_accent,

@@ -19,6 +19,9 @@ description = "A GPU-accelerated SSH terminal and SFTP client"
 
 [workspace.dependencies]
 gpui = "0.2.2"
+fluent-bundle = "0.16.0"
+sys-locale = "0.3.2"
+unic-langid = "0.9.6"
 
 alacritty_terminal = { version = "=0.26.0", default-features = false }
 portable-pty = "0.9.0"

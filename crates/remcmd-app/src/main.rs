@@ -15,6 +15,9 @@ use pane_layout::{PaneId, PaneLayout, SplitAxis};
 mod icons;
 use icons::{IconName, RemCmdAssets, app_icon, icon, icon_with_color, wordmark};
 
+mod i18n;
+use i18n::Localizer;
+
 mod ssh_runtime;
 use ssh_runtime::SshRuntime;
 
@@ -69,7 +72,8 @@ use gpui::{
 use secrecy::SecretString;
 
 use remcmd_core::{
-    AuthConfig, ConnectionProfile, TabLayout, TerminalSettings, ThemeMode, TransferSettings,
+    AuthConfig, ConnectionProfile, LanguageMode, TabLayout, TerminalSettings, ThemeMode,
+    TransferSettings,
 };
 use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 #[cfg(test)]
@@ -78,7 +82,7 @@ use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
     RemoteDirectory, RemoteDirectoryTree, RemoteFile, RemoteFileEntry, RemoteFileKind,
     ServerPerformanceSnapshot, SessionState, SftpOperation, SftpTransferDirection, ShellEvent,
-    SshConnection, SshErrorKind, TransferRateLimiter,
+    SshConnection, SshError, SshErrorKind, TransferRateLimiter,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
@@ -242,6 +246,8 @@ struct RemCmdApp {
     credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
     active_panel: ActivePanel,
+    language_mode: LanguageMode,
+    localizer: Localizer,
     theme_mode: ThemeMode,
     tab_layout: TabLayout,
     terminal_font_family: SharedString,
@@ -332,7 +338,7 @@ enum WindowsMenuCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsMenuEntry {
     Item {
-        label: &'static str,
+        label_key: &'static str,
         shortcut: &'static str,
         command: WindowsMenuCommand,
     },
@@ -361,6 +367,106 @@ struct TerminalPane {
     focused: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionMessageArg {
+    Text(String),
+    Localized(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionMessage {
+    Plain(String),
+    Localized {
+        key: &'static str,
+        args: Vec<(&'static str, SessionMessageArg)>,
+    },
+    LocalizedWithDetail {
+        key: &'static str,
+        detail: String,
+    },
+    ConnectionError {
+        kind: SshErrorKind,
+        details: String,
+    },
+}
+
+impl SessionMessage {
+    fn localized(key: &'static str) -> Self {
+        Self::Localized {
+            key,
+            args: Vec::new(),
+        }
+    }
+
+    fn localized_with(
+        key: &'static str,
+        args: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> Self {
+        Self::Localized {
+            key,
+            args: args
+                .into_iter()
+                .map(|(name, value)| (name, SessionMessageArg::Text(value)))
+                .collect(),
+        }
+    }
+
+    fn localized_with_args(
+        key: &'static str,
+        args: impl IntoIterator<Item = (&'static str, SessionMessageArg)>,
+    ) -> Self {
+        Self::Localized {
+            key,
+            args: args.into_iter().collect(),
+        }
+    }
+
+    fn connection_error(error: &SshError) -> Self {
+        Self::ConnectionError {
+            kind: error.kind(),
+            details: error.message().to_owned(),
+        }
+    }
+
+    fn localized_with_detail(key: &'static str, detail: impl Into<String>) -> Self {
+        Self::LocalizedWithDetail {
+            key,
+            detail: detail.into(),
+        }
+    }
+
+    fn render(&self, localizer: &Localizer) -> String {
+        match self {
+            Self::Plain(message) => message.clone(),
+            Self::Localized { key, args } => {
+                let mut fluent_args = fluent_bundle::FluentArgs::new();
+                for (name, value) in args {
+                    fluent_args.set(
+                        *name,
+                        match value {
+                            SessionMessageArg::Text(value) => value.clone(),
+                            SessionMessageArg::Localized(key) => localizer.text(key),
+                        },
+                    );
+                }
+                localizer.text_with(key, Some(&fluent_args))
+            }
+            Self::LocalizedWithDetail { key, detail } => {
+                format!("{}: {detail}", localizer.text(key))
+            }
+            Self::ConnectionError { kind, details } => {
+                localized_connection_error_parts(*kind, details, localizer)
+            }
+        }
+    }
+}
+
+impl From<String> for SessionMessage {
+    fn from(message: String) -> Self {
+        Self::Plain(message)
+    }
+}
+
 struct TerminalSession {
     id: SessionId,
     profile_id: String,
@@ -369,9 +475,9 @@ struct TerminalSession {
     connection_state: SessionState,
     connection_handle: Option<ConnectionHandle>,
     local_terminal_handle: Option<LocalTerminalHandle>,
-    connection_error: Option<String>,
-    connection_message: Option<String>,
-    terminal_end_reason: Option<String>,
+    connection_error: Option<SessionMessage>,
+    connection_message: Option<SessionMessage>,
+    terminal_end_reason: Option<SessionMessage>,
     host_key_prompt: Option<HostKeyInfo>,
     terminal: Option<ActiveTerminal>,
     terminal_marked_text: String,
@@ -422,11 +528,10 @@ impl TerminalSession {
         }
     }
 
-    fn new_local(id: SessionId) -> Self {
+    fn new_local(id: SessionId, sftp_unavailable: String) -> Self {
         let mut session = Self::new(id, LOCAL_PROFILE_ID.into());
         session.kind = TerminalSessionKind::Local;
-        session.sftp_availability =
-            SftpAvailability::Unavailable("SFTP is only available for SSH sessions".into());
+        session.sftp_availability = SftpAvailability::Unavailable(sftp_unavailable);
         session
     }
 
@@ -536,7 +641,9 @@ struct CommandTooltip {
     theme: Theme,
 }
 
-struct AboutWindow;
+struct AboutWindow {
+    localizer: Localizer,
+}
 
 impl Render for CommandTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -562,6 +669,8 @@ impl Render for CommandTooltip {
 impl Render for AboutWindow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let mut version_args = fluent_bundle::FluentArgs::new();
+        version_args.set("version", env!("CARGO_PKG_VERSION"));
 
         div()
             .flex()
@@ -594,21 +703,24 @@ impl Render for AboutWindow {
                             .mt_3()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                            .child(
+                                self.localizer
+                                    .text_with("about-version", Some(&version_args)),
+                            ),
                     )
                     .child(
                         div()
                             .mt_3()
                             .text_sm()
                             .text_color(theme.text_muted)
-                            .child("Remote workspaces, files, and terminals in one native app."),
+                            .child(self.localizer.text("about-tagline")),
                     )
                     .child(
                         div()
                             .mt_5()
                             .text_xs()
                             .text_color(theme.text_faint)
-                            .child("Licensed under Apache-2.0"),
+                            .child(self.localizer.text("about-license")),
                     ),
             )
     }
@@ -769,6 +881,7 @@ enum ActivePanel {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsSelector {
+    Language,
     Theme,
     TabLayout,
     TerminalFont,
@@ -780,6 +893,7 @@ enum SettingsSelector {
 impl SettingsSelector {
     const fn element_id(self) -> &'static str {
         match self {
+            Self::Language => "settings-language-selector",
             Self::Theme => "settings-theme-selector",
             Self::TabLayout => "settings-tab-layout-selector",
             Self::TerminalFont => "settings-terminal-font-selector",
@@ -791,6 +905,7 @@ impl SettingsSelector {
 
     const fn options(self) -> &'static [SettingsOption] {
         match self {
+            Self::Language => &LANGUAGE_SETTING_OPTIONS,
             Self::Theme => &THEME_SETTING_OPTIONS,
             Self::TabLayout => &TAB_LAYOUT_SETTING_OPTIONS,
             Self::TerminalFont => &[],
@@ -802,6 +917,7 @@ impl SettingsSelector {
 
     const fn control_width(self) -> f32 {
         match self {
+            Self::Language => 132.0,
             Self::Theme => 92.0,
             Self::TabLayout => 104.0,
             Self::TerminalFont => 180.0,
@@ -813,6 +929,7 @@ impl SettingsSelector {
 
     const fn menu_width(self) -> f32 {
         match self {
+            Self::Language => 148.0,
             Self::Theme => 104.0,
             Self::TabLayout => 120.0,
             Self::TerminalFont => 220.0,
@@ -825,6 +942,7 @@ impl SettingsSelector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsValue {
+    Language(LanguageMode),
     Theme(ThemeMode),
     TabLayout(TabLayout),
     TerminalFontSize(u16),
@@ -837,6 +955,21 @@ struct SettingsOption {
     label: &'static str,
     value: SettingsValue,
 }
+
+const LANGUAGE_SETTING_OPTIONS: [SettingsOption; 3] = [
+    SettingsOption {
+        label: "Follow System",
+        value: SettingsValue::Language(LanguageMode::System),
+    },
+    SettingsOption {
+        label: "English",
+        value: SettingsValue::Language(LanguageMode::EnUs),
+    },
+    SettingsOption {
+        label: "简体中文",
+        value: SettingsValue::Language(LanguageMode::ZhCn),
+    },
+];
 
 const THEME_SETTING_OPTIONS: [SettingsOption; 3] = [
     SettingsOption {
@@ -1648,9 +1781,9 @@ impl SftpTransferTask {
         }
     }
 
-    fn status_text(&self) -> String {
+    fn status_text(&self, localizer: &Localizer) -> String {
         match self.state {
-            SftpTransferState::Queued => "Queued".into(),
+            SftpTransferState::Queued => localizer.text("sftp-queued"),
             SftpTransferState::Running => self.total.map_or_else(
                 || format_remote_size(self.transferred),
                 |total| {
@@ -1661,13 +1794,18 @@ impl SftpTransferTask {
                     )
                 },
             ),
-            SftpTransferState::Cancelling => "Cancelling...".into(),
-            SftpTransferState::Conflict => "Destination already exists".into(),
+            SftpTransferState::Cancelling => localizer.text("sftp-cancelling"),
+            SftpTransferState::Conflict => localizer.text("sftp-conflict"),
             SftpTransferState::Completed => {
-                format!("Completed · {}", format_remote_size(self.transferred))
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("size", format_remote_size(self.transferred));
+                localizer.text_with("sftp-completed", Some(&args))
             }
-            SftpTransferState::Failed => self.error.clone().unwrap_or_else(|| "Failed".into()),
-            SftpTransferState::Cancelled => "Cancelled".into(),
+            SftpTransferState::Failed => self
+                .error
+                .clone()
+                .unwrap_or_else(|| localizer.text("sftp-failed")),
+            SftpTransferState::Cancelled => localizer.text("sftp-cancelled"),
         }
     }
 }
@@ -2037,15 +2175,6 @@ impl ProfileAuthKind {
         (Self::Agent, "SSH Agent"),
     ];
 
-    const fn label(self) -> &'static str {
-        match self {
-            Self::None => "No Password",
-            Self::Password => "Password",
-            Self::PrivateKey => "Private Key",
-            Self::Agent => "SSH Agent",
-        }
-    }
-
     fn from_config(config: &AuthConfig) -> Self {
         match config {
             AuthConfig::None => Self::None,
@@ -2062,7 +2191,7 @@ impl ProfileAuthKind {
             Self::PrivateKey => {
                 let path = private_key_path.trim();
                 if path.is_empty() {
-                    return Err("Private key path is required");
+                    return Err("profile-validation-private-key");
                 }
 
                 Ok(AuthConfig::PrivateKey {
@@ -2141,14 +2270,11 @@ impl RemCmdApp {
         let profiles_path = default_profiles_path().expect("failed to resolve profiles path");
         let settings_path = default_settings_path().expect("failed to resolve settings path");
 
-        let (profiles, form_error) = match ensure_profiles_file(&profiles_path)
+        let (profiles, profile_load_error) = match ensure_profiles_file(&profiles_path)
             .and_then(|_| load_profiles(&profiles_path))
         {
             Ok(profiles) => (profiles, None),
-            Err(error) => (
-                Vec::new(),
-                Some(format!("Failed to load profiles: {error}")),
-            ),
+            Err(error) => (Vec::new(), Some(error.to_string())),
         };
 
         let selected_profile_id = profiles.first().map(|profile| profile.id.clone());
@@ -2159,13 +2285,16 @@ impl RemCmdApp {
             .unwrap_or(0)
             + 1;
 
-        let (settings, settings_error) = match load_settings(&settings_path) {
+        let (settings, settings_load_error) = match load_settings(&settings_path) {
             Ok(settings) => (settings, None),
-            Err(error) => (
-                AppSettings::default(),
-                Some(format!("Failed to load settings: {error}")),
-            ),
+            Err(error) => (AppSettings::default(), Some(error.to_string())),
         };
+        let language_mode = settings.language_mode;
+        let localizer = Localizer::new(language_mode);
+        let form_error = profile_load_error
+            .map(|error| format!("{}: {error}", localizer.text("app-load-profiles-failed")));
+        let settings_error = settings_load_error
+            .map(|error| format!("{}: {error}", localizer.text("app-load-settings-failed")));
         let theme_mode = settings.theme_mode;
         let tab_layout = settings.tab_layout;
         let terminal_settings = settings.terminal.normalized();
@@ -2186,7 +2315,8 @@ impl RemCmdApp {
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
         });
-        let sidebar_search = cx.new(|cx| TextField::new(cx, "", "Search connections"));
+        let sidebar_search =
+            cx.new(|cx| TextField::new(cx, "", localizer.text("sidebar-search-placeholder")));
         cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
         let settings_focus_handle = cx.focus_handle();
         let quick_terminal_focus_handle = cx.focus_handle();
@@ -2236,6 +2366,8 @@ impl RemCmdApp {
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
             active_panel: ActivePanel::Home,
+            language_mode,
+            localizer,
             theme_mode,
             tab_layout,
             terminal_font_family,
@@ -2382,7 +2514,8 @@ impl RemCmdApp {
     fn create_local_session(&mut self) -> SessionId {
         let session_id = SessionId(self.next_session_id);
         self.next_session_id += 1;
-        self.sessions.push(TerminalSession::new_local(session_id));
+        let session = TerminalSession::new_local(session_id, self.tr("sftp-ssh-only"));
+        self.sessions.push(session);
         session_id
     }
 
@@ -2814,12 +2947,7 @@ impl RemCmdApp {
             if let Some(session) = self.session_mut(session_id) {
                 session.sftp_browser_mut(placement).loading = false;
             }
-            self.show_sftp_error(
-                session_id,
-                placement,
-                "Connect this terminal to browse remote files".into(),
-                cx,
-            );
+            self.show_sftp_error(session_id, placement, self.tr("sftp-connect-browse"), cx);
             return;
         };
 
@@ -3073,14 +3201,14 @@ impl RemCmdApp {
         };
 
         if contents.len() > MAX_REMOTE_FILE_BYTES {
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("size", MAX_REMOTE_FILE_BYTES / 1024 / 1024);
+            let message = self.tr_with("sftp-file-limit", &args);
             if let Some(file) = self
                 .session_mut(session_id)
                 .and_then(|session| session.sftp.file.as_mut())
             {
-                file.error = Some(format!(
-                    "File exceeds the {} MB editor limit",
-                    MAX_REMOTE_FILE_BYTES / 1024 / 1024
-                ));
+                file.error = Some(message);
             }
             cx.notify();
             return;
@@ -3150,11 +3278,12 @@ impl RemCmdApp {
             .and_then(|session| session.sftp.file.as_ref())
             .is_some_and(|file| file.is_dirty(cx));
         if dirty {
+            let message = self.tr("sftp-save-before-close");
             if let Some(file) = self
                 .session_mut(session_id)
                 .and_then(|session| session.sftp.file.as_mut())
             {
-                file.error = Some("Save or revert your changes before closing this file".into());
+                file.error = Some(message);
             }
         } else if let Some(session) = self.session_mut(session_id) {
             session.sftp.file = None;
@@ -3178,7 +3307,7 @@ impl RemCmdApp {
             files: true,
             directories: true,
             multiple: true,
-            prompt: Some("Upload".into()),
+            prompt: Some(self.tr("sftp-upload").into()),
         });
         let runtime = cx.global::<SshRuntime>().handle();
 
@@ -3197,7 +3326,7 @@ impl RemCmdApp {
                         this.show_sftp_error(
                             session_id,
                             placement,
-                            format!("Failed to prepare upload: {message}"),
+                            format!("{}: {message}", this.tr("sftp-prepare-upload-failed")),
                             cx,
                         );
                         return;
@@ -3219,7 +3348,7 @@ impl RemCmdApp {
                             this.show_sftp_error(
                                 session_id,
                                 placement,
-                                "Failed to queue remote directory creation".into(),
+                                this.tr("sftp-queue-directory-failed"),
                                 cx,
                             );
                             return;
@@ -3254,7 +3383,7 @@ impl RemCmdApp {
                     this.show_sftp_error(
                         session_id,
                         placement,
-                        format!("Failed to open upload picker: {error}"),
+                        format!("{}: {error}", this.tr("sftp-open-upload-failed")),
                         cx,
                     );
                 });
@@ -3282,7 +3411,7 @@ impl RemCmdApp {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Download".into()),
+            prompt: Some(self.tr("sftp-download").into()),
         });
 
         cx.spawn(async move |this, cx| match selected_paths.await {
@@ -3348,7 +3477,7 @@ impl RemCmdApp {
                     this.show_sftp_error(
                         session_id,
                         placement,
-                        format!("Failed to open download destination: {error}"),
+                        format!("{}: {error}", this.tr("sftp-open-download-failed")),
                         cx,
                     );
                 });
@@ -3404,7 +3533,7 @@ impl RemCmdApp {
                     this.show_sftp_error(
                         session_id,
                         placement,
-                        format!("Failed to prepare recursive download: {error}"),
+                        format!("{}: {error}", this.tr("sftp-prepare-download-failed")),
                         cx,
                     );
                 }
@@ -3412,7 +3541,7 @@ impl RemCmdApp {
                     this.show_sftp_error(
                         session_id,
                         placement,
-                        format!("Recursive download task failed: {error}"),
+                        format!("{}: {error}", this.tr("sftp-download-task-failed")),
                         cx,
                     );
                 }
@@ -3495,16 +3624,23 @@ impl RemCmdApp {
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();
         let message = if paths.len() == 1 {
-            format!("Delete {}?", entries[0].name)
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("name", entries[0].name.clone());
+            self.tr_with("sftp-delete-one", &args)
         } else {
-            format!("Delete {} selected items?", paths.len())
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("count", paths.len());
+            self.tr_with("sftp-delete-many", &args)
         };
         self.sftp_context_menu = None;
         let answer = window.prompt(
             PromptLevel::Critical,
             &message,
-            Some("Directories and their contents will be deleted recursively."),
-            &[PromptButton::new("Delete"), PromptButton::cancel("Cancel")],
+            Some(&self.tr("sftp-delete-recursive")),
+            &[
+                PromptButton::new(self.tr("common-delete")),
+                PromptButton::cancel(self.tr("common-cancel")),
+            ],
             cx,
         );
 
@@ -3541,16 +3677,11 @@ impl RemCmdApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = cx.new(|cx| {
-            TextField::new(
-                cx,
-                "",
-                match kind {
-                    SftpCreateKind::File => "File name",
-                    SftpCreateKind::Directory => "Folder name",
-                },
-            )
-        });
+        let placeholder = match kind {
+            SftpCreateKind::File => self.tr("sftp-file-name"),
+            SftpCreateKind::Directory => self.tr("sftp-folder-name"),
+        };
+        let input = cx.new(|cx| TextField::new(cx, "", placeholder));
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
         input.focus_handle(cx).focus(window);
         self.sftp_context_menu = None;
@@ -3575,8 +3706,9 @@ impl RemCmdApp {
             || name.contains('/')
             || name.contains('\\')
         {
+            let message = self.tr("sftp-valid-name");
             if let Some(prompt) = self.sftp_create_prompt.as_mut() {
-                prompt.error = Some("Enter a valid name without path separators".into());
+                prompt.error = Some(message);
             }
             cx.notify();
             return;
@@ -3671,6 +3803,7 @@ impl RemCmdApp {
     }
 
     fn start_queued_sftp_transfers(&mut self, cx: &mut Context<Self>) {
+        let connect_before_transfer = self.tr("sftp-connect-transfer");
         loop {
             if self.active_sftp_transfer_count()
                 >= usize::from(self.transfer_settings.max_parallel_transfers)
@@ -3699,7 +3832,7 @@ impl RemCmdApp {
                 },
                 None => Err(remcmd_ssh::SshError::new(
                     SshErrorKind::InvalidState,
-                    "Connect this terminal before transferring files",
+                    connect_before_transfer.clone(),
                 )),
             };
 
@@ -3731,13 +3864,9 @@ impl RemCmdApp {
         };
 
         if signal_worker {
+            let task_missing = self.tr("sftp-task-missing");
             let result = handle
-                .ok_or_else(|| {
-                    remcmd_ssh::SshError::new(
-                        SshErrorKind::InvalidState,
-                        "SSH connection task is not running",
-                    )
-                })
+                .ok_or_else(|| remcmd_ssh::SshError::new(SshErrorKind::InvalidState, task_missing))
                 .and_then(|handle| handle.cancel_transfer(transfer_id));
             if let Err(error) = result
                 && let Some(session) = self.session_mut(session_id)
@@ -4135,8 +4264,81 @@ impl RemCmdApp {
 
     fn persist_profiles(&mut self) {
         if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
-            self.form_error = Some(format!("Failed to save profiles:\n{error}"));
+            self.form_error = Some(format!("{}:\n{error}", self.tr("app-save-profiles-failed")));
         }
+    }
+
+    fn tr(&self, key: &str) -> String {
+        self.localizer.text(key)
+    }
+
+    fn tr_with(&self, key: &str, args: &fluent_bundle::FluentArgs<'_>) -> String {
+        self.localizer.text_with(key, Some(args))
+    }
+
+    fn set_language_mode(&mut self, language_mode: LanguageMode, cx: &mut Context<Self>) {
+        self.language_mode = language_mode;
+        self.localizer = Localizer::new(language_mode);
+
+        let sidebar_placeholder = self.tr("sidebar-search-placeholder");
+        self.sidebar_search.update(cx, |field, cx| {
+            field.set_placeholder(sidebar_placeholder, cx);
+        });
+        if let Some(editor) = self.editor.as_ref() {
+            for (field, key) in [
+                (editor.name.clone(), "field-name"),
+                (editor.host.clone(), "field-host"),
+                (editor.port.clone(), "field-port"),
+                (editor.username.clone(), "field-username"),
+                (editor.private_key_path.clone(), "field-private-key"),
+            ] {
+                let placeholder = self.tr(key);
+                field.update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+            }
+        }
+        if let Some(prompt) = self.credential_prompt.as_ref() {
+            let key = match prompt.kind {
+                CredentialPromptKind::Password => "credential-password",
+                CredentialPromptKind::PrivateKeyPassphrase { .. } => "credential-passphrase",
+            };
+            let placeholder = self.tr(key);
+            prompt
+                .input
+                .update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+        }
+        if let Some(prompt) = self.sftp_create_prompt.as_ref() {
+            let placeholder = self.tr(match prompt.kind {
+                SftpCreateKind::File => "sftp-file-name",
+                SftpCreateKind::Directory => "sftp-folder-name",
+            });
+            prompt
+                .input
+                .update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+        }
+        if let Some(prompt) = self.quick_command_prompt.as_ref() {
+            let placeholder = self.tr("field-command");
+            prompt
+                .input
+                .update(cx, |field, cx| field.set_placeholder(placeholder, cx));
+        }
+        let sftp_ssh_only = self.tr("sftp-ssh-only");
+        for session in &mut self.sessions {
+            if session.is_local() {
+                session.sftp_availability = SftpAvailability::Unavailable(sftp_ssh_only.clone());
+            }
+        }
+        if let Some(about_window) = self.about_window {
+            let title = self.tr("about-title");
+            let _ = about_window.update(cx, move |about, window, cx| {
+                about.localizer = Localizer::new(language_mode);
+                window.set_window_title(&title);
+                cx.notify();
+            });
+        }
+
+        cx.set_menus(application_menus(&self.localizer));
+        self.persist_settings();
+        cx.notify();
     }
 
     fn refresh_system_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -4205,6 +4407,7 @@ impl RemCmdApp {
 
     fn settings_value(&self, selector: SettingsSelector) -> SettingsValue {
         match selector {
+            SettingsSelector::Language => SettingsValue::Language(self.language_mode),
             SettingsSelector::Theme => SettingsValue::Theme(self.theme_mode),
             SettingsSelector::TabLayout => SettingsValue::TabLayout(self.tab_layout),
             SettingsSelector::TerminalFont => {
@@ -4233,17 +4436,33 @@ impl RemCmdApp {
             .iter()
             .find(|option| option.value == value)
         {
-            return option.label.into();
+            return self.settings_option_label(option).into();
         }
 
         match value {
             SettingsValue::TerminalFontSize(size) => format!("{size} pt").into(),
             SettingsValue::TransferRate(rate) => format!("{rate} MiB/s").into(),
             SettingsValue::ParallelTransfers(count) => count.to_string().into(),
-            SettingsValue::Theme(_) | SettingsValue::TabLayout(_) => {
-                unreachable!("all theme and tab-layout values have labels")
+            SettingsValue::Language(_) | SettingsValue::Theme(_) | SettingsValue::TabLayout(_) => {
+                unreachable!("all enumerated settings values have labels")
             }
         }
+    }
+
+    fn settings_option_label(&self, option: &SettingsOption) -> String {
+        let key = match option.value {
+            SettingsValue::Language(LanguageMode::System) => Some("settings-language-system"),
+            SettingsValue::Language(LanguageMode::EnUs) => Some("settings-language-english"),
+            SettingsValue::Language(LanguageMode::ZhCn) => Some("settings-language-chinese"),
+            SettingsValue::Theme(ThemeMode::System) => Some("common-system"),
+            SettingsValue::Theme(ThemeMode::Light) => Some("common-light"),
+            SettingsValue::Theme(ThemeMode::Dark) => Some("common-dark"),
+            SettingsValue::TabLayout(TabLayout::Horizontal) => Some("common-horizontal"),
+            SettingsValue::TabLayout(TabLayout::Vertical) => Some("common-vertical"),
+            SettingsValue::TransferRate(0) => Some("common-unlimited"),
+            _ => None,
+        };
+        key.map_or_else(|| option.label.to_owned(), |key| self.tr(key))
     }
 
     fn toggle_settings_selector(
@@ -4305,6 +4524,7 @@ impl RemCmdApp {
     ) {
         self.open_settings_selector = None;
         match value {
+            SettingsValue::Language(mode) => self.set_language_mode(mode, cx),
             SettingsValue::Theme(mode) => self.set_theme_mode(mode, window, cx),
             SettingsValue::TabLayout(layout) => self.set_tab_layout(layout, cx),
             SettingsValue::TerminalFontSize(size) => self.set_terminal_font_size(size, cx),
@@ -4317,6 +4537,7 @@ impl RemCmdApp {
 
     fn persist_settings(&mut self) {
         let settings = AppSettings {
+            language_mode: self.language_mode,
             theme_mode: self.theme_mode,
             tab_layout: self.tab_layout,
             transfers: self.transfer_settings,
@@ -4327,7 +4548,7 @@ impl RemCmdApp {
         };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
-            .map(|error| format!("Failed to save settings: {error}"));
+            .map(|error| format!("{}: {error}", self.tr("app-save-settings-failed")));
     }
 
     fn load_editor_for_selected_profile(&mut self, cx: &mut Context<Self>) {
@@ -4345,12 +4566,13 @@ impl RemCmdApp {
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Edit,
             profile_id: profile.id.clone(),
-            name: cx.new(|cx| TextField::new(cx, profile.name, "Name")),
-            host: cx.new(|cx| TextField::new(cx, profile.host, "Host")),
-            port: cx.new(|cx| TextField::new(cx, profile.port.to_string(), "Port")),
-            username: cx.new(|cx| TextField::new(cx, profile.username, "Username")),
+            name: cx.new(|cx| TextField::new(cx, profile.name, self.tr("field-name"))),
+            host: cx.new(|cx| TextField::new(cx, profile.host, self.tr("field-host"))),
+            port: cx.new(|cx| TextField::new(cx, profile.port.to_string(), self.tr("field-port"))),
+            username: cx.new(|cx| TextField::new(cx, profile.username, self.tr("field-username"))),
             auth_kind,
-            private_key_path: cx.new(|cx| TextField::new(cx, private_key_path, "Private key path")),
+            private_key_path: cx
+                .new(|cx| TextField::new(cx, private_key_path, self.tr("field-private-key"))),
         });
 
         self.profile_auth_selector_open = false;
@@ -4362,12 +4584,12 @@ impl RemCmdApp {
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Create,
             profile_id: format!("demo-{number}"),
-            name: cx.new(|cx| TextField::new(cx, "", "Name")),
-            host: cx.new(|cx| TextField::new(cx, "", "Host")),
-            port: cx.new(|cx| TextField::new(cx, "22", "Port")),
-            username: cx.new(|cx| TextField::new(cx, "", "Username")),
+            name: cx.new(|cx| TextField::new(cx, "", self.tr("field-name"))),
+            host: cx.new(|cx| TextField::new(cx, "", self.tr("field-host"))),
+            port: cx.new(|cx| TextField::new(cx, "22", self.tr("field-port"))),
+            username: cx.new(|cx| TextField::new(cx, "", self.tr("field-username"))),
             auth_kind: ProfileAuthKind::Password,
-            private_key_path: cx.new(|cx| TextField::new(cx, "", "Private key path")),
+            private_key_path: cx.new(|cx| TextField::new(cx, "", self.tr("field-private-key"))),
         });
         self.profile_auth_selector_open = false;
         self.form_error = None;
@@ -4387,10 +4609,10 @@ impl RemCmdApp {
     ) -> Entity<TextField> {
         self.dismiss_credential_prompt(cx);
 
-        let placeholder = match kind {
-            CredentialPromptKind::Password => "Password",
-            CredentialPromptKind::PrivateKeyPassphrase { .. } => "Passphrase",
-        };
+        let placeholder = self.tr(match kind {
+            CredentialPromptKind::Password => "credential-password",
+            CredentialPromptKind::PrivateKeyPassphrase { .. } => "credential-passphrase",
+        });
         let input = cx.new(|cx| TextField::new_secure(cx, placeholder));
         cx.observe(&input, |this, input, cx| {
             if let Some(prompt) = this.credential_prompt.as_mut()
@@ -4432,7 +4654,7 @@ impl RemCmdApp {
         &mut self,
         profile_id: String,
         kind: Option<CredentialKind>,
-        success_message: Option<&'static str>,
+        success_message_key: Option<&'static str>,
         cx: &mut Context<Self>,
     ) {
         let runtime = cx.global::<SshRuntime>().handle();
@@ -4441,7 +4663,7 @@ impl RemCmdApp {
             .entry(profile_id.clone())
             .or_default() += 1;
         if let Some(session) = self.session_for_profile_mut(&profile_id) {
-            session.connection_message = Some("Updating the system keychain".into());
+            session.connection_message = Some(SessionMessage::localized("credential-updating"));
         }
 
         cx.spawn(async move |this, cx| {
@@ -4471,13 +4693,14 @@ impl RemCmdApp {
 
                 match result {
                     Ok(Ok(())) => {
-                        if let Some(message) = success_message
+                        if let Some(message_key) = success_message_key
                             && remove_counter
                             && this.selected_profile_id.as_deref()
                                 == Some(deleted_profile_id.as_str())
                             && let Some(session) = this.session_for_profile_mut(&deleted_profile_id)
                         {
-                            session.connection_message = Some(message.into());
+                            session.connection_message =
+                                Some(SessionMessage::localized(message_key));
                         }
                     }
                     Ok(Err(error)) => {
@@ -4485,7 +4708,8 @@ impl RemCmdApp {
                     }
                     Err(error) => {
                         this.form_error = Some(format!(
-                            "Failed to access the system keychain task: {error}"
+                            "{}: {error}",
+                            this.tr("credential-keychain-task-failed")
                         ));
                     }
                 }
@@ -4509,7 +4733,7 @@ impl RemCmdApp {
         self.delete_stored_credentials(
             editor.profile_id.clone(),
             Some(kind),
-            Some("Saved credential removed from the system keychain"),
+            Some("credential-removed"),
             cx,
         );
     }
@@ -4575,6 +4799,7 @@ impl RemCmdApp {
         let size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
         let terminal = LocalTerminal::spawn(local_pty_size(size));
         let (handle, mut events) = terminal.split();
+        let sftp_unavailable = self.tr("sftp-ssh-only");
 
         let Some(session) = self.session_mut(session_id) else {
             return;
@@ -4584,7 +4809,7 @@ impl RemCmdApp {
         session.connection_handle = None;
         session.local_terminal_handle = Some(handle);
         session.connection_error = None;
-        session.connection_message = Some("Starting local shell".into());
+        session.connection_message = Some(SessionMessage::localized("terminal-starting-local"));
         session.terminal_end_reason = None;
         session.terminal = Some(ActiveTerminal::new(LOCAL_PROFILE_ID.into(), size));
         session.terminal_marked_text.clear();
@@ -4592,8 +4817,7 @@ impl RemCmdApp {
         session.terminal_selecting = false;
         session.terminal_scroll_accumulator = 0.0;
         session.terminal_resize_task = None;
-        session.sftp_availability =
-            SftpAvailability::Unavailable("SFTP is only available for SSH sessions".into());
+        session.sftp_availability = SftpAvailability::Unavailable(sftp_unavailable);
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -4640,13 +4864,19 @@ impl RemCmdApp {
             return;
         }
 
-        let options = about_window_options(cx);
-        match cx.open_window(options, |_, cx| cx.new(|_| AboutWindow)) {
+        let options = about_window_options(cx, &self.localizer);
+        let language_mode = self.language_mode;
+        match cx.open_window(options, |_, cx| {
+            cx.new(|_| AboutWindow {
+                localizer: Localizer::new(language_mode),
+            })
+        }) {
             Ok(window_handle) => {
                 self.about_window = Some(window_handle);
             }
             Err(error) => {
-                self.settings_error = Some(format!("Failed to open About window: {error}"));
+                self.settings_error =
+                    Some(format!("{}: {error}", self.tr("app-open-about-failed")));
                 cx.notify();
             }
         }
@@ -4671,7 +4901,7 @@ impl RemCmdApp {
         if self.quick_command_prompt.is_some() {
             return;
         }
-        let input = cx.new(|cx| TextField::new(cx, "", "Command"));
+        let input = cx.new(|cx| TextField::new(cx, "", self.tr("field-command")));
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
         self.quick_command_prompt = Some(QuickCommandPrompt {
             input,
@@ -4788,15 +5018,17 @@ impl RemCmdApp {
         let command = prompt.input.read(cx).text().trim().to_owned();
         let selected_profile_ids = prompt.selected_profile_ids.clone();
         if command.is_empty() {
+            let message = self.tr("quick-enter-command");
             if let Some(prompt) = self.quick_command_prompt.as_mut() {
-                prompt.error = Some("Enter a command".into());
+                prompt.error = Some(message);
             }
             cx.notify();
             return;
         }
         if selected_profile_ids.is_empty() {
+            let message = self.tr("quick-select-server");
             if let Some(prompt) = self.quick_command_prompt.as_mut() {
-                prompt.error = Some("Select at least one server".into());
+                prompt.error = Some(message);
             }
             cx.notify();
             return;
@@ -4836,8 +5068,9 @@ impl RemCmdApp {
             .collect::<Vec<_>>();
 
         if targets.is_empty() {
+            let message = self.tr("quick-servers-disconnected");
             if let Some(prompt) = self.quick_command_prompt.as_mut() {
-                prompt.error = Some("The selected servers are no longer connected".into());
+                prompt.error = Some(message);
             }
             cx.notify();
             return;
@@ -4896,7 +5129,7 @@ impl RemCmdApp {
         if self.sessions.iter().any(|session| {
             session.profile_id == selected_id && session.connection_state.can_disconnect()
         }) {
-            self.form_error = Some("Disconnect this profile before deleting it".into());
+            self.form_error = Some(self.tr("profile-disconnect-before-delete"));
             cx.notify();
             return;
         }
@@ -4987,7 +5220,8 @@ impl RemCmdApp {
                 Ok(Some(path)) => this.set_private_key_path(&profile_id, path, cx),
                 Ok(None) => {}
                 Err(error) => {
-                    this.form_error = Some(format!("Failed to open file picker: {error}"));
+                    this.form_error =
+                        Some(format!("{}: {error}", this.tr("app-file-picker-failed")));
                     cx.notify();
                 }
             });
@@ -5005,7 +5239,7 @@ impl RemCmdApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Select".into()),
+            prompt: Some(self.tr("common-select").into()),
         });
 
         cx.spawn(async move |this, cx| match selected_paths.await {
@@ -5026,7 +5260,8 @@ impl RemCmdApp {
                         .as_ref()
                         .is_some_and(|editor| editor.profile_id == profile_id)
                     {
-                        this.form_error = Some(format!("Failed to open file picker: {error}"));
+                        this.form_error =
+                            Some(format!("{}: {error}", this.tr("app-file-picker-failed")));
                         cx.notify();
                     }
                 });
@@ -5036,6 +5271,7 @@ impl RemCmdApp {
     }
 
     fn set_private_key_path(&mut self, profile_id: &str, path: PathBuf, cx: &mut Context<Self>) {
+        let placeholder = self.tr("field-private-key");
         let Some(editor) = self
             .editor
             .as_mut()
@@ -5045,7 +5281,7 @@ impl RemCmdApp {
         };
 
         let path = path.to_string_lossy().into_owned();
-        editor.private_key_path = cx.new(|cx| TextField::new(cx, path, "Private key path"));
+        editor.private_key_path = cx.new(|cx| TextField::new(cx, path, placeholder));
         self.form_error = None;
         cx.notify();
     }
@@ -5062,19 +5298,19 @@ impl RemCmdApp {
         let private_key_path = editor.private_key_path.read(cx).text();
 
         if name.is_empty() || host.is_empty() || username.is_empty() {
-            self.form_error = Some("Name, host, and username are required".into());
+            self.form_error = Some(self.tr("profile-validation-required"));
             cx.notify();
             return;
         }
 
         let Ok(port) = port_text.trim().parse::<u16>() else {
-            self.form_error = Some("Port must be a number from 1 to 65535".into());
+            self.form_error = Some(self.tr("profile-validation-port"));
             cx.notify();
             return;
         };
 
         if port == 0 {
-            self.form_error = Some("Port must be a number from 1 to 65535".into());
+            self.form_error = Some(self.tr("profile-validation-port"));
             cx.notify();
             return;
         };
@@ -5082,7 +5318,7 @@ impl RemCmdApp {
         let auth = match editor.auth_kind.into_config(&private_key_path) {
             Ok(auth) => auth,
             Err(error) => {
-                self.form_error = Some(error.into());
+                self.form_error = Some(self.tr(error));
                 cx.notify();
                 return;
             }
@@ -5130,7 +5366,7 @@ impl RemCmdApp {
             self.delete_stored_credentials(
                 editor.profile_id,
                 None,
-                Some("Saved credentials cleared because connection details changed"),
+                Some("credential-cleared-after-change"),
                 cx,
             );
         }
@@ -5334,7 +5570,7 @@ impl RemCmdApp {
         let runtime = cx.global::<SshRuntime>().handle();
         if let Some(session) = self.session_mut(session_id) {
             session.connection_error = None;
-            session.connection_message = Some("Checking the system keychain".into());
+            session.connection_message = Some(SessionMessage::localized("credential-checking"));
         }
         self.credential_lookup_session_id = Some(session_id);
 
@@ -5416,7 +5652,7 @@ impl RemCmdApp {
                             if this.activate_session_in_window(session_id, window, cx) {
                                 this.start_connection(session_id, profile, auth, None, cx);
                                 if let Some(session) = this.session_mut(session_id) {
-                                    session.connection_message = Some(error);
+                                    session.connection_message = Some(error.into());
                                 }
                             }
                         }
@@ -5510,15 +5746,17 @@ impl RemCmdApp {
         };
 
         if prompt.input.read(cx).is_empty() {
-            let label = match prompt.kind {
-                CredentialPromptKind::Password => "Password",
-                CredentialPromptKind::PrivateKeyPassphrase { .. } => "Passphrase",
+            let label_key = match prompt.kind {
+                CredentialPromptKind::Password => "credential-password",
+                CredentialPromptKind::PrivateKeyPassphrase { .. } => "credential-passphrase",
             };
-            prompt.error = Some(format!("{label} is required"));
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("label", self.localizer.text(label_key));
+            prompt.error = Some(self.localizer.text_with("credential-required", Some(&args)));
             window.focus(&prompt.input.focus_handle(cx));
             cx.notify();
             return;
-        }
+        };
 
         let profile_id = prompt.profile_id.clone();
         let session_id = prompt.session_id;
@@ -5534,7 +5772,8 @@ impl RemCmdApp {
         else {
             self.dismiss_credential_prompt(cx);
             if let Some(session) = self.session_mut(session_id) {
-                session.connection_error = Some("Connection profile no longer exists".into());
+                session.connection_error =
+                    Some(SessionMessage::localized("connection-profile-missing"));
             }
             cx.notify();
             return;
@@ -5578,25 +5817,37 @@ impl RemCmdApp {
     }
 
     fn trust_pending_host_key(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.active_session_mut() else {
+        let Some(session_id) = self.active_session_id else {
             return;
         };
-        let Some(info) = session.host_key_prompt.take() else {
-            return;
-        };
-
-        let Some(handle) = session.connection_handle.as_ref() else {
-            session.connection_error = Some("SSH connection handle is missing".into());
+        let Some((info, handle)) = self.session_mut(session_id).and_then(|session| {
+            let info = session.host_key_prompt.take()?;
+            match session.connection_handle.clone() {
+                Some(handle) => Some((info, handle)),
+                None => {
+                    session.connection_error =
+                        Some(SessionMessage::localized("connection-handle-missing"));
+                    None
+                }
+            }
+        }) else {
             cx.notify();
             return;
         };
 
         match handle.trust_host_key() {
             Ok(()) => {
-                session.connection_message = Some(format!("Trusting {}", info.address()));
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some(SessionMessage::localized_with(
+                        "connection-trusting-host",
+                        [("address", info.address())],
+                    ));
+                }
             }
             Err(error) => {
-                session.connection_error = Some(error.to_string());
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_error = Some(SessionMessage::connection_error(&error));
+                }
             }
         }
         cx.notify();
@@ -5613,7 +5864,7 @@ impl RemCmdApp {
         if let Some(handle) = session.connection_handle.as_ref()
             && let Err(error) = handle.reject_host_key()
         {
-            session.connection_error = Some(error.to_string());
+            session.connection_error = Some(error.to_string().into());
         }
         session.connection_message = None;
         cx.notify();
@@ -5701,8 +5952,10 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         let runtime = cx.global::<SshRuntime>().handle();
+        let keychain_task_failed = self.tr("credential-keychain-task-failed");
         if let Some(session) = self.session_mut(session_id) {
-            session.connection_message = Some("Removing the rejected saved credential".into());
+            session.connection_message =
+                Some(SessionMessage::localized("credential-removing-rejected"));
         }
 
         self.credential_lookup_session_id = Some(session_id);
@@ -5722,9 +5975,9 @@ impl RemCmdApp {
                 let error = match result {
                     Ok(Ok(())) => authentication_error,
                     Ok(Err(error)) => format!("{authentication_error}\n{error}"),
-                    Err(error) => format!(
-                        "{authentication_error}\nFailed to access the system keychain task: {error}"
-                    ),
+                    Err(error) => {
+                        format!("{authentication_error}\n{keychain_task_failed}: {error}")
+                    }
                 };
 
                 match kind {
@@ -5762,13 +6015,15 @@ impl RemCmdApp {
             let _ = this.update(cx, |this, cx| {
                 if let Some(session) = this.session_mut(session_id) {
                     session.connection_message = Some(match result {
-                        Ok(Ok(())) => "Credential saved in the system keychain".into(),
-                        Ok(Err(error)) => {
-                            format!("Connected, but the credential could not be saved: {error}")
-                        }
-                        Err(error) => {
-                            format!("Connected, but the system keychain task failed: {error}")
-                        }
+                        Ok(Ok(())) => SessionMessage::localized("credential-saved"),
+                        Ok(Err(error)) => SessionMessage::localized_with_detail(
+                            "credential-save-failed",
+                            error.to_string(),
+                        ),
+                        Err(error) => SessionMessage::localized_with_detail(
+                            "credential-save-task-failed",
+                            error.to_string(),
+                        ),
                     });
                 }
                 cx.notify();
@@ -5799,12 +6054,13 @@ impl RemCmdApp {
                 session.connection_state = SessionState::Failed;
                 session.connection_handle = None;
                 session.local_terminal_handle = None;
-                session.connection_error = Some(error);
+                session.connection_error = Some(error.into());
                 session.close_when_disconnected
             } else {
                 // Disable repeated clicks before the worker publishes its event.
                 session.connection_state = SessionState::Disconnecting;
-                session.terminal_end_reason = Some("Session disconnected".into());
+                session.terminal_end_reason =
+                    Some(SessionMessage::localized("terminal-session-disconnected"));
                 false
             }
         };
@@ -6126,7 +6382,7 @@ impl RemCmdApp {
         }
 
         if let Err(error) = session.write_terminal_input(data) {
-            session.connection_error = Some(error);
+            session.connection_error = Some(error.into());
             cx.notify();
         }
     }
@@ -6213,7 +6469,7 @@ impl RemCmdApp {
                 }
 
                 if let Err(error) = session.resize_terminal(size) {
-                    session.connection_error = Some(error);
+                    session.connection_error = Some(error.into());
                     cx.notify();
                 }
             });
@@ -6452,22 +6708,31 @@ impl RemCmdApp {
             }
             TerminalEvent::Bell => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some("Remote terminal bell".into());
+                    session.connection_message =
+                        Some(SessionMessage::localized("terminal-remote-bell"));
                 }
                 true
             }
             TerminalEvent::ExitRequested => {
+                let message = SessionMessage::localized("terminal-remote-exit-requested");
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some("Remote terminal requested exit".into());
-                    session.terminal_end_reason = Some("Remote terminal requested exit".into());
+                    session.connection_message = Some(message.clone());
+                    session.terminal_end_reason = Some(message);
                 }
                 true
             }
             TerminalEvent::ChildExited(status) => {
+                let message = status.map_or_else(
+                    || SessionMessage::localized("terminal-remote-exited"),
+                    |status| {
+                        SessionMessage::localized_with(
+                            "terminal-remote-exited-status",
+                            [("status", status.to_string())],
+                        )
+                    },
+                );
                 if let Some(session) = self.session_mut(session_id) {
-                    session.terminal_end_reason = status
-                        .map(|status| format!("Remote terminal exited with status {status}"))
-                        .or_else(|| Some("Remote terminal exited".into()));
+                    session.terminal_end_reason = Some(message);
                     session
                         .connection_message
                         .clone_from(&session.terminal_end_reason);
@@ -6485,7 +6750,7 @@ impl RemCmdApp {
             return;
         };
         if let Err(error) = session.write_terminal_input(data) {
-            session.connection_error = Some(error);
+            session.connection_error = Some(error.into());
         }
     }
 
@@ -6540,6 +6805,7 @@ impl RemCmdApp {
 
         let should_notify = match event {
             ConnectionEvent::StateChanged(state) => {
+                let connection_closed = self.tr("sftp-connection-closed");
                 let close_when_disconnected = {
                     let session = self
                         .session_mut(session_id)
@@ -6569,12 +6835,13 @@ impl RemCmdApp {
                         session.sftp_availability = SftpAvailability::Checking;
                         session.sftp.stop_loading();
                         session.sidebar_sftp.stop_loading();
-                        session.transfers.fail_pending("SSH connection closed");
+                        session.transfers.fail_pending(&connection_closed);
                         session.performance.clear_connection();
                         if previous_state == SessionState::Disconnecting
                             && session.terminal_end_reason.is_none()
                         {
-                            session.terminal_end_reason = Some("Session disconnected".into());
+                            session.terminal_end_reason =
+                                Some(SessionMessage::localized("terminal-session-disconnected"));
                         }
                     }
 
@@ -6592,14 +6859,17 @@ impl RemCmdApp {
             }
             ConnectionEvent::HostKeyVerificationRequired(info) => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message =
-                        Some(format!("Verify host key for {}", info.address()));
+                    session.connection_message = Some(SessionMessage::localized_with(
+                        "connection-verify-host",
+                        [("address", info.address())],
+                    ));
                     session.host_key_prompt = Some(info);
                 }
                 self.activate_session(session_id, cx);
                 true
             }
             ConnectionEvent::Failed(error) => {
+                let connection_failed = self.tr("sftp-connection-failed");
                 let (failed_profile_id, failed_credential, close_when_disconnected) = {
                     let session = self
                         .session_mut(session_id)
@@ -6612,7 +6882,7 @@ impl RemCmdApp {
                     session.host_key_prompt = None;
                     session.sftp.stop_loading();
                     session.sidebar_sftp.stop_loading();
-                    session.transfers.fail_pending("SSH connection failed");
+                    session.transfers.fail_pending(&connection_failed);
                     session.performance.clear_connection();
                     (profile_id, credential, session.close_when_disconnected)
                 };
@@ -6623,7 +6893,7 @@ impl RemCmdApp {
                 }
                 self.sync_performance_monitoring();
 
-                let authentication_error = error.to_string();
+                let authentication_error = localized_connection_error(&error, &self.localizer);
                 let prompted_for_credential =
                     match (failed_profile_id, failed_credential, error.kind()) {
                         (
@@ -6669,7 +6939,7 @@ impl RemCmdApp {
                     };
 
                 if !prompted_for_credential && let Some(session) = self.session_mut(session_id) {
-                    session.connection_error = Some(error.to_string());
+                    session.connection_error = Some(SessionMessage::connection_error(&error));
                 }
                 true
             }
@@ -6766,13 +7036,21 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::SftpAvailabilityChanged { available, message } => {
+                let unavailable_message = message.map_or_else(
+                    || self.tr("sftp-server-unavailable"),
+                    |details| {
+                        format!(
+                            "{}\n{}: {details}",
+                            self.tr("sftp-server-unavailable"),
+                            self.tr("connection-technical-details")
+                        )
+                    },
+                );
                 if let Some(session) = self.session_mut(session_id) {
                     session.sftp_availability = if available {
                         SftpAvailability::Available
                     } else {
-                        SftpAvailability::Unavailable(
-                            message.unwrap_or_else(|| "SFTP is unavailable on this server".into()),
-                        )
+                        SftpAvailability::Unavailable(unavailable_message)
                     };
                     if !available {
                         session.sftp.stop_loading();
@@ -6797,6 +7075,12 @@ impl RemCmdApp {
                 operation,
                 error,
             } => {
+                let error_message = format!(
+                    "{}\n{}: {}",
+                    self.tr("sftp-failed"),
+                    self.tr("connection-technical-details"),
+                    error.message()
+                );
                 let transfer_failed = match operation {
                     SftpOperation::ReadDirectory | SftpOperation::ReadDirectoryTree => {
                         let placement = sftp_browser_placement_for_request(request_id);
@@ -6804,18 +7088,16 @@ impl RemCmdApp {
                             session_id,
                             placement,
                             request_id,
-                            error.to_string(),
+                            error_message,
                             cx,
                         );
                         false
                     }
                     SftpOperation::ReadFile | SftpOperation::WriteFile => {
                         if let Some(session) = self.session_mut(session_id) {
-                            session.sftp.fail_file_request(
-                                request_id,
-                                operation,
-                                error.to_string(),
-                            );
+                            session
+                                .sftp
+                                .fail_file_request(request_id, operation, error_message);
                         }
                         false
                     }
@@ -6823,14 +7105,14 @@ impl RemCmdApp {
                     | SftpOperation::CreateDirectory
                     | SftpOperation::DeletePaths => {
                         let placement = sftp_browser_placement_for_request(request_id);
-                        self.show_sftp_error(session_id, placement, error.to_string(), cx);
+                        self.show_sftp_error(session_id, placement, error_message, cx);
                         false
                     }
                     SftpOperation::UploadFile
                     | SftpOperation::DownloadFile
                     | SftpOperation::CancelTransfer => {
                         if let Some(session) = self.session_mut(session_id) {
-                            session.transfers.mark_failed(request_id, error.to_string());
+                            session.transfers.mark_failed(request_id, error_message);
                         }
                         true
                     }
@@ -6847,9 +7129,15 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::PerformanceFailed(error) => {
+                let message = format!(
+                    "{}\n{}: {}",
+                    self.tr("performance-unavailable"),
+                    self.tr("connection-technical-details"),
+                    error.message()
+                );
                 if let Some(session) = self.session_mut(session_id) {
                     session.performance.loading = false;
-                    session.performance.error = Some(error.to_string());
+                    session.performance.error = Some(message);
                 }
                 true
             }
@@ -6874,7 +7162,10 @@ impl RemCmdApp {
                 false
             }
             ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
-                let message = format!("Remote shell exited with status {status}");
+                let message = SessionMessage::localized_with(
+                    "terminal-remote-shell-status",
+                    [("status", status.to_string())],
+                );
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     session.terminal_end_reason = Some(message);
@@ -6886,9 +7177,21 @@ impl RemCmdApp {
                 core_dumped,
                 message,
             }) => {
-                let core_dump = if core_dumped { " (core dumped)" } else { "" };
-                let message =
-                    format!("Remote shell exited on signal {signal}{core_dump}: {message}");
+                let message = SessionMessage::localized_with_args(
+                    "terminal-remote-shell-signal",
+                    [
+                        ("signal", SessionMessageArg::Text(signal)),
+                        (
+                            "core",
+                            if core_dumped {
+                                SessionMessageArg::Localized("terminal-core-dumped")
+                            } else {
+                                SessionMessageArg::Text(String::new())
+                            },
+                        ),
+                        ("message", SessionMessageArg::Text(message)),
+                    ],
+                );
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     session.terminal_end_reason = Some(message);
@@ -6896,19 +7199,21 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Eof) => {
+                let message = SessionMessage::localized("terminal-remote-shell-eof");
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some("Remote shell reached EOF".into());
+                    session.connection_message = Some(message.clone());
                     if session.terminal_end_reason.is_none() {
-                        session.terminal_end_reason = Some("Remote shell reached EOF".into());
+                        session.terminal_end_reason = Some(message);
                     }
                 }
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Closed) => {
+                let message = SessionMessage::localized("terminal-remote-shell-closed");
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some("Remote shell closed".into());
+                    session.connection_message = Some(message.clone());
                     if session.terminal_end_reason.is_none() {
-                        session.terminal_end_reason = Some("Remote shell closed".into());
+                        session.terminal_end_reason = Some(message);
                     }
                 }
                 true
@@ -6961,14 +7266,24 @@ impl RemCmdApp {
                 true
             }
             LocalTerminalEvent::Exited { exit_code, signal } => {
+                let message = signal.map_or_else(
+                    || {
+                        SessionMessage::localized_with(
+                            "terminal-local-shell-status",
+                            [("status", exit_code.to_string())],
+                        )
+                    },
+                    |signal| {
+                        SessionMessage::localized_with(
+                            "terminal-local-shell-signal",
+                            [("signal", signal)],
+                        )
+                    },
+                );
                 let should_remove = {
                     let session = self
                         .session_mut(session_id)
                         .expect("checked local session should still exist");
-                    let message = signal.map_or_else(
-                        || format!("Local shell exited with status {exit_code}"),
-                        |signal| format!("Local shell exited on signal {signal}"),
-                    );
                     session.connection_state = SessionState::Disconnected;
                     session.local_terminal_handle = None;
                     session.terminal_resize_task = None;
@@ -6989,7 +7304,7 @@ impl RemCmdApp {
                     session.connection_state = SessionState::Failed;
                     session.local_terminal_handle = None;
                     session.terminal_resize_task = None;
-                    session.connection_error = Some(error.to_string());
+                    session.connection_error = Some(error.to_string().into());
                     session.close_when_disconnected
                 };
                 if should_remove {
@@ -7346,12 +7661,36 @@ impl RemCmdApp {
                     .pl(px(12.0))
                     .child(wordmark(self.theme, 90.0, 20.0)),
             )
-            .child(self.render_windows_menu_button(WindowsMenu::File, "File", cx))
-            .child(self.render_windows_menu_button(WindowsMenu::Edit, "Edit", cx))
-            .child(self.render_windows_menu_button(WindowsMenu::Terminal, "Terminal", cx))
-            .child(self.render_windows_menu_button(WindowsMenu::View, "View", cx))
-            .child(self.render_windows_menu_button(WindowsMenu::Window, "Window", cx))
-            .child(self.render_windows_menu_button(WindowsMenu::Help, "Help", cx))
+            .child(self.render_windows_menu_button(
+                WindowsMenu::File,
+                self.tr("menu-file").into(),
+                cx,
+            ))
+            .child(self.render_windows_menu_button(
+                WindowsMenu::Edit,
+                self.tr("menu-edit").into(),
+                cx,
+            ))
+            .child(self.render_windows_menu_button(
+                WindowsMenu::Terminal,
+                self.tr("menu-terminal").into(),
+                cx,
+            ))
+            .child(self.render_windows_menu_button(
+                WindowsMenu::View,
+                self.tr("menu-view").into(),
+                cx,
+            ))
+            .child(self.render_windows_menu_button(
+                WindowsMenu::Window,
+                self.tr("menu-window").into(),
+                cx,
+            ))
+            .child(self.render_windows_menu_button(
+                WindowsMenu::Help,
+                self.tr("menu-help").into(),
+                cx,
+            ))
             .child(drag_area)
             .child(self.render_windows_titlebar_controls(is_maximized, cx))
     }
@@ -7359,7 +7698,7 @@ impl RemCmdApp {
     fn render_windows_menu_button(
         &self,
         menu: WindowsMenu,
-        label: &'static str,
+        label: SharedString,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let selected = self.windows_menu_open == Some(menu);
@@ -7368,10 +7707,7 @@ impl RemCmdApp {
         let width = windows_menu_button_width(menu);
 
         div()
-            .id(SharedString::from(format!(
-                "windows-menu-{}",
-                label.to_ascii_lowercase()
-            )))
+            .id(SharedString::from(format!("windows-menu-{menu:?}")))
             .flex()
             .flex_none()
             .items_center()
@@ -7415,7 +7751,7 @@ impl RemCmdApp {
         };
         let entries = windows_menu_entries(menu);
         let left = windows_menu_left(menu);
-        let width = windows_menu_popup_width(&entries);
+        let width = windows_menu_popup_width(&entries, &self.localizer);
         let mut popup = self
             .glass_floating_surface()
             .id("windows_menu_popup")
@@ -7431,12 +7767,12 @@ impl RemCmdApp {
         for (index, entry) in entries.into_iter().enumerate() {
             popup = match entry {
                 WindowsMenuEntry::Item {
-                    label,
+                    label_key,
                     shortcut,
                     command,
                 } => popup.child(self.render_windows_menu_item(
                     SharedString::from(format!("windows-menu-entry-{menu:?}-{index}")),
-                    label,
+                    self.localizer.text(label_key).into(),
                     shortcut,
                     command,
                     cx,
@@ -7451,7 +7787,7 @@ impl RemCmdApp {
     fn render_windows_menu_item(
         &self,
         id: SharedString,
-        label: &'static str,
+        label: SharedString,
         shortcut: &'static str,
         command: WindowsMenuCommand,
         cx: &mut Context<Self>,
@@ -7496,7 +7832,7 @@ impl RemCmdApp {
                             .flex_none()
                             .whitespace_nowrap()
                             .text_color(foreground)
-                            .child(label),
+                            .child(label.clone()),
                     )
                     .when(!shortcut.is_empty(), |this| {
                         this.child(
@@ -7752,9 +8088,10 @@ impl RemCmdApp {
         &self,
         id: &'static str,
         left: bool,
-        tooltip: &'static str,
+        tooltip: impl Into<SharedString>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
+        let tooltip = tooltip.into();
         icon_button(
             id,
             self.render_titlebar_sidebar_symbol(left),
@@ -7766,7 +8103,7 @@ impl RemCmdApp {
         .rounded_full()
         .tooltip(move |_, cx| -> AnyView {
             cx.new(|_| CommandTooltip {
-                label: tooltip.into(),
+                label: tooltip.clone(),
                 theme,
             })
             .into()
@@ -7826,7 +8163,11 @@ impl RemCmdApp {
                 .border_color(glyph)
                 .rounded(px(1.0))
         };
-        let maximize_tooltip = if is_maximized { "Restore" } else { "Maximize" };
+        let maximize_tooltip = if is_maximized {
+            self.tr("common-restore")
+        } else {
+            self.tr("common-maximize")
+        };
         let tooltip_theme = self.theme;
         let maximize = div()
             .id("maximize_window")
@@ -7842,7 +8183,7 @@ impl RemCmdApp {
             .child(maximize_symbol)
             .tooltip(move |_, cx| -> AnyView {
                 cx.new(|_| CommandTooltip {
-                    label: maximize_tooltip.into(),
+                    label: maximize_tooltip.clone().into(),
                     theme: tooltip_theme,
                 })
                 .into()
@@ -7889,6 +8230,7 @@ impl RemCmdApp {
                         .contains_key(profile_id)
                 });
         let theme = self.theme;
+        let new_terminal_tooltip = self.tr("sidebar-new-terminal");
         let mut new_terminal = icon_button(
             "new-titlebar-terminal",
             icon(
@@ -7905,7 +8247,7 @@ impl RemCmdApp {
         .rounded_full()
         .tooltip(move |_, cx| -> AnyView {
             cx.new(|_| CommandTooltip {
-                label: "New terminal".into(),
+                label: new_terminal_tooltip.clone().into(),
                 theme,
             })
             .into()
@@ -7917,9 +8259,14 @@ impl RemCmdApp {
         }
 
         let right_sidebar = self
-            .render_titlebar_sidebar_button("toggle_right_sidebar", false, "Toggle right sidebar")
+            .render_titlebar_sidebar_button(
+                "toggle_right_sidebar",
+                false,
+                self.tr("terminal-toggle-right-sidebar"),
+            )
             .on_click(cx.listener(|this, _, _, cx| this.toggle_right_sidebar(cx)));
         let bottom_panel_enabled = self.active_panel == ActivePanel::Connection;
+        let bottom_panel_tooltip = self.tr("terminal-toggle-bottom-panel");
         let mut bottom_panel = icon_button(
             "toggle_bottom_panel",
             icon(
@@ -7939,7 +8286,7 @@ impl RemCmdApp {
         })
         .tooltip(move |_, cx| -> AnyView {
             cx.new(|_| CommandTooltip {
-                label: "Toggle bottom panel".into(),
+                label: bottom_panel_tooltip.clone().into(),
                 theme,
             })
             .into()
@@ -8040,10 +8387,14 @@ impl RemCmdApp {
             }]);
 
         for (view, label, icon_name) in [
-            (RightSidebarView::Sftp, "SFTP", IconName::Folder),
+            (
+                RightSidebarView::Sftp,
+                self.tr("sftp-title"),
+                IconName::Folder,
+            ),
             (
                 RightSidebarView::Performance,
-                "Performance",
+                self.tr("performance-title"),
                 IconName::Performance,
             ),
         ] {
@@ -8135,13 +8486,13 @@ impl RemCmdApp {
             .map(|session| session.profile_id.as_str())
             .unwrap_or(&tab.profile_id);
         let server_name = if profile_id == LOCAL_PROFILE_ID {
-            "Local"
+            self.tr("terminal-local")
         } else {
             self.profiles
                 .iter()
                 .find(|profile| profile.id == profile_id)
-                .map(|profile| profile.name.as_str())
-                .unwrap_or("Server")
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| self.tr("terminal-server"))
         };
         let sftp_path = active_session
             .filter(|session| session.sftp.loaded)
@@ -8151,11 +8502,12 @@ impl RemCmdApp {
             .and_then(|terminal| terminal.remote_cwd.as_deref());
 
         workspace_tab_title(
-            server_name,
+            &server_name,
             tab.view,
             terminal_number,
             sftp_path,
             remote_cwd,
+            &self.localizer,
         )
     }
 
@@ -8201,7 +8553,11 @@ impl RemCmdApp {
             0.0
         };
         let left_sidebar_button = self
-            .render_titlebar_sidebar_button("toggle_left_sidebar", true, "Toggle sidebar")
+            .render_titlebar_sidebar_button(
+                "toggle_left_sidebar",
+                true,
+                self.tr("terminal-toggle-left-sidebar"),
+            )
             .on_click(cx.listener(|this, _, _, cx| this.toggle_left_sidebar(cx)));
         let left_sidebar_group = div()
             .id("titlebar_left_sidebar_group")
@@ -8374,8 +8730,10 @@ impl RemCmdApp {
             }])
             .overflow_x_scroll()
             .track_scroll(&self.titlebar_tabs_scroll_handle);
+        let close_terminal_tooltip = self.tr("common-close-terminal");
 
         for (tab_index, (tab, label)) in self.tabs.iter().zip(tab_labels).enumerate() {
+            let close_terminal_tooltip = close_terminal_tooltip.clone();
             let tab_id = tab.id;
             let is_active =
                 self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
@@ -8502,7 +8860,7 @@ impl RemCmdApp {
                             .min_w(px(0.0))
                             .truncate()
                             .text_sm()
-                            .child(label),
+                            .child(label.clone()),
                     )
             };
             let content_start_opacity = if is_active {
@@ -8555,7 +8913,7 @@ impl RemCmdApp {
                 .child(self.render_titlebar_close_symbol())
                 .tooltip(move |_, cx| -> AnyView {
                     cx.new(|_| CommandTooltip {
-                        label: "Close terminal".into(),
+                        label: close_terminal_tooltip.clone().into(),
                         theme: tooltip_theme,
                     })
                     .into()
@@ -8805,12 +9163,12 @@ impl RemCmdApp {
             .and_then(|session| session.sftp.file.as_ref())
             .is_some_and(|file| file.is_dirty(cx));
         if dirty {
+            let message = self.tr("terminal-save-before-close");
             if let Some(file) = self
                 .session_mut(session_id)
                 .and_then(|session| session.sftp.file.as_mut())
             {
-                file.error =
-                    Some("Save or revert your changes before closing this terminal".into());
+                file.error = Some(message);
             }
             cx.notify();
         }
@@ -9082,13 +9440,13 @@ impl RemCmdApp {
         let session = self.session(session_id);
         let (message, color) =
             if let Some(error) = session.and_then(|session| session.connection_error.as_ref()) {
-                (error.clone(), self.theme.error_text)
+                (error.render(&self.localizer), self.theme.error_text)
             } else if let Some(message) =
                 session.and_then(|session| session.terminal_end_reason.as_ref())
             {
-                (message.clone(), self.theme.text_muted)
+                (message.render(&self.localizer), self.theme.text_muted)
             } else {
-                ("Session ended".into(), self.theme.text_muted)
+                (self.tr("terminal-session-ended"), self.theme.text_muted)
             };
 
         div()
@@ -9124,7 +9482,7 @@ impl RemCmdApp {
                         self.render_icon_button(
                             SharedString::from(format!("terminal-reconnect-{}", session_id.0)),
                             IconName::Reconnect,
-                            "Reconnect",
+                            self.tr("common-reconnect"),
                             IconTone::Accent,
                             true,
                         )
@@ -9138,7 +9496,7 @@ impl RemCmdApp {
                         self.render_icon_button(
                             SharedString::from(format!("terminal-close-{}", session_id.0)),
                             IconName::Cancel,
-                            "Close terminal",
+                            self.tr("common-close-terminal"),
                             IconTone::Default,
                             true,
                         )
@@ -9161,10 +9519,14 @@ impl RemCmdApp {
             .map(ConnectionProfile::address)
             .unwrap_or_else(|| prompt.profile_id.clone());
         let (title, field_label, key_path) = match &prompt.kind {
-            CredentialPromptKind::Password => ("Password", "Password", None),
+            CredentialPromptKind::Password => (
+                self.tr("credential-password"),
+                self.tr("credential-password"),
+                None,
+            ),
             CredentialPromptKind::PrivateKeyPassphrase { path } => (
-                "Private key passphrase",
-                "Passphrase",
+                self.tr("credential-private-key-passphrase"),
+                self.tr("credential-passphrase"),
                 Some(path.display().to_string()),
             ),
         };
@@ -9230,7 +9592,7 @@ impl RemCmdApp {
                             .text_color(self.theme.on_accent)
                             .when(prompt.remember, |this| this.child("✓")),
                     )
-                    .child("Remember in system keychain")
+                    .child(self.tr("credential-remember"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(prompt) = this.credential_prompt.as_mut() {
                             prompt.remember = !prompt.remember;
@@ -9258,7 +9620,7 @@ impl RemCmdApp {
                 .child(
                     text_button(
                         "credential_cancel",
-                        "Cancel",
+                        self.tr("common-cancel"),
                         TextButtonTone::Secondary,
                         true,
                         &self.theme,
@@ -9271,7 +9633,7 @@ impl RemCmdApp {
                 .child(
                     text_button(
                         "credential_submit",
-                        "Connect",
+                        self.tr("common-connect"),
                         TextButtonTone::Primary,
                         true,
                         &self.theme,
@@ -9317,7 +9679,7 @@ impl RemCmdApp {
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
-                    .child("Verify host key"),
+                    .child(self.tr("host-key-title")),
             )
             .child(
                 div()
@@ -9331,7 +9693,7 @@ impl RemCmdApp {
                     .mt_4()
                     .text_sm()
                     .text_color(self.theme.text_muted)
-                    .child("This server is not recorded in known_hosts. Verify its fingerprint before connecting."),
+                    .child(self.tr("host-key-description")),
             )
             .child(
                 div()
@@ -9345,16 +9707,16 @@ impl RemCmdApp {
                             .w(px(80.0))
                             .flex_none()
                             .text_color(self.theme.text_faint)
-                            .child("Algorithm"),
+                            .child(self.tr("host-key-algorithm")),
                     )
-                    .child(div().child(info.algorithm().to_owned()))
+                    .child(div().child(info.algorithm().to_owned())),
             )
             .child(
                 div()
                     .mt_3()
                     .text_sm()
                     .text_color(self.theme.text_faint)
-                    .child("SHA-256 fingerprint"),
+                    .child(self.tr("host-key-fingerprint")),
             )
             .child(
                 div()
@@ -9373,7 +9735,7 @@ impl RemCmdApp {
                     .child(
                         text_button(
                             "host_key_cancel",
-                            "Cancel",
+                            self.tr("common-cancel"),
                             TextButtonTone::Secondary,
                             true,
                             &self.theme,
@@ -9385,7 +9747,7 @@ impl RemCmdApp {
                     .child(
                         text_button(
                             "host_key_trust",
-                            "Trust and Connect",
+                            self.tr("common-trust-connect"),
                             TextButtonTone::Primary,
                             true,
                             &self.theme,
@@ -9465,7 +9827,7 @@ impl RemCmdApp {
                     .hover(move |this| this.bg(home_hover))
                     .active(move |this| this.bg(pressed_background))
                     .child(self.render_sidebar_icon(IconName::Home, 17.0))
-                    .child("Home")
+                    .child(self.tr("sidebar-home"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.show_home(window, cx);
                     })),
@@ -9484,7 +9846,7 @@ impl RemCmdApp {
                     .hover(move |this| this.bg(list_hover_background))
                     .active(move |this| this.bg(pressed_background))
                     .child(self.render_sidebar_icon(IconName::Terminal, 17.0))
-                    .child("Local Terminal")
+                    .child(self.tr("sidebar-local-terminal"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_local_terminal(window, cx);
                     })),
@@ -9514,7 +9876,7 @@ impl RemCmdApp {
                     .hover(move |this| this.bg(list_hover_background))
                     .active(move |this| this.bg(pressed_background))
                     .child(self.render_sidebar_icon(IconName::NewConnection, 17.0))
-                    .child("New Connection")
+                    .child(self.tr("sidebar-new-connection"))
                     .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
             );
 
@@ -9541,7 +9903,7 @@ impl RemCmdApp {
                 .hover(move |this| this.bg(list_hover_background))
                 .active(move |this| this.bg(pressed_background))
                 .child(self.render_sidebar_icon(section_icon, 15.0))
-                .child("Connections")
+                .child(self.tr("sidebar-connections"))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_connections(cx))),
         );
 
@@ -9568,7 +9930,7 @@ impl RemCmdApp {
                     .render_icon_button(
                         SharedString::from(format!("new-terminal-{}", profile.id)),
                         IconName::Add,
-                        "New terminal",
+                        self.tr("sidebar-new-terminal"),
                         IconTone::Default,
                         can_create_terminal,
                     )
@@ -9652,7 +10014,7 @@ impl RemCmdApp {
                     .mt_2()
                     .text_sm()
                     .text_color(self.theme.text_faint)
-                    .child("No matching connections"),
+                    .child(self.tr("sidebar-no-match")),
             );
         }
 
@@ -9705,7 +10067,7 @@ impl RemCmdApp {
                             .hover(move |this| this.bg(settings_hover))
                             .active(move |this| this.bg(pressed_background))
                             .child(self.render_sidebar_icon(IconName::Settings, 17.0))
-                            .child("Settings")
+                            .child(self.tr("sidebar-settings"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_settings(window, cx);
                             })),
@@ -9714,7 +10076,7 @@ impl RemCmdApp {
                         self.render_icon_button(
                             "show_about",
                             IconName::About,
-                            "About RemCmd",
+                            self.tr("about-title"),
                             IconTone::Default,
                             true,
                         )
@@ -9742,7 +10104,7 @@ impl RemCmdApp {
                             self.render_icon_button(
                                 "toggle_sidebar_search",
                                 IconName::Search,
-                                "Search connections",
+                                self.tr("menu-search-connections"),
                                 IconTone::Default,
                                 true,
                             )
@@ -9823,7 +10185,7 @@ impl RemCmdApp {
                 self.render_icon_button(
                     SharedString::from(format!("close-sidebar-tab-{}", tab_id.0)),
                     IconName::Cancel,
-                    "Close terminal",
+                    self.tr("common-close-terminal"),
                     IconTone::Default,
                     true,
                 )
@@ -10007,7 +10369,7 @@ impl RemCmdApp {
                 .text_sm()
                 .text_color(self.theme.text_muted)
                 .child(self.render_sidebar_icon(IconName::Performance, 20.0))
-                .child("Connect to monitor this server")
+                .child(self.tr("performance-connect-hint"))
                 .into_any_element();
         }
 
@@ -10016,7 +10378,8 @@ impl RemCmdApp {
             let message = performance
                 .error
                 .as_deref()
-                .unwrap_or("Collecting server metrics...");
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.tr("performance-collecting"));
             return div()
                 .flex()
                 .flex_1()
@@ -10087,25 +10450,25 @@ impl RemCmdApp {
                             .text_xs()
                             .text_color(self.theme.text_muted)
                             .child(if performance.error.is_some() {
-                                "Retrying"
+                                self.tr("performance-retrying")
                             } else {
-                                "Live, 2s"
+                                self.tr("performance-live")
                             }),
                     ),
             )
             .child(self.render_performance_meter(
-                "CPU",
+                self.tr("performance-cpu").into(),
                 cpu_usage,
                 if performance.cpu_usage.is_some() {
                     format!("{cpu_usage:.0}%")
                 } else {
-                    "Collecting".into()
+                    self.tr("performance-collecting")
                 },
                 self.theme.accent,
             ))
             .child(self.render_logical_cpu_usage(snapshot, performance))
             .child(self.render_performance_meter(
-                "Memory",
+                self.tr("performance-memory").into(),
                 memory_usage,
                 format!(
                     "{} / {}",
@@ -10119,10 +10482,10 @@ impl RemCmdApp {
                 },
             ))
             .child(self.render_performance_meter(
-                "Swap",
+                self.tr("performance-swap").into(),
                 swap_usage,
                 if snapshot.swap_total_bytes == 0 {
-                    "Not configured".into()
+                    self.tr("performance-not-configured")
                 } else {
                     format!(
                         "{} / {}",
@@ -10151,7 +10514,7 @@ impl RemCmdApp {
                             .items_center()
                             .justify_between()
                             .text_sm()
-                            .child("Load average")
+                            .child(self.tr("performance-load-average"))
                             .child(div().text_color(self.theme.text_muted).child(format!(
                                 "{:.2}  {:.2}  {:.2}",
                                 snapshot.load_one_milli as f32 / 1000.0,
@@ -10159,15 +10522,11 @@ impl RemCmdApp {
                                 snapshot.load_fifteen_milli as f32 / 1000.0,
                             ))),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(self.theme.text_faint)
-                            .child(format!(
-                                "1m / 5m / 15m, {} logical CPUs",
-                                snapshot.cpu_count
-                            )),
-                    ),
+                    .child(div().text_xs().text_color(self.theme.text_faint).child({
+                        let mut args = fluent_bundle::FluentArgs::new();
+                        args.set("count", snapshot.cpu_count);
+                        self.tr_with("performance-load-periods", &args)
+                    })),
             )
             .child(
                 div()
@@ -10182,24 +10541,24 @@ impl RemCmdApp {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Network"),
+                            .child(self.tr("performance-network")),
                     )
                     .child(
                         self.render_performance_value_row(
-                            "Download",
+                            self.tr("performance-download").into(),
                             performance
                                 .network_rx_per_second
                                 .map(format_byte_rate)
-                                .unwrap_or_else(|| "Collecting".into()),
+                                .unwrap_or_else(|| self.tr("performance-collecting")),
                         ),
                     )
                     .child(
                         self.render_performance_value_row(
-                            "Upload",
+                            self.tr("performance-upload").into(),
                             performance
                                 .network_tx_per_second
                                 .map(format_byte_rate)
-                                .unwrap_or_else(|| "Collecting".into()),
+                                .unwrap_or_else(|| self.tr("performance-collecting")),
                         ),
                     ),
             )
@@ -10216,34 +10575,34 @@ impl RemCmdApp {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Disk I/O"),
+                            .child(self.tr("performance-disk-io")),
                     )
                     .child(
                         self.render_performance_value_row(
-                            "Read",
+                            self.tr("performance-read").into(),
                             performance
                                 .disk_read_per_second
                                 .map(format_byte_rate)
                                 .unwrap_or_else(|| {
                                     if snapshot.disk_read_bytes.is_some() {
-                                        "Collecting".into()
+                                        self.tr("performance-collecting")
                                     } else {
-                                        "Unavailable".into()
+                                        self.tr("performance-unavailable")
                                     }
                                 }),
                         ),
                     )
                     .child(
                         self.render_performance_value_row(
-                            "Write",
+                            self.tr("performance-write").into(),
                             performance
                                 .disk_write_per_second
                                 .map(format_byte_rate)
                                 .unwrap_or_else(|| {
                                     if snapshot.disk_write_bytes.is_some() {
-                                        "Collecting".into()
+                                        self.tr("performance-collecting")
                                     } else {
-                                        "Unavailable".into()
+                                        self.tr("performance-unavailable")
                                     }
                                 }),
                         ),
@@ -10254,7 +10613,7 @@ impl RemCmdApp {
             let disk_used = disk_total.saturating_sub(disk_available);
             let disk_usage = percent(disk_used, disk_total);
             content = content.child(self.render_performance_meter(
-                "Root disk",
+                self.tr("performance-root-disk").into(),
                 disk_usage,
                 format!(
                     "{} / {}",
@@ -10281,21 +10640,23 @@ impl RemCmdApp {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child("System"),
+                            .child(self.tr("performance-system")),
                     )
                     .child(self.render_performance_value_row(
-                        "Uptime",
+                        self.tr("performance-uptime").into(),
                         format_uptime(snapshot.uptime_seconds),
                     ))
                     .child(self.render_performance_value_row(
-                        "Processes",
-                        format!(
-                            "{} running / {} total",
-                            snapshot.processes_running, snapshot.processes_total
-                        ),
+                        self.tr("performance-processes").into(),
+                        {
+                            let mut args = fluent_bundle::FluentArgs::new();
+                            args.set("running", snapshot.processes_running);
+                            args.set("total", snapshot.processes_total);
+                            self.tr_with("performance-process-count", &args)
+                        },
                     ))
                     .child(self.render_performance_value_row(
-                        "SSH response",
+                        self.tr("performance-ssh-response").into(),
                         format_response_time(snapshot.ssh_response_time),
                     )),
             )
@@ -10374,20 +10735,20 @@ impl RemCmdApp {
                     .justify_between()
                     .gap_2()
                     .text_sm()
-                    .child("Logical CPUs")
-                    .child(
-                        div()
-                            .text_color(self.theme.text_muted)
-                            .child(format!("{} threads", snapshot.logical_cpus.len())),
-                    ),
+                    .child(self.tr("performance-logical-cpus"))
+                    .child(div().text_color(self.theme.text_muted).child({
+                        let mut args = fluent_bundle::FluentArgs::new();
+                        args.set("count", snapshot.logical_cpus.len());
+                        self.tr_with("performance-thread-count", &args)
+                    })),
             )
             .child(
                 self.render_performance_value_row(
-                    "I/O wait",
+                    self.tr("performance-io-wait").into(),
                     performance
                         .cpu_iowait_usage
                         .map(|usage| format!("{usage:.1}%"))
-                        .unwrap_or_else(|| "Collecting".into()),
+                        .unwrap_or_else(|| self.tr("performance-collecting")),
                 ),
             )
             .child(
@@ -10402,7 +10763,7 @@ impl RemCmdApp {
 
     fn render_performance_meter(
         &self,
-        label: &'static str,
+        label: SharedString,
         value: f32,
         detail: String,
         color: gpui::Hsla,
@@ -10448,7 +10809,7 @@ impl RemCmdApp {
             )
     }
 
-    fn render_performance_value_row(&self, label: &'static str, value: String) -> gpui::Div {
+    fn render_performance_value_row(&self, label: SharedString, value: String) -> gpui::Div {
         div()
             .flex()
             .items_center()
@@ -10486,7 +10847,7 @@ impl RemCmdApp {
                     },
                     20.0,
                 ))
-                .child("No active terminal")
+                .child(self.tr("terminal-no-active"))
                 .into_any_element()
         };
 
@@ -10518,7 +10879,7 @@ impl RemCmdApp {
                 self.render_icon_button(
                     "dispose_quick_terminal",
                     IconName::Delete,
-                    "Close Quick Terminal",
+                    self.tr("terminal-close-quick"),
                     IconTone::Default,
                     true,
                 )
@@ -10532,7 +10893,7 @@ impl RemCmdApp {
             self.render_icon_button(
                 "collapse_bottom_panel",
                 IconName::Collapse,
-                "Collapse panel",
+                self.tr("terminal-collapse-panel"),
                 IconTone::Default,
                 true,
             )
@@ -10562,7 +10923,7 @@ impl RemCmdApp {
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .child(self.render_sidebar_icon(IconName::Terminal, 15.0))
-                    .child("TERMINAL"),
+                    .child(self.tr("terminal-label")),
             )
             .child(actions);
 
@@ -10606,7 +10967,7 @@ impl RemCmdApp {
                 .child(
                     text_button(
                         "start_quick_terminal",
-                        "Start Local Terminal",
+                        self.tr("terminal-start-local"),
                         TextButtonTone::Primary,
                         true,
                         &self.theme,
@@ -10625,7 +10986,7 @@ impl RemCmdApp {
                 .connection_error
                 .as_ref()
                 .or(session.terminal_end_reason.as_ref())
-                .cloned()
+                .map(|message| message.render(&self.localizer))
         });
         let terminal = self.render_terminal_session_view(
             session_id,
@@ -10654,11 +11015,11 @@ impl RemCmdApp {
                         .pt_2()
                         .text_sm()
                         .text_color(self.theme.text_muted)
-                        .child(message.unwrap_or_else(|| "Local terminal ended".into()))
+                        .child(message.unwrap_or_else(|| self.tr("terminal-local-ended")))
                         .child(
                             text_button(
                                 "restart_quick_terminal",
-                                "Restart",
+                                self.tr("terminal-restart"),
                                 TextButtonTone::Secondary,
                                 true,
                                 &self.theme,
@@ -10691,7 +11052,7 @@ impl RemCmdApp {
                     .h(px(72.0))
                     .text_sm()
                     .text_color(self.theme.text_muted)
-                    .child("No connections yet"),
+                    .child(self.tr("home-no-connections")),
             );
         } else {
             let visible_profile_count = self.profiles.len().min(6);
@@ -10756,7 +11117,7 @@ impl RemCmdApp {
 
         let new_connection = text_button(
             "home-new-connection",
-            "New Connection",
+            self.tr("sidebar-new-connection"),
             TextButtonTone::Primary,
             true,
             &self.theme,
@@ -10764,7 +11125,7 @@ impl RemCmdApp {
         .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx)));
         let local_terminal = text_button(
             "home-local-terminal",
-            "Local Terminal",
+            self.tr("sidebar-local-terminal"),
             TextButtonTone::Secondary,
             true,
             &self.theme,
@@ -10816,13 +11177,13 @@ impl RemCmdApp {
                                             div()
                                                 .text_size(px(24.0))
                                                 .font_weight(FontWeight::BOLD)
-                                                .child("RemCmd"),
+                                                .child(self.tr("app-name")),
                                         )
                                         .child(
                                             div()
                                                 .text_sm()
                                                 .text_color(self.theme.text_muted)
-                                                .child("Remote workspaces, files, and terminals"),
+                                                .child(self.tr("home-product-tagline")),
                                         ),
                                 ),
                         )
@@ -10841,7 +11202,7 @@ impl RemCmdApp {
                                 .mb_2()
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child("Connections"),
+                                .child(self.tr("sidebar-connections")),
                         )
                         .child(connections),
                 ),
@@ -10860,14 +11221,7 @@ impl RemCmdApp {
         let state = session
             .map(|session| session.connection_state)
             .unwrap_or(SessionState::Disconnected);
-        let status = match state {
-            SessionState::Disconnected => "Disconnected",
-            SessionState::Connecting => "Connecting",
-            SessionState::Authenticating => "Authenticating",
-            SessionState::Connected => "Connected",
-            SessionState::Disconnecting => "Disconnecting",
-            SessionState::Failed => "Failed",
-        };
+        let status = self.tr(session_state_key(state));
         let status_color = match state {
             SessionState::Connected => self.theme.status_ok,
             SessionState::Failed => self.theme.error_text,
@@ -10891,15 +11245,15 @@ impl RemCmdApp {
                 .credential_mutations_in_progress
                 .contains_key(&profile.id);
         let action_label = if state == SessionState::Connected {
-            "New Terminal"
+            self.tr("connection-new-terminal")
         } else if state == SessionState::Failed {
-            "Retry Connection"
+            self.tr("connection-retry")
         } else if state == SessionState::Connecting || state == SessionState::Authenticating {
-            "Connecting..."
+            self.tr("connection-status-connecting")
         } else if state == SessionState::Disconnecting {
-            "Disconnecting..."
+            self.tr("connection-status-disconnecting")
         } else {
-            "Connect"
+            self.tr("common-connect")
         };
         let action_hover = self.theme.accent_hover;
         let action_pressed = self.theme.button_primary_pressed_bg;
@@ -10945,16 +11299,28 @@ impl RemCmdApp {
             .overflow_hidden()
             .rounded_lg()
             .bg(self.theme.settings_group_bg)
-            .child(self.render_server_info_row("Host", profile.host.clone(), true))
-            .child(self.render_server_info_row("Port", profile.port.to_string(), true))
-            .child(self.render_server_info_row("Username", profile.username.clone(), true))
             .child(self.render_server_info_row(
-                "Authentication",
-                ProfileAuthKind::from_config(&profile.auth).label().into(),
+                self.tr("field-host").into(),
+                profile.host.clone(),
                 true,
             ))
             .child(self.render_server_info_row(
-                "Open terminals",
+                self.tr("field-port").into(),
+                profile.port.to_string(),
+                true,
+            ))
+            .child(self.render_server_info_row(
+                self.tr("field-username").into(),
+                profile.username.clone(),
+                true,
+            ))
+            .child(self.render_server_info_row(
+                self.tr("profile-authentication").into(),
+                profile_auth_label(&profile.auth, &self.localizer),
+                true,
+            ))
+            .child(self.render_server_info_row(
+                self.tr("connection-open-terminals").into(),
                 terminal_count.to_string(),
                 false,
             ));
@@ -11017,7 +11383,7 @@ impl RemCmdApp {
                                         .max_w(px(520.0))
                                         .text_sm()
                                         .text_color(self.theme.error_text)
-                                        .child(error.clone()),
+                                        .child(error.render(&self.localizer)),
                                 )
                             },
                         ),
@@ -11027,7 +11393,7 @@ impl RemCmdApp {
 
     fn render_server_info_row(
         &self,
-        label: &'static str,
+        label: SharedString,
         value: String,
         divided: bool,
     ) -> gpui::Div {
@@ -11129,7 +11495,7 @@ impl RemCmdApp {
                     .items_center()
                     .justify_center()
                     .text_color(self.theme.text_muted)
-                    .child("No terminal selected"),
+                    .child(self.tr("terminal-no-selected")),
             );
         }
 
@@ -11222,15 +11588,22 @@ impl RemCmdApp {
             .rounded_lg()
             .bg(self.theme.settings_group_bg)
             .child(self.render_settings_row(
+                "settings-language-row",
+                self.tr("settings-language").into(),
+                SettingsSelector::Language,
+                true,
+                cx,
+            ))
+            .child(self.render_settings_row(
                 "settings-theme-row",
-                "Theme",
+                self.tr("settings-theme").into(),
                 SettingsSelector::Theme,
                 true,
                 cx,
             ))
             .child(self.render_settings_row(
                 "settings-tab-layout-row",
-                "Tab layout",
+                self.tr("settings-tab-layout").into(),
                 SettingsSelector::TabLayout,
                 false,
                 cx,
@@ -11243,14 +11616,14 @@ impl RemCmdApp {
             .bg(self.theme.settings_group_bg)
             .child(self.render_settings_row(
                 "settings-terminal-font-row",
-                "Font",
+                self.tr("settings-font").into(),
                 SettingsSelector::TerminalFont,
                 true,
                 cx,
             ))
             .child(self.render_settings_row(
                 "settings-terminal-font-size-row",
-                "Font size",
+                self.tr("settings-font-size").into(),
                 SettingsSelector::TerminalFontSize,
                 false,
                 cx,
@@ -11263,14 +11636,14 @@ impl RemCmdApp {
             .bg(self.theme.settings_group_bg)
             .child(self.render_settings_row(
                 "settings-transfer-rate-row",
-                "Speed limit",
+                self.tr("settings-speed-limit").into(),
                 SettingsSelector::TransferRate,
                 true,
                 cx,
             ))
             .child(self.render_settings_row(
                 "settings-parallel-files-row",
-                "Parallel files",
+                self.tr("settings-parallel-files").into(),
                 SettingsSelector::ParallelTransfers,
                 false,
                 cx,
@@ -11292,7 +11665,7 @@ impl RemCmdApp {
                     .mb_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Appearance"),
+                    .child(self.tr("settings-appearance")),
             )
             .child(appearance_group)
             .child(
@@ -11302,7 +11675,7 @@ impl RemCmdApp {
                     .mb_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Terminal"),
+                    .child(self.tr("settings-terminal")),
             )
             .child(terminal_group)
             .child(
@@ -11312,7 +11685,7 @@ impl RemCmdApp {
                     .mb_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Transfers"),
+                    .child(self.tr("settings-transfers")),
             )
             .child(transfer_group)
             .when_some(self.settings_error.as_ref(), |this, error| {
@@ -11336,7 +11709,7 @@ impl RemCmdApp {
     fn render_settings_row(
         &self,
         id: &'static str,
-        label: &'static str,
+        label: SharedString,
         selector: SettingsSelector,
         divided: bool,
         cx: &mut Context<Self>,
@@ -11889,7 +12262,7 @@ impl RemCmdApp {
                 self.render_icon_button(
                     "split_pane_right",
                     IconName::SplitRight,
-                    "Split right",
+                    self.tr("terminal-split-right"),
                     IconTone::Default,
                     can_split,
                 )
@@ -11901,7 +12274,7 @@ impl RemCmdApp {
                 self.render_icon_button(
                     "split_pane_down",
                     IconName::SplitDown,
-                    "Split down",
+                    self.tr("terminal-split-down"),
                     IconTone::Default,
                     can_split,
                 )
@@ -11913,7 +12286,7 @@ impl RemCmdApp {
                 self.render_icon_button(
                     "close_active_pane",
                     IconName::ClosePane,
-                    "Close pane",
+                    self.tr("terminal-close-pane"),
                     IconTone::Default,
                     self.active_tab_id.is_some_and(|tab_id| {
                         self.panes
@@ -11947,7 +12320,7 @@ impl RemCmdApp {
             .render_icon_button(
                 "show_terminal",
                 IconName::Terminal,
-                "Terminal",
+                self.tr("terminal-view"),
                 IconTone::Default,
                 true,
             )
@@ -11963,7 +12336,7 @@ impl RemCmdApp {
             .render_icon_button(
                 "show_remote_files",
                 IconName::Folder,
-                "Remote files",
+                self.tr("terminal-remote-files"),
                 IconTone::Default,
                 can_browse_files,
             )
@@ -12019,7 +12392,7 @@ impl RemCmdApp {
         let mut new_terminal = self.render_context_menu_item(
             "profile-context-new-terminal",
             IconName::Connect,
-            "New Terminal",
+            self.tr("profile-context-new-terminal"),
             IconTone::Default,
             can_open_terminal,
         );
@@ -12036,7 +12409,7 @@ impl RemCmdApp {
         let mut edit = self.render_context_menu_item(
             "profile-context-edit",
             IconName::Edit,
-            "Edit Connection",
+            self.tr("profile-context-edit"),
             IconTone::Default,
             true,
         );
@@ -12048,7 +12421,7 @@ impl RemCmdApp {
         let mut delete = self.render_context_menu_item(
             "profile-context-delete",
             IconName::Delete,
-            "Delete Connection",
+            self.tr("profile-context-delete"),
             IconTone::Danger,
             !has_live_session,
         );
@@ -12104,7 +12477,7 @@ impl RemCmdApp {
         let mut copy = self.render_context_menu_item(
             "terminal-context-copy",
             IconName::Copy,
-            "Copy",
+            self.tr("common-copy"),
             IconTone::Default,
             can_copy,
         );
@@ -12118,7 +12491,7 @@ impl RemCmdApp {
         let mut paste = self.render_context_menu_item(
             "terminal-context-paste",
             IconName::Paste,
-            "Paste",
+            self.tr("common-paste"),
             IconTone::Default,
             can_paste,
         );
@@ -12132,7 +12505,7 @@ impl RemCmdApp {
         let mut select_all = self.render_context_menu_item(
             "terminal-context-select-all",
             IconName::SelectAll,
-            "Select All",
+            self.tr("common-select-all"),
             IconTone::Default,
             can_select_all,
         );
@@ -12146,7 +12519,7 @@ impl RemCmdApp {
         let mut reset = self.render_context_menu_item(
             "terminal-context-reset",
             IconName::Reconnect,
-            "Reset Terminal",
+            self.tr("terminal-reset"),
             IconTone::Default,
             can_reset,
         );
@@ -12202,7 +12575,7 @@ impl RemCmdApp {
         let mut new_file = self.render_context_menu_item(
             "sftp-context-new-file",
             IconName::File,
-            "New File",
+            self.tr("sftp-new-file"),
             IconTone::Default,
             connected,
         );
@@ -12220,7 +12593,7 @@ impl RemCmdApp {
         let mut new_folder = self.render_context_menu_item(
             "sftp-context-new-folder",
             IconName::Folder,
-            "New Folder",
+            self.tr("sftp-new-folder"),
             IconTone::Default,
             connected,
         );
@@ -12238,7 +12611,7 @@ impl RemCmdApp {
         let mut copy_path = self.render_context_menu_item(
             "sftp-context-copy-path",
             IconName::Copy,
-            "Copy Path",
+            self.tr("sftp-copy-path"),
             IconTone::Default,
             !entries.is_empty(),
         );
@@ -12250,7 +12623,7 @@ impl RemCmdApp {
         let mut view = self.render_context_menu_item(
             "sftp-context-view",
             IconName::View,
-            "View",
+            self.tr("sftp-view"),
             IconTone::Default,
             single_file.is_some(),
         );
@@ -12262,7 +12635,7 @@ impl RemCmdApp {
         let mut edit = self.render_context_menu_item(
             "sftp-context-edit",
             IconName::Edit,
-            "Edit",
+            self.tr("sftp-edit"),
             IconTone::Default,
             single_file.is_some(),
         );
@@ -12274,7 +12647,7 @@ impl RemCmdApp {
         let mut download = self.render_context_menu_item(
             "sftp-context-download",
             IconName::Download,
-            "Download",
+            self.tr("sftp-download"),
             IconTone::Default,
             can_download,
         );
@@ -12286,7 +12659,7 @@ impl RemCmdApp {
         let mut delete = self.render_context_menu_item(
             "sftp-context-delete",
             IconName::Delete,
-            "Delete",
+            self.tr("common-delete"),
             IconTone::Danger,
             connected && !entries.is_empty(),
         );
@@ -12322,10 +12695,11 @@ impl RemCmdApp {
         &self,
         id: &'static str,
         icon_name: IconName,
-        label: &'static str,
+        label: impl Into<SharedString>,
         tone: IconTone,
         enabled: bool,
     ) -> gpui::Stateful<gpui::Div> {
+        let label = label.into();
         let (hover, pressed) = match tone {
             IconTone::Danger => (self.theme.danger, self.theme.danger_hover),
             IconTone::Accent | IconTone::Default => (self.theme.accent, self.theme.accent_hover),
@@ -12401,7 +12775,7 @@ impl RemCmdApp {
                             .when(enabled, |this| {
                                 this.group_hover(hover_group.clone(), |style| style.opacity(0.0))
                             })
-                            .child(label),
+                            .child(label.clone()),
                     )
                     .when(enabled, |this| {
                         this.child(
@@ -12428,13 +12802,13 @@ impl RemCmdApp {
             return div().into_any_element();
         };
         let title = match prompt.kind {
-            SftpCreateKind::File => "New File",
-            SftpCreateKind::Directory => "New Folder",
+            SftpCreateKind::File => self.tr("sftp-new-file"),
+            SftpCreateKind::Directory => self.tr("sftp-new-folder"),
         };
         let input = prompt.input.clone();
         let create = text_button(
             "submit_sftp_create",
-            "Create",
+            self.tr("common-create"),
             TextButtonTone::Primary,
             true,
             &self.theme,
@@ -12442,7 +12816,7 @@ impl RemCmdApp {
         .on_click(cx.listener(|this, _, _, cx| this.submit_sftp_create(cx)));
         let cancel = text_button(
             "cancel_sftp_create",
-            "Cancel",
+            self.tr("common-cancel"),
             TextButtonTone::Secondary,
             true,
             &self.theme,
@@ -12510,9 +12884,9 @@ impl RemCmdApp {
             .count();
         let target_label: SharedString =
             if selected_count == connected_profile_ids.len() && !connected_profile_ids.is_empty() {
-                "All servers".into()
+                self.tr("quick-all-servers").into()
             } else if selected_count == 0 {
-                "No servers selected".into()
+                self.tr("quick-no-servers").into()
             } else if selected_count == 1 {
                 let selected_profile_id = connected_profile_ids
                     .iter()
@@ -12524,9 +12898,11 @@ impl RemCmdApp {
                             .find(|profile| profile.id == *profile_id)
                     })
                     .map(|profile| profile.name.clone().into())
-                    .unwrap_or_else(|| "1 server".into())
+                    .unwrap_or_else(|| self.tr("quick-one-server").into())
             } else {
-                format!("{selected_count} servers").into()
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", selected_count);
+                self.tr_with("quick-server-count", &args).into()
             };
 
         let selector_group: SharedString = "quick-command-target-control".into();
@@ -12658,7 +13034,7 @@ impl RemCmdApp {
         let input = prompt.input.clone();
         let run = text_button(
             "submit_quick_command",
-            "Run",
+            self.tr("common-run"),
             TextButtonTone::Primary,
             run_enabled,
             &self.theme,
@@ -12719,12 +13095,15 @@ impl RemCmdApp {
             match &session.sftp_availability {
                 SftpAvailability::Checking => {
                     return self.render_sftp_availability_hint(
-                        "Checking SFTP availability...",
-                        "Remote files will appear when the server check completes.",
+                        self.tr("sftp-checking"),
+                        self.tr("sftp-checking-detail"),
                     );
                 }
                 SftpAvailability::Unavailable(message) => {
-                    return self.render_sftp_availability_hint("SFTP unavailable", message.clone());
+                    return self.render_sftp_availability_hint(
+                        self.tr("sftp-unavailable"),
+                        message.clone(),
+                    );
                 }
                 SftpAvailability::Available => {}
             }
@@ -12754,7 +13133,7 @@ impl RemCmdApp {
                 .justify_center()
                 .text_sm()
                 .text_color(self.theme.text_muted)
-                .child("Loading remote files...")
+                .child(self.tr("sftp-loading-files"))
                 .into_any_element()
         } else if loaded && entry_count == 0 {
             div()
@@ -12767,7 +13146,7 @@ impl RemCmdApp {
                 .justify_center()
                 .text_sm()
                 .text_color(self.theme.text_muted)
-                .child("This directory is empty")
+                .child(self.tr("sftp-empty-directory"))
                 .into_any_element()
         } else {
             div()
@@ -12793,7 +13172,7 @@ impl RemCmdApp {
         let mut parent_button = self.render_icon_button(
             SharedString::from(format!("sftp_parent_directory_{element_suffix}")),
             IconName::ArrowUp,
-            "Parent directory",
+            self.tr("sftp-parent-directory"),
             IconTone::Default,
             can_go_up,
         );
@@ -12806,7 +13185,7 @@ impl RemCmdApp {
         let mut refresh_button = self.render_icon_button(
             SharedString::from(format!("sftp_refresh_directory_{element_suffix}")),
             IconName::Reconnect,
-            "Refresh",
+            self.tr("common-refresh"),
             IconTone::Default,
             can_refresh,
         );
@@ -12819,7 +13198,7 @@ impl RemCmdApp {
         let mut upload_button = self.render_icon_button(
             SharedString::from(format!("sftp_upload_{element_suffix}")),
             IconName::Upload,
-            "Upload files",
+            self.tr("sftp-upload-files"),
             IconTone::Default,
             can_upload,
         );
@@ -12836,7 +13215,7 @@ impl RemCmdApp {
         let mut download_button = self.render_icon_button(
             SharedString::from(format!("sftp_download_selected_{element_suffix}")),
             IconName::Download,
-            "Download selected",
+            self.tr("sftp-download-selected"),
             IconTone::Default,
             can_download,
         );
@@ -12854,7 +13233,7 @@ impl RemCmdApp {
         let mut delete_button = self.render_icon_button(
             SharedString::from(format!("sftp_delete_selected_{element_suffix}")),
             IconName::Delete,
-            "Delete selected",
+            self.tr("sftp-delete-selected"),
             IconTone::Danger,
             can_delete,
         );
@@ -12916,7 +13295,7 @@ impl RemCmdApp {
                                 .flex_none()
                                 .text_sm()
                                 .text_color(self.theme.text_muted)
-                                .child("Loading..."),
+                                .child(self.tr("common-loading")),
                         )
                     }),
             );
@@ -13283,7 +13662,7 @@ impl RemCmdApp {
                 session_id.0
             )),
             IconName::Delete,
-            "Clear finished transfers",
+            self.tr("sftp-clear-finished"),
             IconTone::Default,
             has_finished,
         );
@@ -13314,7 +13693,7 @@ impl RemCmdApp {
                             .min_w(px(0.0))
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Transfers"),
+                            .child(self.tr("sftp-transfers")),
                     )
                     .child(clear_button),
             );
@@ -13322,29 +13701,32 @@ impl RemCmdApp {
         if let Some(progress) = batch_progress {
             let percentage = (progress.fraction * 100.0).round() as u32;
             let title = if progress.settled_count < progress.task_count {
-                format!("Downloading {} files", progress.task_count)
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", progress.task_count);
+                self.tr_with("sftp-downloading-files", &args)
             } else if progress.failed_count == 0 {
-                format!("Downloaded {} files", progress.task_count)
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", progress.task_count);
+                self.tr_with("sftp-downloaded-files", &args)
             } else {
-                format!(
-                    "Downloaded with {} error{}",
-                    progress.failed_count,
-                    if progress.failed_count == 1 { "" } else { "s" }
-                )
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", progress.failed_count);
+                self.tr_with("sftp-downloaded-errors", &args)
             };
             let status = progress.total.map_or_else(
                 || {
-                    format!(
-                        "{} / {} files · {percentage}%",
-                        progress.settled_count, progress.task_count
-                    )
+                    let mut args = fluent_bundle::FluentArgs::new();
+                    args.set("settled", progress.settled_count);
+                    args.set("total", progress.task_count);
+                    args.set("percent", percentage);
+                    self.tr_with("sftp-file-progress", &args)
                 },
                 |total| {
-                    format!(
-                        "{} / {} · {percentage}%",
-                        format_remote_size(progress.transferred),
-                        format_remote_size(total)
-                    )
+                    let mut args = fluent_bundle::FluentArgs::new();
+                    args.set("transferred", format_remote_size(progress.transferred));
+                    args.set("total", format_remote_size(total));
+                    args.set("percent", percentage);
+                    self.tr_with("sftp-byte-progress", &args)
                 },
             );
             queue = queue.child(
@@ -13430,7 +13812,7 @@ impl RemCmdApp {
                                 SharedString::from(format!(
                                     "replace-sftp-transfer-{element_suffix}-{transfer_id}"
                                 )),
-                                "Replace",
+                                self.tr("common-replace"),
                                 TextButtonTone::Primary,
                                 true,
                                 &self.theme,
@@ -13450,7 +13832,7 @@ impl RemCmdApp {
                                 SharedString::from(format!(
                                     "cancel-conflicted-sftp-transfer-{element_suffix}-{transfer_id}"
                                 )),
-                                "Cancel",
+                                self.tr("common-cancel"),
                                 TextButtonTone::Secondary,
                                 true,
                                 &self.theme,
@@ -13469,7 +13851,7 @@ impl RemCmdApp {
                                 "cancel-active-sftp-transfer-{element_suffix}-{transfer_id}"
                             )),
                             IconName::Cancel,
-                            "Cancel transfer",
+                            self.tr("sftp-cancel-transfer"),
                             IconTone::Default,
                             true,
                         )
@@ -13519,7 +13901,7 @@ impl RemCmdApp {
                                 .truncate()
                                 .text_xs()
                                 .text_color(status_color)
-                                .child(task.status_text()),
+                                .child(task.status_text(&self.localizer)),
                         )
                         .when(
                             matches!(
@@ -13574,7 +13956,7 @@ impl RemCmdApp {
         let mut back_button = self.render_icon_button(
             "sftp_close_file",
             IconName::ArrowLeft,
-            "Back to directory",
+            self.tr("sftp-back-directory"),
             IconTone::Default,
             !saving,
         );
@@ -13586,7 +13968,7 @@ impl RemCmdApp {
 
         let mut revert_button = text_button(
             "sftp_revert_file",
-            "Revert",
+            self.tr("common-revert"),
             TextButtonTone::Secondary,
             dirty && !saving,
             &self.theme,
@@ -13600,7 +13982,11 @@ impl RemCmdApp {
         let can_save = editable && dirty && !saving && connected;
         let mut save_button = text_button(
             "sftp_save_file",
-            if saving { "Saving" } else { "Save" },
+            if saving {
+                self.tr("common-saving")
+            } else {
+                self.tr("common-save")
+            },
             TextButtonTone::Primary,
             can_save,
             &self.theme,
@@ -13623,7 +14009,7 @@ impl RemCmdApp {
                 .justify_center()
                 .text_sm()
                 .text_color(self.theme.text_muted)
-                .child("Loading remote file...");
+                .child(self.tr("sftp-loading-file"));
         } else if binary {
             content = content
                 .items_center()
@@ -13632,7 +14018,7 @@ impl RemCmdApp {
                 .text_sm()
                 .text_color(self.theme.text_muted)
                 .child(self.render_sidebar_icon(IconName::File, 20.0))
-                .child("Binary or non-UTF-8 files cannot be edited")
+                .child(self.tr("sftp-binary-read-only"))
                 .child(format_remote_size(size));
         } else if let Some(editor) = editor {
             content = content.child(editor);
@@ -13679,7 +14065,7 @@ impl RemCmdApp {
                                 .mr_2()
                                 .text_sm()
                                 .text_color(self.theme.text_muted)
-                                .child("Modified"),
+                                .child(self.tr("sftp-modified")),
                         )
                     })
                     .when(!editable, |this| {
@@ -13689,7 +14075,7 @@ impl RemCmdApp {
                                 .mr_2()
                                 .text_sm()
                                 .text_color(self.theme.text_muted)
-                                .child("Read Only"),
+                                .child(self.tr("sftp-read-only")),
                         )
                     })
                     .when(editable, |this| {
@@ -13720,12 +14106,12 @@ impl RemCmdApp {
             return div().into_any_element();
         };
         let title = match editor.mode {
-            ProfileEditorMode::Create => "New Connection",
-            ProfileEditorMode::Edit => "Edit Connection",
+            ProfileEditorMode::Create => self.tr("profile-new-title"),
+            ProfileEditorMode::Edit => self.tr("profile-edit-title"),
         };
         let save = text_button(
             "save_profile",
-            "Save",
+            self.tr("common-save"),
             TextButtonTone::Primary,
             true,
             &self.theme,
@@ -13733,7 +14119,7 @@ impl RemCmdApp {
         .on_click(cx.listener(|this, _, _, cx| this.save_editor(cx)));
         let cancel = text_button(
             "cancel_profile",
-            "Cancel",
+            self.tr("common-cancel"),
             TextButtonTone::Secondary,
             true,
             &self.theme,
@@ -13750,10 +14136,10 @@ impl RemCmdApp {
             .overflow_y_scroll()
             .px_4()
             .py_3()
-            .child(self.render_form_row("Name", editor.name.clone()))
-            .child(self.render_form_row("Host", editor.host.clone()))
-            .child(self.render_form_row("Port", editor.port.clone()))
-            .child(self.render_form_row("Username", editor.username.clone()))
+            .child(self.render_form_row(self.tr("field-name").into(), editor.name.clone()))
+            .child(self.render_form_row(self.tr("field-host").into(), editor.host.clone()))
+            .child(self.render_form_row(self.tr("field-port").into(), editor.port.clone()))
+            .child(self.render_form_row(self.tr("field-username").into(), editor.username.clone()))
             .child(self.render_auth_method_row(editor.auth_kind, cx))
             .when(editor.auth_kind == ProfileAuthKind::PrivateKey, |this| {
                 this.child(self.render_private_key_row(editor.private_key_path.clone(), cx))
@@ -13848,19 +14234,19 @@ impl RemCmdApp {
         let can_disconnect = state.can_disconnect();
 
         let label = match state {
-            _ if checking_keychain => "Checking",
-            _ if updating_keychain => "Updating",
-            SessionState::Failed => "Retry",
-            SessionState::Disconnecting => "Disconnecting",
-            _ if can_disconnect => "Disconnect",
+            _ if checking_keychain => self.tr("credential-checking"),
+            _ if updating_keychain => self.tr("credential-updating"),
+            SessionState::Failed => self.tr("common-retry"),
+            SessionState::Disconnecting => self.tr("connection-status-disconnecting"),
+            _ if can_disconnect => self.tr("common-disconnect"),
             _ if self
                 .selected_profile_id
                 .as_deref()
                 .is_some_and(|profile_id| self.terminal_has_ended(profile_id)) =>
             {
-                "Reconnect"
+                self.tr("common-reconnect")
             }
-            _ => "Connect",
+            _ => self.tr("common-connect"),
         };
 
         let tone = if can_disconnect {
@@ -13934,7 +14320,7 @@ impl RemCmdApp {
             self.credential_lookup_task.is_some()
                 && self.credential_lookup_session_id == Some(session.id)
         }) {
-            return "Checking system keychain".into();
+            return self.tr("credential-checking");
         }
         if self
             .selected_profile_id
@@ -13944,22 +14330,13 @@ impl RemCmdApp {
                     .contains_key(profile_id)
             })
         {
-            return "Updating system keychain".into();
+            return self.tr("credential-updating");
         }
 
-        let state = match session
+        let state = session
             .map(|session| session.connection_state)
-            .unwrap_or(SessionState::Disconnected)
-        {
-            SessionState::Disconnected => "Disconnected",
-            SessionState::Connecting => "Connecting",
-            SessionState::Authenticating => "Authenticating",
-            SessionState::Connected => "Connected",
-            SessionState::Disconnecting => "Disconnecting",
-            SessionState::Failed => "Failed",
-        };
-
-        state.into()
+            .unwrap_or(SessionState::Disconnected);
+        self.tr(session_state_key(state))
     }
 
     fn render_auth_method_row(
@@ -14015,7 +14392,7 @@ impl RemCmdApp {
                     .truncate()
                     .pr(px(4.0))
                     .text_right()
-                    .child(selected.label()),
+                    .child(self.tr(profile_auth_kind_key(selected))),
             )
             .child(picker)
             .on_click(cx.listener(|this, _, _, cx| {
@@ -14039,8 +14416,7 @@ impl RemCmdApp {
             let option_hover = self.theme.accent;
             let option_pressed = self.theme.accent_hover;
             let on_accent = self.theme.on_accent;
-            for (index, (auth_kind, label)) in ProfileAuthKind::OPTIONS.iter().copied().enumerate()
-            {
+            for (index, (auth_kind, _)) in ProfileAuthKind::OPTIONS.iter().copied().enumerate() {
                 let is_selected = auth_kind == selected;
                 let hover_group: SharedString = format!("profile-auth-option-{index}-hover").into();
                 let check = self.render_select_menu_check(is_selected, hover_group.clone());
@@ -14059,7 +14435,10 @@ impl RemCmdApp {
                         .hover(move |this| this.bg(option_hover).text_color(on_accent))
                         .active(move |this| this.bg(option_pressed).text_color(on_accent))
                         .child(check)
-                        .child(self.render_select_menu_label(label.into(), hover_group))
+                        .child(self.render_select_menu_label(
+                            self.tr(profile_auth_kind_key(auth_kind)).into(),
+                            hover_group,
+                        ))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.select_auth_method(auth_kind, window, cx);
@@ -14080,7 +14459,7 @@ impl RemCmdApp {
                     .flex_none()
                     .w(px(112.0))
                     .truncate()
-                    .child("Authentication"),
+                    .child(self.tr("profile-authentication")),
             )
             .child(selector)
     }
@@ -14094,7 +14473,13 @@ impl RemCmdApp {
             .flex()
             .items_center()
             .mt_3()
-            .child(div().flex_none().w(px(112.0)).truncate().child("Key file"))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(112.0))
+                    .truncate()
+                    .child(self.tr("profile-key-file")),
+            )
             .child(
                 div()
                     .flex()
@@ -14107,7 +14492,7 @@ impl RemCmdApp {
                         self.render_icon_button(
                             "browse_private_key",
                             IconName::Folder,
-                            "Browse",
+                            self.tr("common-browse"),
                             IconTone::Default,
                             true,
                         )
@@ -14128,13 +14513,13 @@ impl RemCmdApp {
                     .flex_none()
                     .w(px(112.0))
                     .truncate()
-                    .child("Credential"),
+                    .child(self.tr("profile-credential")),
             )
             .child(
                 self.render_icon_button(
                     "forget_saved_credential",
                     IconName::ForgetCredential,
-                    "Forget",
+                    self.tr("profile-forget-credential"),
                     IconTone::Danger,
                     true,
                 )
@@ -14144,7 +14529,7 @@ impl RemCmdApp {
             )
     }
 
-    fn render_form_row(&self, label: &'static str, field: Entity<TextField>) -> impl IntoElement {
+    fn render_form_row(&self, label: SharedString, field: Entity<TextField>) -> impl IntoElement {
         div()
             .flex()
             .items_center()
@@ -14286,6 +14671,86 @@ fn auth_method_with_secret(prompt_kind: CredentialPromptKind, secret: SecretStri
     }
 }
 
+fn profile_auth_label(auth: &AuthConfig, localizer: &Localizer) -> String {
+    localizer.text(match auth {
+        AuthConfig::None => "common-none",
+        AuthConfig::Password => "credential-password",
+        AuthConfig::PrivateKey { .. } => "profile-auth-private-key",
+        AuthConfig::Agent => "profile-auth-agent",
+    })
+}
+
+const fn profile_auth_kind_key(kind: ProfileAuthKind) -> &'static str {
+    match kind {
+        ProfileAuthKind::None => "profile-auth-none",
+        ProfileAuthKind::Password => "profile-auth-password",
+        ProfileAuthKind::PrivateKey => "profile-auth-private-key",
+        ProfileAuthKind::Agent => "profile-auth-agent",
+    }
+}
+
+fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String {
+    localized_connection_error_parts(error.kind(), error.message(), localizer)
+}
+
+fn localized_connection_error_parts(
+    kind: SshErrorKind,
+    details: &str,
+    localizer: &Localizer,
+) -> String {
+    let (summary_key, suggestion_key) = match kind {
+        SshErrorKind::InvalidState | SshErrorKind::Configuration => (
+            "connection-error-summary-configuration",
+            "connection-error-suggestion-configuration",
+        ),
+        SshErrorKind::Network => (
+            "connection-error-summary-network",
+            "connection-error-suggestion-network",
+        ),
+        SshErrorKind::HostKeyUntrusted
+        | SshErrorKind::HostKeyChanged
+        | SshErrorKind::HostKeyPersistence
+        | SshErrorKind::HostKeyVerification => (
+            "connection-error-summary-host-key",
+            "connection-error-suggestion-host-key",
+        ),
+        SshErrorKind::Authentication | SshErrorKind::PrivateKeyPassphrase => (
+            "connection-error-summary-auth",
+            "connection-error-suggestion-auth",
+        ),
+        SshErrorKind::Timeout => (
+            "connection-error-summary-timeout",
+            "connection-error-suggestion-timeout",
+        ),
+        SshErrorKind::Protocol => (
+            "connection-error-summary-protocol",
+            "connection-error-suggestion-protocol",
+        ),
+        SshErrorKind::Sftp => (
+            "connection-error-summary-sftp",
+            "connection-error-suggestion-sftp",
+        ),
+    };
+    format!(
+        "{}\n{}\n{}: {}",
+        localizer.text(summary_key),
+        localizer.text(suggestion_key),
+        localizer.text("connection-technical-details"),
+        details
+    )
+}
+
+const fn session_state_key(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Disconnected => "connection-status-disconnected",
+        SessionState::Connecting => "connection-status-connecting",
+        SessionState::Authenticating => "connection-status-authenticating",
+        SessionState::Connected => "connection-status-connected",
+        SessionState::Disconnecting => "connection-status-disconnecting",
+        SessionState::Failed => "connection-status-failed",
+    }
+}
+
 fn credentials_invalidated_by_edit(
     profile: &ConnectionProfile,
     host: &str,
@@ -14348,14 +14813,16 @@ fn windows_menu_left(menu: WindowsMenu) -> f32 {
             .sum::<f32>()
 }
 
-fn windows_menu_popup_width(entries: &[WindowsMenuEntry]) -> f32 {
+fn windows_menu_popup_width(entries: &[WindowsMenuEntry], localizer: &Localizer) -> f32 {
     entries
         .iter()
         .filter_map(|entry| match entry {
             WindowsMenuEntry::Item {
-                label, shortcut, ..
+                label_key,
+                shortcut,
+                ..
             } => Some(
-                28.0 + estimated_windows_menu_text_width(label)
+                28.0 + estimated_windows_menu_text_width(&localizer.text(label_key))
                     + if shortcut.is_empty() {
                         0.0
                     } else {
@@ -14381,174 +14848,174 @@ fn windows_menu_entries(menu: WindowsMenu) -> Vec<WindowsMenuEntry> {
     match menu {
         WindowsMenu::File => vec![
             Item {
-                label: "New Connection",
+                label_key: "menu-new-connection",
                 shortcut: "Ctrl+N",
                 command: Command::NewConnection,
             },
             Item {
-                label: "New Local Terminal",
+                label_key: "menu-new-local-terminal",
                 shortcut: "Ctrl+T",
                 command: Command::NewLocalTerminal,
             },
             Item {
-                label: "New SSH Terminal",
+                label_key: "menu-new-remote-terminal",
                 shortcut: "Ctrl+Shift+T",
                 command: Command::NewRemoteTerminal,
             },
             Separator,
             Item {
-                label: "Connect Selected Server",
+                label_key: "menu-connect",
                 shortcut: "Ctrl+Enter",
                 command: Command::ConnectSelectedProfile,
             },
             Item {
-                label: "Disconnect Active Session",
+                label_key: "menu-disconnect",
                 shortcut: "Ctrl+Shift+X",
                 command: Command::DisconnectActiveSession,
             },
             Separator,
             Item {
-                label: "Settings",
+                label_key: "menu-settings",
                 shortcut: "Ctrl+,",
                 command: Command::ShowSettings,
             },
             Item {
-                label: "Exit",
+                label_key: "menu-exit",
                 shortcut: "Ctrl+Q",
                 command: Command::Quit,
             },
         ],
         WindowsMenu::Edit => vec![
             Item {
-                label: "Undo",
+                label_key: "menu-undo",
                 shortcut: "Ctrl+Z",
                 command: Command::Edit(EditCommand::Undo),
             },
             Item {
-                label: "Redo",
+                label_key: "menu-redo",
                 shortcut: "Ctrl+Y",
                 command: Command::Edit(EditCommand::Redo),
             },
             Separator,
             Item {
-                label: "Cut",
+                label_key: "menu-cut",
                 shortcut: "Ctrl+X",
                 command: Command::Edit(EditCommand::Cut),
             },
             Item {
-                label: "Copy",
+                label_key: "menu-copy",
                 shortcut: "Ctrl+C",
                 command: Command::Edit(EditCommand::Copy),
             },
             Item {
-                label: "Paste",
+                label_key: "menu-paste",
                 shortcut: "Ctrl+V",
                 command: Command::Edit(EditCommand::Paste),
             },
             Item {
-                label: "Select All",
+                label_key: "menu-select-all",
                 shortcut: "Ctrl+A",
                 command: Command::Edit(EditCommand::SelectAll),
             },
         ],
         WindowsMenu::Terminal => vec![
             Item {
-                label: "Split Horizontally",
+                label_key: "menu-split-horizontal",
                 shortcut: "Ctrl+D",
                 command: Command::SplitHorizontal,
             },
             Item {
-                label: "Split Vertically",
+                label_key: "menu-split-vertical",
                 shortcut: "Ctrl+Shift+D",
                 command: Command::SplitVertical,
             },
             Separator,
             Item {
-                label: "Show Terminal",
+                label_key: "menu-show-terminal",
                 shortcut: "Ctrl+1",
                 command: Command::ShowTerminalView,
             },
             Item {
-                label: "Show Remote Files",
+                label_key: "menu-show-remote-files",
                 shortcut: "Ctrl+2",
                 command: Command::ShowFilesView,
             },
             Separator,
             Item {
-                label: "Reset Terminal",
+                label_key: "menu-reset-terminal",
                 shortcut: "Ctrl+R",
                 command: Command::ResetActiveTerminal,
             },
             Item {
-                label: "Close Active Split",
+                label_key: "menu-close-active-split",
                 shortcut: "Ctrl+Alt+W",
                 command: Command::CloseActivePane,
             },
             Item {
-                label: "Close Active Tab",
+                label_key: "menu-close-active-tab",
                 shortcut: "Ctrl+Shift+W",
                 command: Command::CloseActiveTab,
             },
         ],
         WindowsMenu::View => vec![
             Item {
-                label: "Home",
+                label_key: "menu-home",
                 shortcut: "Ctrl+Shift+H",
                 command: Command::ShowHome,
             },
             Separator,
             Item {
-                label: "Toggle Connections Sidebar",
+                label_key: "menu-toggle-connections-sidebar",
                 shortcut: "Ctrl+Shift+S",
                 command: Command::ToggleLeftSidebar,
             },
             Item {
-                label: "Search Connections",
+                label_key: "menu-search-connections",
                 shortcut: "Ctrl+F",
                 command: Command::ToggleConnectionSearch,
             },
             Separator,
             Item {
-                label: "Show Remote Files Sidebar",
+                label_key: "menu-show-remote-files-sidebar",
                 shortcut: "Ctrl+Shift+F",
                 command: Command::ShowSftpSidebar,
             },
             Item {
-                label: "Show Server Performance",
+                label_key: "menu-show-server-performance",
                 shortcut: "Ctrl+Shift+P",
                 command: Command::ShowPerformanceSidebar,
             },
             Item {
-                label: "Toggle Bottom Terminal",
+                label_key: "menu-toggle-bottom-terminal",
                 shortcut: "Ctrl+J",
                 command: Command::ToggleBottomPanel,
             },
         ],
         WindowsMenu::Window => vec![
             Item {
-                label: "Minimize",
+                label_key: "menu-minimize",
                 shortcut: "",
                 command: Command::MinimizeWindow,
             },
             Item {
-                label: "Maximize or Restore",
+                label_key: "menu-maximize-restore",
                 shortcut: "",
                 command: Command::ZoomWindow,
             },
             Item {
-                label: "Toggle Full Screen",
+                label_key: "menu-fullscreen",
                 shortcut: "Ctrl+Alt+F",
                 command: Command::ToggleFullscreen,
             },
             Separator,
             Item {
-                label: "Close Window",
+                label_key: "menu-close-window",
                 shortcut: "Ctrl+W",
                 command: Command::CloseWindow,
             },
         ],
         WindowsMenu::Help => vec![Item {
-            label: "About RemCmd",
+            label_key: "about-title",
             shortcut: "",
             command: Command::ShowAbout,
         }],
@@ -14634,12 +15101,18 @@ fn workspace_tab_title(
     terminal_number: usize,
     sftp_path: Option<&str>,
     remote_cwd: Option<&str>,
+    localizer: &Localizer,
 ) -> String {
     let path = match view {
-        TerminalTabView::Terminal => remote_cwd
+        TerminalTabView::Terminal => remote_cwd.map(str::to_owned).unwrap_or_else(|| {
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("number", terminal_number);
+            localizer.text_with("terminal-number", Some(&args))
+        }),
+        TerminalTabView::Files => sftp_path
+            .or(remote_cwd)
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("Terminal {terminal_number}")),
-        TerminalTabView::Files => sftp_path.or(remote_cwd).unwrap_or("Files").to_owned(),
+            .unwrap_or_else(|| localizer.text("terminal-files")),
     };
     format!("{server_name} - {path}")
 }
@@ -15139,7 +15612,7 @@ fn main_window_titlebar() -> TitlebarOptions {
     }
 }
 
-fn about_window_options(cx: &App) -> WindowOptions {
+fn about_window_options(cx: &App, _localizer: &Localizer) -> WindowOptions {
     let window_size = size(px(440.0), px(380.0));
     let titlebar = {
         #[cfg(target_os = "macos")]
@@ -15153,7 +15626,7 @@ fn about_window_options(cx: &App) -> WindowOptions {
         #[cfg(not(target_os = "macos"))]
         {
             TitlebarOptions {
-                title: Some("About RemCmd".into()),
+                title: Some(_localizer.text("about-title").into()),
                 ..Default::default()
             }
         }
@@ -15244,18 +15717,21 @@ fn bind_profile_editor_keys(cx: &mut App) {
     )]);
 }
 
-fn application_menus() -> Vec<Menu> {
+fn application_menus(localizer: &Localizer) -> Vec<Menu> {
     let mut application_items = vec![
-        MenuItem::action("About RemCmd", ShowAbout),
+        MenuItem::action(localizer.text("about-title"), ShowAbout),
         MenuItem::separator(),
-        MenuItem::action("Settings...", ShowSettings),
+        MenuItem::action(localizer.text("menu-settings"), ShowSettings),
     ];
     #[cfg(target_os = "macos")]
     application_items.push(MenuItem::os_submenu(
-        "Services",
+        localizer.text("menu-services"),
         gpui::SystemMenuType::Services,
     ));
-    application_items.extend([MenuItem::separator(), MenuItem::action("Quit RemCmd", Quit)]);
+    application_items.extend([
+        MenuItem::separator(),
+        MenuItem::action(localizer.text("menu-quit"), Quit),
+    ]);
 
     vec![
         Menu {
@@ -15263,51 +15739,60 @@ fn application_menus() -> Vec<Menu> {
             items: application_items,
         },
         Menu {
-            name: "File".into(),
+            name: localizer.text("menu-file").into(),
             items: vec![
-                MenuItem::action("New Connection", NewConnection),
-                MenuItem::action("New Local Terminal", NewLocalTerminal),
-                MenuItem::action("New SSH Terminal", NewRemoteTerminal),
+                MenuItem::action(localizer.text("menu-new-connection"), NewConnection),
+                MenuItem::action(localizer.text("menu-new-local-terminal"), NewLocalTerminal),
+                MenuItem::action(
+                    localizer.text("menu-new-remote-terminal"),
+                    NewRemoteTerminal,
+                ),
                 MenuItem::separator(),
-                MenuItem::action("Connect Selected Server", ConnectSelectedProfile),
-                MenuItem::action("Disconnect Active Session", DisconnectActiveSession),
+                MenuItem::action(localizer.text("menu-connect"), ConnectSelectedProfile),
+                MenuItem::action(localizer.text("menu-disconnect"), DisconnectActiveSession),
             ],
         },
         Menu {
-            name: "Terminal".into(),
+            name: localizer.text("menu-terminal").into(),
             items: vec![
-                MenuItem::action("Split Horizontally", SplitHorizontal),
-                MenuItem::action("Split Vertically", SplitVertical),
+                MenuItem::action(localizer.text("menu-split-horizontal"), SplitHorizontal),
+                MenuItem::action(localizer.text("menu-split-vertical"), SplitVertical),
                 MenuItem::separator(),
-                MenuItem::action("Show Terminal", ShowTerminalView),
-                MenuItem::action("Show Remote Files", ShowFilesView),
+                MenuItem::action(localizer.text("menu-terminal-view"), ShowTerminalView),
+                MenuItem::action(localizer.text("menu-files-view"), ShowFilesView),
                 MenuItem::separator(),
-                MenuItem::action("Reset Terminal", ResetActiveTerminal),
-                MenuItem::action("Close Active Split", CloseActivePane),
-                MenuItem::action("Close Active Tab", CloseActiveTab),
+                MenuItem::action(localizer.text("menu-reset-terminal"), ResetActiveTerminal),
+                MenuItem::action(localizer.text("menu-close-pane"), CloseActivePane),
+                MenuItem::action(localizer.text("menu-close-terminal"), CloseActiveTab),
             ],
         },
         Menu {
-            name: "View".into(),
+            name: localizer.text("menu-view").into(),
             items: vec![
-                MenuItem::action("Home", ShowHome),
+                MenuItem::action(localizer.text("menu-home"), ShowHome),
                 MenuItem::separator(),
-                MenuItem::action("Toggle Connections Sidebar", ToggleLeftSidebar),
-                MenuItem::action("Search Connections", ToggleConnectionSearch),
+                MenuItem::action(localizer.text("menu-toggle-sidebar"), ToggleLeftSidebar),
+                MenuItem::action(
+                    localizer.text("menu-search-connections"),
+                    ToggleConnectionSearch,
+                ),
                 MenuItem::separator(),
-                MenuItem::action("Show Remote Files Sidebar", ShowSftpSidebar),
-                MenuItem::action("Show Server Performance", ShowPerformanceSidebar),
-                MenuItem::action("Toggle Bottom Terminal", ToggleBottomPanel),
+                MenuItem::action(localizer.text("menu-sftp-sidebar"), ShowSftpSidebar),
+                MenuItem::action(
+                    localizer.text("menu-performance-sidebar"),
+                    ShowPerformanceSidebar,
+                ),
+                MenuItem::action(localizer.text("menu-bottom-panel"), ToggleBottomPanel),
             ],
         },
         Menu {
-            name: "Window".into(),
+            name: localizer.text("menu-window").into(),
             items: vec![
-                MenuItem::action("Minimize", MinimizeWindow),
-                MenuItem::action("Zoom", ZoomWindow),
-                MenuItem::action("Enter Full Screen", ToggleFullscreen),
+                MenuItem::action(localizer.text("menu-minimize"), MinimizeWindow),
+                MenuItem::action(localizer.text("menu-zoom"), ZoomWindow),
+                MenuItem::action(localizer.text("menu-fullscreen"), ToggleFullscreen),
                 MenuItem::separator(),
-                MenuItem::action("Close Window", CloseWindow),
+                MenuItem::action(localizer.text("menu-close-window"), CloseWindow),
             ],
         },
     ]
@@ -15324,7 +15809,7 @@ fn dispatch_main_window_action(
     cx.stop_propagation();
 }
 
-fn configure_application_menu(cx: &mut App) {
+fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
     cx.bind_keys([
         KeyBinding::new("cmd-,", ShowSettings, None),
         KeyBinding::new("cmd-shift-h", ShowHome, None),
@@ -15487,7 +15972,7 @@ fn configure_application_menu(cx: &mut App) {
         dispatch_main_window_action(cx, |_, window, _| window.remove_window());
     });
     cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.set_menus(application_menus());
+    cx.set_menus(application_menus(localizer));
 }
 
 fn launch(cx: &mut App) {
@@ -15503,8 +15988,11 @@ fn launch(cx: &mut App) {
     bind_quick_command_keys(cx);
     bind_profile_editor_keys(cx);
     let main_window = open_main_window(cx);
+    let language_mode = main_window
+        .update(cx, |this, _, _| this.language_mode)
+        .unwrap_or(LanguageMode::System);
     cx.set_global(RemCmdMainWindow(main_window));
-    configure_application_menu(cx);
+    configure_application_menu(cx, &Localizer::new(language_mode));
     cx.activate(true);
 }
 
@@ -15595,8 +16083,37 @@ mod tests {
     }
 
     #[test]
+    fn session_messages_localize_at_render_time() {
+        let message = SessionMessage::localized("terminal-session-disconnected");
+        let english = Localizer::new(LanguageMode::EnUs);
+        let chinese = Localizer::new(LanguageMode::ZhCn);
+
+        assert_eq!(
+            message.render(&english),
+            english.text("terminal-session-disconnected")
+        );
+        assert_eq!(
+            message.render(&chinese),
+            chinese.text("terminal-session-disconnected")
+        );
+        assert_ne!(message.render(&english), message.render(&chinese));
+    }
+
+    #[test]
+    fn connection_errors_relocalize_without_changing_technical_details() {
+        let error = SshError::new(SshErrorKind::Network, "connection-detail-canary");
+        let message = SessionMessage::connection_error(&error);
+        let english = message.render(&Localizer::new(LanguageMode::EnUs));
+        let chinese = message.render(&Localizer::new(LanguageMode::ZhCn));
+
+        assert_ne!(english, chinese);
+        assert!(english.contains("connection-detail-canary"));
+        assert!(chinese.contains("connection-detail-canary"));
+    }
+
+    #[test]
     fn application_menu_exposes_workspace_operations() {
-        let menus = application_menus();
+        let menus = application_menus(&Localizer::new(LanguageMode::EnUs));
         let menu_names = menus
             .iter()
             .map(|menu| menu.name.to_string())
@@ -15607,6 +16124,53 @@ mod tests {
             &menus[0].items[0],
             MenuItem::Action { name, .. } if name.as_ref() == "About RemCmd"
         ));
+    }
+
+    #[test]
+    fn application_menus_and_widths_rebuild_for_chinese() {
+        let localizer = Localizer::new(LanguageMode::ZhCn);
+        let menus = application_menus(&localizer);
+        assert_eq!(
+            menus
+                .iter()
+                .map(|menu| menu.name.to_string())
+                .collect::<Vec<_>>(),
+            ["RemCmd", "文件", "终端", "视图", "窗口"]
+        );
+        assert!(matches!(
+            &menus[0].items[0],
+            MenuItem::Action { name, .. } if name.as_ref() == "关于 RemCmd"
+        ));
+
+        for menu in [
+            WindowsMenu::File,
+            WindowsMenu::Edit,
+            WindowsMenu::Terminal,
+            WindowsMenu::View,
+            WindowsMenu::Window,
+            WindowsMenu::Help,
+        ] {
+            let entries = windows_menu_entries(menu);
+            let width = windows_menu_popup_width(&entries, &localizer);
+            for entry in entries {
+                let WindowsMenuEntry::Item {
+                    label_key,
+                    shortcut,
+                    ..
+                } = entry
+                else {
+                    continue;
+                };
+                let required = 28.0
+                    + estimated_windows_menu_text_width(&localizer.text(label_key))
+                    + if shortcut.is_empty() {
+                        0.0
+                    } else {
+                        20.0 + estimated_windows_menu_text_width(shortcut)
+                    };
+                assert!(width >= required.ceil());
+            }
+        }
     }
 
     #[test]
@@ -15632,7 +16196,7 @@ mod tests {
         assert_eq!(
             help_entries,
             vec![WindowsMenuEntry::Item {
-                label: "About RemCmd",
+                label_key: "about-title",
                 shortcut: "",
                 command: WindowsMenuCommand::ShowAbout,
             }]
@@ -15675,18 +16239,21 @@ mod tests {
             expected_left += windows_menu_button_width(menu);
 
             let entries = windows_menu_entries(menu);
-            let width = windows_menu_popup_width(&entries);
+            let width = windows_menu_popup_width(&entries, &Localizer::new(LanguageMode::EnUs));
             assert!(width >= WINDOWS_MENU_MIN_WIDTH);
             for entry in entries {
                 let WindowsMenuEntry::Item {
-                    label, shortcut, ..
+                    label_key,
+                    shortcut,
+                    ..
                 } = entry
                 else {
                     continue;
                 };
-                let required = 28.0
-                    + estimated_windows_menu_text_width(label)
-                    + if shortcut.is_empty() {
+                let required =
+                    28.0 + estimated_windows_menu_text_width(
+                        &Localizer::new(LanguageMode::EnUs).text(label_key),
+                    ) + if shortcut.is_empty() {
                         0.0
                     } else {
                         20.0 + estimated_windows_menu_text_width(shortcut)
@@ -15713,6 +16280,10 @@ mod tests {
 
     #[test]
     fn settings_selectors_cover_every_persisted_choice() {
+        assert_eq!(
+            SettingsSelector::Language.options(),
+            &LANGUAGE_SETTING_OPTIONS
+        );
         assert_eq!(SettingsSelector::Theme.options(), &THEME_SETTING_OPTIONS);
         assert_eq!(
             SettingsSelector::TabLayout.options(),
@@ -15923,7 +16494,8 @@ mod tests {
                 TerminalTabView::Files,
                 1,
                 Some("/home/test"),
-                Some("/ignored")
+                Some("/ignored"),
+                &Localizer::new(LanguageMode::EnUs),
             ),
             "Demo Server - /home/test"
         );
@@ -15933,7 +16505,8 @@ mod tests {
                 TerminalTabView::Files,
                 1,
                 None,
-                Some("/var/log")
+                Some("/var/log"),
+                &Localizer::new(LanguageMode::EnUs),
             ),
             "Demo Server - /var/log"
         );
@@ -15943,7 +16516,8 @@ mod tests {
                 TerminalTabView::Terminal,
                 2,
                 Some("/ignored"),
-                None
+                None,
+                &Localizer::new(LanguageMode::EnUs),
             ),
             "Demo Server - Terminal 2"
         );
@@ -15953,7 +16527,8 @@ mod tests {
                 TerminalTabView::Terminal,
                 2,
                 None,
-                Some("/srv/app")
+                Some("/srv/app"),
+                &Localizer::new(LanguageMode::EnUs),
             ),
             "Demo Server - /srv/app"
         );
@@ -16422,7 +16997,7 @@ mod tests {
         assert!(
             ProfileAuthKind::OPTIONS
                 .iter()
-                .all(|(kind, label)| kind.label() == *label)
+                .all(|(kind, _)| profile_auth_kind_key(*kind).starts_with("profile-auth-"))
         );
     }
 
@@ -16430,7 +17005,7 @@ mod tests {
     fn private_key_authentication_requires_a_path() {
         assert_eq!(
             ProfileAuthKind::PrivateKey.into_config("   "),
-            Err("Private key path is required")
+            Err("profile-validation-private-key")
         );
     }
 
