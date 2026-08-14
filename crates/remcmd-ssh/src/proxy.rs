@@ -386,7 +386,7 @@ async fn open_proxy_command(command: &str) -> Result<ProxyCommandStream, SshErro
     });
     Ok(ProxyCommandStream {
         child,
-        stdin,
+        stdin: Some(stdin),
         stdout,
         stderr_task,
     })
@@ -394,7 +394,7 @@ async fn open_proxy_command(command: &str) -> Result<ProxyCommandStream, SshErro
 
 struct ProxyCommandStream {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: ChildStdout,
     stderr_task: JoinHandle<Vec<u8>>,
 }
@@ -415,21 +415,39 @@ impl AsyncWrite for ProxyCommandStream {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.stdin).poll_write(context, buffer)
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ProxyCommand stdin is closed",
+            )));
+        };
+        Pin::new(stdin).poll_write(context, buffer)
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.stdin).poll_flush(context)
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(stdin).poll_flush(context)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.stdin).poll_shutdown(context)
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(stdin).poll_shutdown(context) {
+            Poll::Ready(Ok(())) => {
+                self.stdin.take();
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
     }
 }
 
