@@ -4,7 +4,9 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use remcmd_core::{ConnectionProfile, TabLayout, TerminalSettings, ThemeMode, TransferSettings};
+use remcmd_core::{
+    ConnectionProfile, LanguageMode, TabLayout, TerminalSettings, ThemeMode, TransferSettings,
+};
 
 mod credentials;
 pub use credentials::{
@@ -28,6 +30,8 @@ pub fn default_settings_path() -> io::Result<PathBuf> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 pub struct AppSettings {
+    #[serde(default)]
+    pub language_mode: LanguageMode,
     #[serde(default)]
     pub theme_mode: ThemeMode,
     #[serde(default)]
@@ -108,6 +112,7 @@ mod tests {
         let settings = load_settings(&directory.path().join("settings.json")).unwrap();
 
         assert_eq!(settings.theme_mode, ThemeMode::System);
+        assert_eq!(settings.language_mode, LanguageMode::System);
         assert_eq!(settings.tab_layout, TabLayout::Vertical);
         assert_eq!(settings.transfers, TransferSettings::default());
         assert_eq!(settings.terminal, TerminalSettings::default());
@@ -118,6 +123,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/settings.json");
         let settings = AppSettings {
+            language_mode: LanguageMode::ZhCn,
             theme_mode: ThemeMode::Dark,
             tab_layout: TabLayout::Horizontal,
             transfers: TransferSettings {
@@ -144,6 +150,7 @@ mod tests {
         let settings = load_settings(&path).unwrap();
 
         assert_eq!(settings.theme_mode, ThemeMode::Light);
+        assert_eq!(settings.language_mode, LanguageMode::System);
         assert_eq!(settings.tab_layout, TabLayout::Vertical);
         assert_eq!(settings.transfers, TransferSettings::default());
         assert_eq!(settings.terminal, TerminalSettings::default());

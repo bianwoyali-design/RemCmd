@@ -106,6 +106,15 @@ impl TextField {
         self.content.is_empty()
     }
 
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     pub fn take_text(&mut self, cx: &mut Context<Self>) -> String {
         let content = std::mem::take(&mut self.content);
         self.selected_range = 0..0;
