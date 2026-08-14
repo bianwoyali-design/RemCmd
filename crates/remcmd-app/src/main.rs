@@ -344,7 +344,7 @@ enum WindowsMenuCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsMenuEntry {
     Item {
-        label: &'static str,
+        label_key: &'static str,
         shortcut: &'static str,
         command: WindowsMenuCommand,
     },
@@ -373,6 +373,121 @@ struct TerminalPane {
     focused: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionMessageArg {
+    Text(String),
+    Localized(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionMessage {
+    Plain(String),
+    Localized {
+        key: &'static str,
+        args: Vec<(&'static str, SessionMessageArg)>,
+    },
+    LocalizedWithDetail {
+        key: &'static str,
+        detail: String,
+    },
+    ConnectionError {
+        kind: SshErrorKind,
+        details: String,
+        stage: Option<ConnectionStage>,
+    },
+    HostKeyVerification {
+        stage: ConnectionStage,
+        address: String,
+    },
+}
+
+impl SessionMessage {
+    fn localized(key: &'static str) -> Self {
+        Self::Localized {
+            key,
+            args: Vec::new(),
+        }
+    }
+
+    fn localized_with(
+        key: &'static str,
+        args: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> Self {
+        Self::Localized {
+            key,
+            args: args
+                .into_iter()
+                .map(|(name, value)| (name, SessionMessageArg::Text(value)))
+                .collect(),
+        }
+    }
+
+    fn localized_with_args(
+        key: &'static str,
+        args: impl IntoIterator<Item = (&'static str, SessionMessageArg)>,
+    ) -> Self {
+        Self::Localized {
+            key,
+            args: args.into_iter().collect(),
+        }
+    }
+
+    fn connection_error(error: &SshError) -> Self {
+        Self::ConnectionError {
+            kind: error.kind(),
+            details: error.message().to_owned(),
+            stage: error.stage().cloned(),
+        }
+    }
+
+    fn host_key_verification(stage: ConnectionStage, address: String) -> Self {
+        Self::HostKeyVerification { stage, address }
+    }
+
+    fn localized_with_detail(key: &'static str, detail: impl Into<String>) -> Self {
+        Self::LocalizedWithDetail {
+            key,
+            detail: detail.into(),
+        }
+    }
+
+    fn render(&self, localizer: &Localizer) -> String {
+        match self {
+            Self::Plain(message) => message.clone(),
+            Self::Localized { key, args } => {
+                let mut fluent_args = fluent_bundle::FluentArgs::new();
+                for (name, value) in args {
+                    fluent_args.set(
+                        *name,
+                        match value {
+                            SessionMessageArg::Text(value) => value.clone(),
+                            SessionMessageArg::Localized(key) => localizer.text(key),
+                        },
+                    );
+                }
+                localizer.text_with(key, Some(&fluent_args))
+            }
+            Self::LocalizedWithDetail { key, detail } => {
+                format!("{}: {detail}", localizer.text(key))
+            }
+            Self::ConnectionError {
+                kind,
+                details,
+                stage,
+            } => localized_connection_error_parts(*kind, details, stage.as_ref(), localizer),
+            Self::HostKeyVerification { stage, address } => {
+                format!("{}: {address}", connection_stage_label(stage, localizer))
+            }
+        }
+    }
+}
+
+impl From<String> for SessionMessage {
+    fn from(message: String) -> Self {
+        Self::Plain(message)
+    }
+}
+
 struct TerminalSession {
     id: SessionId,
     profile_id: String,
@@ -381,9 +496,9 @@ struct TerminalSession {
     connection_state: SessionState,
     connection_handle: Option<ConnectionHandle>,
     local_terminal_handle: Option<LocalTerminalHandle>,
-    connection_error: Option<String>,
-    connection_message: Option<String>,
-    terminal_end_reason: Option<String>,
+    connection_error: Option<SessionMessage>,
+    connection_message: Option<SessionMessage>,
+    terminal_end_reason: Option<SessionMessage>,
     host_key_prompt: Option<HostKeyInfo>,
     terminal: Option<ActiveTerminal>,
     terminal_marked_text: String,
@@ -548,7 +663,7 @@ struct CommandTooltip {
 }
 
 struct AboutWindow {
-    language_mode: LanguageMode,
+    localizer: Localizer,
 }
 
 impl Render for CommandTooltip {
@@ -575,7 +690,6 @@ impl Render for CommandTooltip {
 impl Render for AboutWindow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let localizer = Localizer::new(self.language_mode);
         let mut version_args = fluent_bundle::FluentArgs::new();
         version_args.set("version", env!("CARGO_PKG_VERSION"));
 
@@ -610,21 +724,24 @@ impl Render for AboutWindow {
                             .mt_3()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(localizer.text_with("about-version", Some(&version_args))),
+                            .child(
+                                self.localizer
+                                    .text_with("about-version", Some(&version_args)),
+                            ),
                     )
                     .child(
                         div()
                             .mt_3()
                             .text_sm()
                             .text_color(theme.text_muted)
-                            .child(localizer.text("about-tagline")),
+                            .child(self.localizer.text("about-tagline")),
                     )
                     .child(
                         div()
                             .mt_5()
                             .text_xs()
                             .text_color(theme.text_faint)
-                            .child(localizer.text("about-license")),
+                            .child(self.localizer.text("about-license")),
                     ),
             )
     }
@@ -4326,7 +4443,7 @@ impl RemCmdApp {
         if let Some(about_window) = self.about_window {
             let title = self.tr("about-title");
             let _ = about_window.update(cx, move |about, window, cx| {
-                about.language_mode = language_mode;
+                about.localizer = Localizer::new(language_mode);
                 window.set_window_title(&title);
                 cx.notify();
             });
@@ -4747,7 +4864,7 @@ impl RemCmdApp {
         &mut self,
         profile_id: String,
         kind: Option<CredentialKind>,
-        success_message: Option<String>,
+        success_message_key: Option<&'static str>,
         cx: &mut Context<Self>,
     ) {
         let runtime = cx.global::<SshRuntime>().handle();
@@ -4755,9 +4872,8 @@ impl RemCmdApp {
             .credential_mutations_in_progress
             .entry(profile_id.clone())
             .or_default() += 1;
-        let updating_message = self.tr("credential-updating");
         if let Some(session) = self.session_for_profile_mut(&profile_id) {
-            session.connection_message = Some(updating_message);
+            session.connection_message = Some(SessionMessage::localized("credential-updating"));
         }
 
         cx.spawn(async move |this, cx| {
@@ -4787,13 +4903,14 @@ impl RemCmdApp {
 
                 match result {
                     Ok(Ok(())) => {
-                        if let Some(message) = success_message
+                        if let Some(message_key) = success_message_key
                             && remove_counter
                             && this.selected_profile_id.as_deref()
                                 == Some(deleted_profile_id.as_str())
                             && let Some(session) = this.session_for_profile_mut(&deleted_profile_id)
                         {
-                            session.connection_message = Some(message);
+                            session.connection_message =
+                                Some(SessionMessage::localized(message_key));
                         }
                     }
                     Ok(Err(error)) => {
@@ -4826,7 +4943,7 @@ impl RemCmdApp {
         self.delete_stored_credentials(
             editor.profile_id.clone(),
             Some(kind),
-            Some(self.tr("credential-removed")),
+            Some("credential-removed"),
             cx,
         );
     }
@@ -4892,7 +5009,6 @@ impl RemCmdApp {
         let size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
         let terminal = LocalTerminal::spawn(local_pty_size(size));
         let (handle, mut events) = terminal.split();
-        let starting_message = self.tr("terminal-starting-local");
         let sftp_unavailable = self.tr("sftp-ssh-only");
 
         let Some(session) = self.session_mut(session_id) else {
@@ -4903,7 +5019,7 @@ impl RemCmdApp {
         session.connection_handle = None;
         session.local_terminal_handle = Some(handle);
         session.connection_error = None;
-        session.connection_message = Some(starting_message);
+        session.connection_message = Some(SessionMessage::localized("terminal-starting-local"));
         session.terminal_end_reason = None;
         session.terminal = Some(ActiveTerminal::new(LOCAL_PROFILE_ID.into(), size));
         session.terminal_marked_text.clear();
@@ -4960,7 +5076,11 @@ impl RemCmdApp {
 
         let options = about_window_options(cx, &self.localizer);
         let language_mode = self.language_mode;
-        match cx.open_window(options, |_, cx| cx.new(|_| AboutWindow { language_mode })) {
+        match cx.open_window(options, |_, cx| {
+            cx.new(|_| AboutWindow {
+                localizer: Localizer::new(language_mode),
+            })
+        }) {
             Ok(window_handle) => {
                 self.about_window = Some(window_handle);
             }
@@ -5855,10 +5975,9 @@ impl RemCmdApp {
         let profile_id = profile.id.clone();
         let credential_kind = prompt_kind.credential_kind();
         let runtime = cx.global::<SshRuntime>().handle();
-        let checking_message = self.tr("credential-checking");
         if let Some(session) = self.session_mut(session_id) {
             session.connection_error = None;
-            session.connection_message = Some(checking_message);
+            session.connection_message = Some(SessionMessage::localized("credential-checking"));
         }
         self.credential_lookup_session_id = Some(session_id);
 
@@ -5949,7 +6068,7 @@ impl RemCmdApp {
                             if this.activate_session_in_window(session_id, window, cx) {
                                 this.start_connection(session_id, profile, auth, None, cx);
                                 if let Some(session) = this.session_mut(session_id) {
-                                    session.connection_message = Some(error);
+                                    session.connection_message = Some(error.into());
                                 }
                             }
                         }
@@ -6063,9 +6182,11 @@ impl RemCmdApp {
                 .find(|profile| &profile.id == jump_id)
                 .cloned()
             else {
-                let message = format!("{}: {jump_id}", self.tr("connection-missing-jump"));
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_error = Some(message);
+                    session.connection_error = Some(SessionMessage::localized_with_detail(
+                        "connection-missing-jump",
+                        jump_id,
+                    ));
                 }
                 cx.notify();
                 return;
@@ -6086,10 +6207,9 @@ impl RemCmdApp {
             proxy_prepared: false,
             force_prompt,
         });
-        let checking_message = self.tr("credential-checking");
         if let Some(session) = self.session_mut(session_id) {
             session.connection_error = None;
-            session.connection_message = Some(checking_message);
+            session.connection_message = Some(SessionMessage::localized("credential-checking"));
         }
         self.continue_connection_preparation(cx);
     }
@@ -6270,9 +6390,8 @@ impl RemCmdApp {
                 plan.set_proxy(proxy);
             }
             if let Err(error) = plan.validate() {
-                let message = localized_connection_error(&error, &self.localizer);
                 if let Some(session) = self.session_mut(pending.session_id) {
-                    session.connection_error = Some(message);
+                    session.connection_error = Some(SessionMessage::connection_error(&error));
                     session.connection_message = None;
                 }
                 cx.notify();
@@ -6304,10 +6423,9 @@ impl RemCmdApp {
             return;
         };
         let runtime = cx.global::<SshRuntime>().handle();
-        let checking_message = self.tr("credential-checking");
         if let Some(session) = self.session_mut(session_id) {
             session.connection_error = None;
-            session.connection_message = Some(checking_message);
+            session.connection_message = Some(SessionMessage::localized("credential-checking"));
         }
         self.credential_lookup_session_id = Some(session_id);
         self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
@@ -6388,7 +6506,10 @@ impl RemCmdApp {
                 );
             }
             (CredentialKind::ProxyCommand, None) => {
-                let message = error.unwrap_or_else(|| self.tr("proxy-command-keychain-missing"));
+                let message = error.map_or_else(
+                    || SessionMessage::localized("proxy-command-keychain-missing"),
+                    SessionMessage::from,
+                );
                 let session_id = self
                     .pending_connection
                     .take()
@@ -6503,17 +6624,16 @@ impl RemCmdApp {
                     expanded_command: preview.expanded_command().clone(),
                     approval_digest: preview.approval_digest().to_owned(),
                 });
-                let approval_message = self.tr("proxy-command-approval-title");
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some(approval_message);
+                    session.connection_message =
+                        Some(SessionMessage::localized("proxy-command-approval-title"));
                 }
                 cx.notify();
             }
             Ok(_) => self.start_connection_plan(session_id, target_profile, plan, credentials, cx),
             Err(error) => {
-                let message = localized_connection_error(&error, &self.localizer);
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_error = Some(message);
+                    session.connection_error = Some(SessionMessage::connection_error(&error));
                     session.connection_message = None;
                 }
                 cx.notify();
@@ -6530,9 +6650,8 @@ impl RemCmdApp {
             .plan
             .approve_proxy_command(prompt.approval_digest.clone())
         {
-            let message = localized_connection_error(&error, &self.localizer);
             if let Some(session) = self.session_mut(prompt.session_id) {
-                session.connection_error = Some(message);
+                session.connection_error = Some(SessionMessage::connection_error(&error));
             }
             cx.notify();
             return;
@@ -6555,9 +6674,10 @@ impl RemCmdApp {
             }
         });
         let Some((profile_index, previous_approval)) = approval_update else {
-            let message = self.tr("profile-validation-proxy-command");
             if let Some(session) = self.session_mut(prompt.session_id) {
-                session.connection_error = Some(message);
+                session.connection_error = Some(SessionMessage::localized(
+                    "profile-validation-proxy-command",
+                ));
             }
             cx.notify();
             return;
@@ -6569,9 +6689,11 @@ impl RemCmdApp {
             {
                 *approved_digest = previous_approval;
             }
-            let message = format!("{}: {error}", self.tr("app-save-profiles-failed"));
             if let Some(session) = self.session_mut(prompt.session_id) {
-                session.connection_error = Some(message);
+                session.connection_error = Some(SessionMessage::localized_with_detail(
+                    "app-save-profiles-failed",
+                    error.to_string(),
+                ));
             }
             cx.notify();
             return;
@@ -6590,9 +6712,10 @@ impl RemCmdApp {
             return;
         };
         self.pending_proxy_approval.remove(&prompt.session_id);
-        let cancelled_message = self.tr("proxy-command-approval-cancelled");
         if let Some(session) = self.session_mut(prompt.session_id) {
-            session.connection_error = Some(cancelled_message);
+            session.connection_error = Some(SessionMessage::localized(
+                "proxy-command-approval-cancelled",
+            ));
             session.connection_message = None;
         }
         cx.notify();
@@ -6709,9 +6832,9 @@ impl RemCmdApp {
             .is_none_or(|pending| pending.session_id != session_id)
         {
             self.dismiss_credential_prompt(cx);
-            let message = self.tr("connection-preparation-expired");
             if let Some(session) = self.session_mut(session_id) {
-                session.connection_error = Some(message);
+                session.connection_error =
+                    Some(SessionMessage::localized("connection-preparation-expired"));
             }
             cx.notify();
             return;
@@ -6762,13 +6885,13 @@ impl RemCmdApp {
         let Some(session_id) = self.active_session_id else {
             return;
         };
-        let handle_missing = self.tr("connection-handle-missing");
         let Some((info, handle)) = self.session_mut(session_id).and_then(|session| {
             let info = session.host_key_prompt.take()?;
             match session.connection_handle.clone() {
                 Some(handle) => Some((info, handle)),
                 None => {
-                    session.connection_error = Some(handle_missing);
+                    session.connection_error =
+                        Some(SessionMessage::localized("connection-handle-missing"));
                     None
                 }
             }
@@ -6779,17 +6902,16 @@ impl RemCmdApp {
 
         match handle.trust_host_key() {
             Ok(()) => {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("address", info.address());
-                let message = self.tr_with("connection-trusting-host", &args);
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some(message);
+                    session.connection_message = Some(SessionMessage::localized_with(
+                        "connection-trusting-host",
+                        [("address", info.address())],
+                    ));
                 }
             }
             Err(error) => {
-                let message = localized_connection_error(&error, &self.localizer);
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_error = Some(message);
+                    session.connection_error = Some(SessionMessage::connection_error(&error));
                 }
             }
         }
@@ -6807,7 +6929,7 @@ impl RemCmdApp {
         if let Some(handle) = session.connection_handle.as_ref()
             && let Err(error) = handle.reject_host_key()
         {
-            session.connection_error = Some(error.to_string());
+            session.connection_error = Some(error.to_string().into());
         }
         session.connection_message = None;
         cx.notify();
@@ -6925,7 +7047,7 @@ impl RemCmdApp {
         }
         if let Some(session) = self.session_mut(session_id) {
             session.connection_error = None;
-            session.connection_message = Some(error.clone());
+            session.connection_message = Some(error.clone().into());
         }
         self.begin_connection_preparation(
             session_id,
@@ -6945,9 +7067,9 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         let runtime = cx.global::<SshRuntime>().handle();
-        let removing_message = self.tr("credential-removing-rejected");
         if let Some(session) = self.session_mut(session_id) {
-            session.connection_message = Some(removing_message);
+            session.connection_message =
+                Some(SessionMessage::localized("credential-removing-rejected"));
         }
 
         self.credential_lookup_session_id = Some(session_id);
@@ -6983,7 +7105,7 @@ impl RemCmdApp {
                     )
                     && let Some(session) = this.session_mut(session_id)
                 {
-                    session.connection_error = Some(error);
+                    session.connection_error = Some(error.into());
                 }
                 cx.notify();
             });
@@ -7019,12 +7141,17 @@ impl RemCmdApp {
                     .spawn_blocking(move || save_credential(&profile_id, kind, &secret))
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    let saved_message = this.tr("credential-saved");
                     if let Some(session) = this.session_mut(session_id) {
                         session.connection_message = Some(match result {
-                            Ok(Ok(())) => saved_message,
-                            Ok(Err(error)) => error.to_string(),
-                            Err(error) => error.to_string(),
+                            Ok(Ok(())) => SessionMessage::localized("credential-saved"),
+                            Ok(Err(error)) => SessionMessage::localized_with_detail(
+                                "credential-save-failed",
+                                error.to_string(),
+                            ),
+                            Err(error) => SessionMessage::localized_with_detail(
+                                "credential-save-task-failed",
+                                error.to_string(),
+                            ),
                         });
                     }
                     cx.notify();
@@ -7042,7 +7169,6 @@ impl RemCmdApp {
     }
 
     fn disconnect_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let disconnected_message = self.tr("terminal-session-disconnected");
         let should_remove = {
             let Some(session) = self.session_mut(session_id) else {
                 return;
@@ -7057,12 +7183,13 @@ impl RemCmdApp {
                 session.connection_state = SessionState::Failed;
                 session.connection_handle = None;
                 session.local_terminal_handle = None;
-                session.connection_error = Some(error);
+                session.connection_error = Some(error.into());
                 session.close_when_disconnected
             } else {
                 // Disable repeated clicks before the worker publishes its event.
                 session.connection_state = SessionState::Disconnecting;
-                session.terminal_end_reason = Some(disconnected_message);
+                session.terminal_end_reason =
+                    Some(SessionMessage::localized("terminal-session-disconnected"));
                 false
             }
         };
@@ -7384,7 +7511,7 @@ impl RemCmdApp {
         }
 
         if let Err(error) = session.write_terminal_input(data) {
-            session.connection_error = Some(error);
+            session.connection_error = Some(error.into());
             cx.notify();
         }
     }
@@ -7471,7 +7598,7 @@ impl RemCmdApp {
                 }
 
                 if let Err(error) = session.resize_terminal(size) {
-                    session.connection_error = Some(error);
+                    session.connection_error = Some(error.into());
                     cx.notify();
                 }
             });
@@ -7709,14 +7836,14 @@ impl RemCmdApp {
                 false
             }
             TerminalEvent::Bell => {
-                let message = self.tr("terminal-remote-bell");
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some(message);
+                    session.connection_message =
+                        Some(SessionMessage::localized("terminal-remote-bell"));
                 }
                 true
             }
             TerminalEvent::ExitRequested => {
-                let message = self.tr("terminal-remote-exit-requested");
+                let message = SessionMessage::localized("terminal-remote-exit-requested");
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     session.terminal_end_reason = Some(message);
@@ -7725,11 +7852,12 @@ impl RemCmdApp {
             }
             TerminalEvent::ChildExited(status) => {
                 let message = status.map_or_else(
-                    || self.tr("terminal-remote-exited"),
+                    || SessionMessage::localized("terminal-remote-exited"),
                     |status| {
-                        let mut args = fluent_bundle::FluentArgs::new();
-                        args.set("status", status);
-                        self.tr_with("terminal-remote-exited-status", &args)
+                        SessionMessage::localized_with(
+                            "terminal-remote-exited-status",
+                            [("status", status.to_string())],
+                        )
                     },
                 );
                 if let Some(session) = self.session_mut(session_id) {
@@ -7751,7 +7879,7 @@ impl RemCmdApp {
             return;
         };
         if let Err(error) = session.write_terminal_input(data) {
-            session.connection_error = Some(error);
+            session.connection_error = Some(error.into());
         }
     }
 
@@ -7807,7 +7935,6 @@ impl RemCmdApp {
         let should_notify = match event {
             ConnectionEvent::StateChanged(state) => {
                 let connection_closed = self.tr("sftp-connection-closed");
-                let disconnected = self.tr("terminal-session-disconnected");
                 let close_when_disconnected = {
                     let session = self
                         .session_mut(session_id)
@@ -7842,7 +7969,8 @@ impl RemCmdApp {
                         if previous_state == SessionState::Disconnecting
                             && session.terminal_end_reason.is_none()
                         {
-                            session.terminal_end_reason = Some(disconnected);
+                            session.terminal_end_reason =
+                                Some(SessionMessage::localized("terminal-session-disconnected"));
                         }
                     }
 
@@ -7858,14 +7986,16 @@ impl RemCmdApp {
             }
             ConnectionEvent::ConnectionStageChanged(stage) => {
                 let message = match stage {
-                    ConnectionStage::Proxy => self.tr("connection-connecting-proxy"),
-                    ConnectionStage::Jump { index, total, .. } => {
-                        let mut args = fluent_bundle::FluentArgs::new();
-                        args.set("index", index);
-                        args.set("total", total);
-                        self.tr_with("connection-connecting-jump", &args)
+                    ConnectionStage::Proxy => {
+                        SessionMessage::localized("connection-connecting-proxy")
                     }
-                    ConnectionStage::Target { .. } => self.tr("connection-connecting-target"),
+                    ConnectionStage::Jump { index, total, .. } => SessionMessage::localized_with(
+                        "connection-connecting-jump",
+                        [("index", index.to_string()), ("total", total.to_string())],
+                    ),
+                    ConnectionStage::Target { .. } => {
+                        SessionMessage::localized("connection-connecting-target")
+                    }
                 };
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message);
@@ -7879,9 +8009,9 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::HostKeyVerificationRequired { stage, info } => {
-                let stage_label = connection_stage_label(&stage, &self.localizer);
                 if let Some(session) = self.session_mut(session_id) {
-                    session.connection_message = Some(format!("{stage_label}: {}", info.address()));
+                    session.connection_message =
+                        Some(SessionMessage::host_key_verification(stage, info.address()));
                     session.host_key_prompt = Some(info);
                 }
                 self.activate_session(session_id, cx);
@@ -8004,9 +8134,8 @@ impl RemCmdApp {
                     };
 
                 if !prompted_for_credential {
-                    let message = localized_connection_error(&error, &self.localizer);
                     if let Some(session) = self.session_mut(session_id) {
-                        session.connection_error = Some(message);
+                        session.connection_error = Some(SessionMessage::connection_error(&error));
                     }
                 }
                 true
@@ -8230,9 +8359,10 @@ impl RemCmdApp {
                 false
             }
             ConnectionEvent::Shell(ShellEvent::ExitStatus(status)) => {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("status", status);
-                let message = self.tr_with("terminal-remote-shell-status", &args);
+                let message = SessionMessage::localized_with(
+                    "terminal-remote-shell-status",
+                    [("status", status.to_string())],
+                );
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     session.terminal_end_reason = Some(message);
@@ -8244,18 +8374,21 @@ impl RemCmdApp {
                 core_dumped,
                 message,
             }) => {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("signal", signal);
-                args.set(
-                    "core",
-                    if core_dumped {
-                        self.tr("terminal-core-dumped")
-                    } else {
-                        String::new()
-                    },
+                let message = SessionMessage::localized_with_args(
+                    "terminal-remote-shell-signal",
+                    [
+                        ("signal", SessionMessageArg::Text(signal)),
+                        (
+                            "core",
+                            if core_dumped {
+                                SessionMessageArg::Localized("terminal-core-dumped")
+                            } else {
+                                SessionMessageArg::Text(String::new())
+                            },
+                        ),
+                        ("message", SessionMessageArg::Text(message)),
+                    ],
                 );
-                args.set("message", message);
-                let message = self.tr_with("terminal-remote-shell-signal", &args);
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     session.terminal_end_reason = Some(message);
@@ -8263,7 +8396,7 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Eof) => {
-                let message = self.tr("terminal-remote-shell-eof");
+                let message = SessionMessage::localized("terminal-remote-shell-eof");
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     if session.terminal_end_reason.is_none() {
@@ -8273,7 +8406,7 @@ impl RemCmdApp {
                 true
             }
             ConnectionEvent::Shell(ShellEvent::Closed) => {
-                let message = self.tr("terminal-remote-shell-closed");
+                let message = SessionMessage::localized("terminal-remote-shell-closed");
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message.clone());
                     if session.terminal_end_reason.is_none() {
@@ -8332,14 +8465,16 @@ impl RemCmdApp {
             LocalTerminalEvent::Exited { exit_code, signal } => {
                 let message = signal.map_or_else(
                     || {
-                        let mut args = fluent_bundle::FluentArgs::new();
-                        args.set("status", exit_code);
-                        self.tr_with("terminal-local-shell-status", &args)
+                        SessionMessage::localized_with(
+                            "terminal-local-shell-status",
+                            [("status", exit_code.to_string())],
+                        )
                     },
                     |signal| {
-                        let mut args = fluent_bundle::FluentArgs::new();
-                        args.set("signal", signal);
-                        self.tr_with("terminal-local-shell-signal", &args)
+                        SessionMessage::localized_with(
+                            "terminal-local-shell-signal",
+                            [("signal", signal)],
+                        )
                     },
                 );
                 let should_remove = {
@@ -8366,7 +8501,7 @@ impl RemCmdApp {
                     session.connection_state = SessionState::Failed;
                     session.local_terminal_handle = None;
                     session.terminal_resize_task = None;
-                    session.connection_error = Some(error.to_string());
+                    session.connection_error = Some(error.to_string().into());
                     session.close_when_disconnected
                 };
                 if should_remove {
@@ -8831,12 +8966,12 @@ impl RemCmdApp {
         for (index, entry) in entries.into_iter().enumerate() {
             popup = match entry {
                 WindowsMenuEntry::Item {
-                    label,
+                    label_key,
                     shortcut,
                     command,
                 } => popup.child(self.render_windows_menu_item(
                     SharedString::from(format!("windows-menu-entry-{menu:?}-{index}")),
-                    windows_menu_label(&self.localizer, label).into(),
+                    self.localizer.text(label_key).into(),
                     shortcut,
                     command,
                     cx,
@@ -10504,11 +10639,11 @@ impl RemCmdApp {
         let session = self.session(session_id);
         let (message, color) =
             if let Some(error) = session.and_then(|session| session.connection_error.as_ref()) {
-                (error.clone(), self.theme.error_text)
+                (error.render(&self.localizer), self.theme.error_text)
             } else if let Some(message) =
                 session.and_then(|session| session.terminal_end_reason.as_ref())
             {
-                (message.clone(), self.theme.text_muted)
+                (message.render(&self.localizer), self.theme.text_muted)
             } else {
                 (self.tr("terminal-session-ended"), self.theme.text_muted)
             };
@@ -12141,7 +12276,7 @@ impl RemCmdApp {
                 .connection_error
                 .as_ref()
                 .or(session.terminal_end_reason.as_ref())
-                .cloned()
+                .map(|message| message.render(&self.localizer))
         });
         let terminal = self.render_terminal_session_view(
             session_id,
@@ -12538,7 +12673,7 @@ impl RemCmdApp {
                                         .max_w(px(520.0))
                                         .text_sm()
                                         .text_color(self.theme.error_text)
-                                        .child(error.clone()),
+                                        .child(error.render(&self.localizer)),
                                 )
                             },
                         ),
@@ -16134,7 +16269,16 @@ fn connection_stage_label(stage: &ConnectionStage, localizer: &Localizer) -> Str
 }
 
 fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String {
-    let (summary_key, suggestion_key) = match error.kind() {
+    localized_connection_error_parts(error.kind(), error.message(), error.stage(), localizer)
+}
+
+fn localized_connection_error_parts(
+    kind: SshErrorKind,
+    details: &str,
+    stage: Option<&ConnectionStage>,
+    localizer: &Localizer,
+) -> String {
+    let (summary_key, suggestion_key) = match kind {
         SshErrorKind::InvalidState | SshErrorKind::Configuration => (
             "connection-error-summary-configuration",
             "connection-error-suggestion-configuration",
@@ -16180,7 +16324,7 @@ fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String
         ),
     };
     let summary = localizer.text(summary_key);
-    let headline = error.stage().map_or_else(
+    let headline = stage.map_or_else(
         || summary.clone(),
         |stage| format!("{}: {summary}", connection_stage_label(stage, localizer)),
     );
@@ -16188,7 +16332,7 @@ fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String
         "{headline}\n{}\n{}: {}",
         localizer.text(suggestion_key),
         localizer.text("connection-technical-details"),
-        error.message()
+        details
     )
 }
 
@@ -16284,9 +16428,11 @@ fn windows_menu_popup_width(entries: &[WindowsMenuEntry], localizer: &Localizer)
         .iter()
         .filter_map(|entry| match entry {
             WindowsMenuEntry::Item {
-                label, shortcut, ..
+                label_key,
+                shortcut,
+                ..
             } => Some(
-                28.0 + estimated_windows_menu_text_width(&windows_menu_label(localizer, label))
+                28.0 + estimated_windows_menu_text_width(&localizer.text(label_key))
                     + if shortcut.is_empty() {
                         0.0
                     } else {
@@ -16297,44 +16443,6 @@ fn windows_menu_popup_width(entries: &[WindowsMenuEntry], localizer: &Localizer)
         })
         .fold(WINDOWS_MENU_MIN_WIDTH, f32::max)
         .ceil()
-}
-
-fn windows_menu_label(localizer: &Localizer, label: &str) -> String {
-    let key = match label {
-        "New Connection" => "menu-new-connection",
-        "New Local Terminal" => "menu-new-local-terminal",
-        "New SSH Terminal" => "menu-new-remote-terminal",
-        "Connect Selected Server" => "menu-connect",
-        "Disconnect Active Session" => "menu-disconnect",
-        "Settings" => "menu-settings",
-        "Exit" => "menu-exit",
-        "Undo" => "menu-undo",
-        "Redo" => "menu-redo",
-        "Cut" => "menu-cut",
-        "Copy" => "menu-copy",
-        "Paste" => "menu-paste",
-        "Select All" => "menu-select-all",
-        "Split Horizontally" => "menu-split-horizontal",
-        "Split Vertically" => "menu-split-vertical",
-        "Show Terminal" => "menu-show-terminal",
-        "Show Remote Files" => "menu-show-remote-files",
-        "Reset Terminal" => "menu-reset-terminal",
-        "Close Active Split" => "menu-close-active-split",
-        "Close Active Tab" => "menu-close-active-tab",
-        "Home" => "menu-home",
-        "Toggle Connections Sidebar" => "menu-toggle-connections-sidebar",
-        "Search Connections" => "menu-search-connections",
-        "Show Remote Files Sidebar" => "menu-show-remote-files-sidebar",
-        "Show Server Performance" => "menu-show-server-performance",
-        "Toggle Bottom Terminal" => "menu-toggle-bottom-terminal",
-        "Minimize" => "menu-minimize",
-        "Maximize or Restore" => "menu-maximize-restore",
-        "Toggle Full Screen" => "menu-fullscreen",
-        "Close Window" => "menu-close-window",
-        "About RemCmd" => "about-title",
-        _ => return label.to_owned(),
-    };
-    localizer.text(key)
 }
 
 fn estimated_windows_menu_text_width(text: &str) -> f32 {
@@ -16350,174 +16458,174 @@ fn windows_menu_entries(menu: WindowsMenu) -> Vec<WindowsMenuEntry> {
     match menu {
         WindowsMenu::File => vec![
             Item {
-                label: "New Connection",
+                label_key: "menu-new-connection",
                 shortcut: "Ctrl+N",
                 command: Command::NewConnection,
             },
             Item {
-                label: "New Local Terminal",
+                label_key: "menu-new-local-terminal",
                 shortcut: "Ctrl+T",
                 command: Command::NewLocalTerminal,
             },
             Item {
-                label: "New SSH Terminal",
+                label_key: "menu-new-remote-terminal",
                 shortcut: "Ctrl+Shift+T",
                 command: Command::NewRemoteTerminal,
             },
             Separator,
             Item {
-                label: "Connect Selected Server",
+                label_key: "menu-connect",
                 shortcut: "Ctrl+Enter",
                 command: Command::ConnectSelectedProfile,
             },
             Item {
-                label: "Disconnect Active Session",
+                label_key: "menu-disconnect",
                 shortcut: "Ctrl+Shift+X",
                 command: Command::DisconnectActiveSession,
             },
             Separator,
             Item {
-                label: "Settings",
+                label_key: "menu-settings",
                 shortcut: "Ctrl+,",
                 command: Command::ShowSettings,
             },
             Item {
-                label: "Exit",
+                label_key: "menu-exit",
                 shortcut: "Ctrl+Q",
                 command: Command::Quit,
             },
         ],
         WindowsMenu::Edit => vec![
             Item {
-                label: "Undo",
+                label_key: "menu-undo",
                 shortcut: "Ctrl+Z",
                 command: Command::Edit(EditCommand::Undo),
             },
             Item {
-                label: "Redo",
+                label_key: "menu-redo",
                 shortcut: "Ctrl+Y",
                 command: Command::Edit(EditCommand::Redo),
             },
             Separator,
             Item {
-                label: "Cut",
+                label_key: "menu-cut",
                 shortcut: "Ctrl+X",
                 command: Command::Edit(EditCommand::Cut),
             },
             Item {
-                label: "Copy",
+                label_key: "menu-copy",
                 shortcut: "Ctrl+C",
                 command: Command::Edit(EditCommand::Copy),
             },
             Item {
-                label: "Paste",
+                label_key: "menu-paste",
                 shortcut: "Ctrl+V",
                 command: Command::Edit(EditCommand::Paste),
             },
             Item {
-                label: "Select All",
+                label_key: "menu-select-all",
                 shortcut: "Ctrl+A",
                 command: Command::Edit(EditCommand::SelectAll),
             },
         ],
         WindowsMenu::Terminal => vec![
             Item {
-                label: "Split Horizontally",
+                label_key: "menu-split-horizontal",
                 shortcut: "Ctrl+D",
                 command: Command::SplitHorizontal,
             },
             Item {
-                label: "Split Vertically",
+                label_key: "menu-split-vertical",
                 shortcut: "Ctrl+Shift+D",
                 command: Command::SplitVertical,
             },
             Separator,
             Item {
-                label: "Show Terminal",
+                label_key: "menu-show-terminal",
                 shortcut: "Ctrl+1",
                 command: Command::ShowTerminalView,
             },
             Item {
-                label: "Show Remote Files",
+                label_key: "menu-show-remote-files",
                 shortcut: "Ctrl+2",
                 command: Command::ShowFilesView,
             },
             Separator,
             Item {
-                label: "Reset Terminal",
+                label_key: "menu-reset-terminal",
                 shortcut: "Ctrl+R",
                 command: Command::ResetActiveTerminal,
             },
             Item {
-                label: "Close Active Split",
+                label_key: "menu-close-active-split",
                 shortcut: "Ctrl+Alt+W",
                 command: Command::CloseActivePane,
             },
             Item {
-                label: "Close Active Tab",
+                label_key: "menu-close-active-tab",
                 shortcut: "Ctrl+Shift+W",
                 command: Command::CloseActiveTab,
             },
         ],
         WindowsMenu::View => vec![
             Item {
-                label: "Home",
+                label_key: "menu-home",
                 shortcut: "Ctrl+Shift+H",
                 command: Command::ShowHome,
             },
             Separator,
             Item {
-                label: "Toggle Connections Sidebar",
+                label_key: "menu-toggle-connections-sidebar",
                 shortcut: "Ctrl+Shift+S",
                 command: Command::ToggleLeftSidebar,
             },
             Item {
-                label: "Search Connections",
+                label_key: "menu-search-connections",
                 shortcut: "Ctrl+F",
                 command: Command::ToggleConnectionSearch,
             },
             Separator,
             Item {
-                label: "Show Remote Files Sidebar",
+                label_key: "menu-show-remote-files-sidebar",
                 shortcut: "Ctrl+Shift+F",
                 command: Command::ShowSftpSidebar,
             },
             Item {
-                label: "Show Server Performance",
+                label_key: "menu-show-server-performance",
                 shortcut: "Ctrl+Shift+P",
                 command: Command::ShowPerformanceSidebar,
             },
             Item {
-                label: "Toggle Bottom Terminal",
+                label_key: "menu-toggle-bottom-terminal",
                 shortcut: "Ctrl+J",
                 command: Command::ToggleBottomPanel,
             },
         ],
         WindowsMenu::Window => vec![
             Item {
-                label: "Minimize",
+                label_key: "menu-minimize",
                 shortcut: "",
                 command: Command::MinimizeWindow,
             },
             Item {
-                label: "Maximize or Restore",
+                label_key: "menu-maximize-restore",
                 shortcut: "",
                 command: Command::ZoomWindow,
             },
             Item {
-                label: "Toggle Full Screen",
+                label_key: "menu-fullscreen",
                 shortcut: "Ctrl+Alt+F",
                 command: Command::ToggleFullscreen,
             },
             Separator,
             Item {
-                label: "Close Window",
+                label_key: "menu-close-window",
                 shortcut: "Ctrl+W",
                 command: Command::CloseWindow,
             },
         ],
         WindowsMenu::Help => vec![Item {
-            label: "About RemCmd",
+            label_key: "about-title",
             shortcut: "",
             command: Command::ShowAbout,
         }],
@@ -17585,6 +17693,35 @@ mod tests {
     }
 
     #[test]
+    fn session_messages_localize_at_render_time() {
+        let message = SessionMessage::localized("terminal-session-disconnected");
+        let english = Localizer::new(LanguageMode::EnUs);
+        let chinese = Localizer::new(LanguageMode::ZhCn);
+
+        assert_eq!(
+            message.render(&english),
+            english.text("terminal-session-disconnected")
+        );
+        assert_eq!(
+            message.render(&chinese),
+            chinese.text("terminal-session-disconnected")
+        );
+        assert_ne!(message.render(&english), message.render(&chinese));
+    }
+
+    #[test]
+    fn connection_errors_relocalize_without_changing_technical_details() {
+        let error = SshError::new(SshErrorKind::Network, "connection-detail-canary");
+        let message = SessionMessage::connection_error(&error);
+        let english = message.render(&Localizer::new(LanguageMode::EnUs));
+        let chinese = message.render(&Localizer::new(LanguageMode::ZhCn));
+
+        assert_ne!(english, chinese);
+        assert!(english.contains("connection-detail-canary"));
+        assert!(chinese.contains("connection-detail-canary"));
+    }
+
+    #[test]
     fn application_menu_exposes_workspace_operations() {
         let menus = application_menus(&Localizer::new(LanguageMode::EnUs));
         let menu_names = menus
@@ -17627,13 +17764,15 @@ mod tests {
             let width = windows_menu_popup_width(&entries, &localizer);
             for entry in entries {
                 let WindowsMenuEntry::Item {
-                    label, shortcut, ..
+                    label_key,
+                    shortcut,
+                    ..
                 } = entry
                 else {
                     continue;
                 };
                 let required = 28.0
-                    + estimated_windows_menu_text_width(&windows_menu_label(&localizer, label))
+                    + estimated_windows_menu_text_width(&localizer.text(label_key))
                     + if shortcut.is_empty() {
                         0.0
                     } else {
@@ -17667,7 +17806,7 @@ mod tests {
         assert_eq!(
             help_entries,
             vec![WindowsMenuEntry::Item {
-                label: "About RemCmd",
+                label_key: "about-title",
                 shortcut: "",
                 command: WindowsMenuCommand::ShowAbout,
             }]
@@ -17714,16 +17853,17 @@ mod tests {
             assert!(width >= WINDOWS_MENU_MIN_WIDTH);
             for entry in entries {
                 let WindowsMenuEntry::Item {
-                    label, shortcut, ..
+                    label_key,
+                    shortcut,
+                    ..
                 } = entry
                 else {
                     continue;
                 };
                 let required =
-                    28.0 + estimated_windows_menu_text_width(&windows_menu_label(
-                        &Localizer::new(LanguageMode::EnUs),
-                        label,
-                    )) + if shortcut.is_empty() {
+                    28.0 + estimated_windows_menu_text_width(
+                        &Localizer::new(LanguageMode::EnUs).text(label_key),
+                    ) + if shortcut.is_empty() {
                         0.0
                     } else {
                         20.0 + estimated_windows_menu_text_width(shortcut)
