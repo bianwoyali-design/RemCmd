@@ -13191,6 +13191,8 @@ impl RemCmdApp {
                     .px(px(10.0))
                     .rounded_lg()
                     .bg(self.theme.settings_group_bg)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
                     .hover(|this| this.bg(self.theme.control_hover_bg))
                     .child(self.tr("diagnostics-title"))
@@ -13375,6 +13377,17 @@ impl RemCmdApp {
             &self.theme,
         )
         .on_click(cx.listener(|this, _, _, cx| this.export_support_bundle(cx)));
+        let back = self
+            .render_icon_button(
+                "diagnostics-back-to-settings",
+                IconName::ArrowLeft,
+                self.tr("settings-back"),
+                IconTone::Default,
+                true,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_settings(window, cx);
+            }));
 
         self.detail_panel_shell().child(
             div()
@@ -13390,10 +13403,12 @@ impl RemCmdApp {
                         .items_center()
                         .justify_between()
                         .child(
-                            div()
-                                .text_xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(self.tr("diagnostics-title")),
+                            div().flex().items_center().gap_2().child(back).child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.tr("diagnostics-title")),
+                            ),
                         )
                         .child(div().flex().gap_2().child(open).child(clear).child(export)),
                 )
@@ -18860,7 +18875,8 @@ mod tests {
     fn bottom_panel_height_preserves_main_content() {
         assert_eq!(clamp_bottom_panel_height(80.0, 720.0), 140.0);
         assert_eq!(clamp_bottom_panel_height(600.0, 720.0), 520.0);
-        assert_eq!(clamp_bottom_panel_height(400.0, 480.0), 328.0);
+        let panel_height = clamp_bottom_panel_height(400.0, 480.0);
+        assert_eq!(480.0 - content_top_inset() - panel_height, 100.0);
     }
 
     #[test]
