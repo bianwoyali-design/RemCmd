@@ -15,9 +15,10 @@ use tokio::{
 };
 
 use crate::{
-    AuthMethod, HostKeyInfo, PtySize, RemoteDirectory, RemoteDirectoryTree, RemoteFile,
-    RemoteFileKind, SessionState, SftpOperation, SftpTransferDirection, ShellEvent, SshError,
-    SshErrorKind, SshSession, SshShellWriter, SshTransport, TransferRateLimiter,
+    AuthMethod, AuthMethodKind, ConnectionPlan, ConnectionStage, HostKeyInfo, PtySize,
+    RemoteDirectory, RemoteDirectoryTree, RemoteFile, RemoteFileKind, SessionState, SftpOperation,
+    SftpTransferDirection, ShellEvent, SshError, SshErrorKind, SshSession, SshShellWriter,
+    SshTransport, TransferRateLimiter,
     host_key::HostKeyDecision,
     performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
     sftp::SftpWorkerHandle,
@@ -97,8 +98,20 @@ pub enum ConnectionEvent {
     /// Reports a successful lifecycle transition.
     StateChanged(SessionState),
 
+    /// Identifies the proxy, jump, or target currently being established.
+    ConnectionStageChanged(ConnectionStage),
+
+    /// Reports independent authentication success for one SSH step.
+    AuthenticationSucceeded {
+        stage: ConnectionStage,
+        method: AuthMethodKind,
+    },
+
     /// Pauses the SSH handshake until the user verifies an unknown server key.
-    HostKeyVerificationRequired(HostKeyInfo),
+    HostKeyVerificationRequired {
+        stage: ConnectionStage,
+        info: HostKeyInfo,
+    },
 
     /// Confirms that the remote PTY accepted a terminal resize.
     Resized(PtySize),
@@ -405,14 +418,36 @@ impl SshConnection {
         initial_size: PtySize,
         transfer_rate_limiter: Arc<TransferRateLimiter>,
     ) -> Self {
+        Self::spawn_plan_with_transfer_rate_limiter(
+            runtime,
+            ConnectionPlan::direct(profile, auth),
+            initial_size,
+            transfer_rate_limiter,
+        )
+    }
+
+    pub fn spawn_plan(runtime: &Handle, plan: ConnectionPlan, initial_size: PtySize) -> Self {
+        Self::spawn_plan_with_transfer_rate_limiter(
+            runtime,
+            plan,
+            initial_size,
+            Arc::new(TransferRateLimiter::default()),
+        )
+    }
+
+    pub fn spawn_plan_with_transfer_rate_limiter(
+        runtime: &Handle,
+        plan: ConnectionPlan,
+        initial_size: PtySize,
+        transfer_rate_limiter: Arc<TransferRateLimiter>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (host_key_decision_tx, host_key_decision_rx) = mpsc::unbounded_channel();
         let host_key_verification_pending = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        runtime.spawn(run_connection(
-            profile,
-            auth,
+        runtime.spawn(run_connection_plan(
+            plan,
             initial_size,
             ConnectionWorkerContext {
                 commands: command_rx,
@@ -564,9 +599,8 @@ fn coalesce_queued_resizes(
     (latest_size, None)
 }
 
-async fn run_connection(
-    profile: ConnectionProfile,
-    auth: AuthMethod,
+async fn run_connection_plan(
+    plan: ConnectionPlan,
     mut latest_size: PtySize,
     context: ConnectionWorkerContext,
 ) {
@@ -577,7 +611,8 @@ async fn run_connection(
         events,
         transfer_rate_limiter,
     } = context;
-    let mut session = SshSession::new(profile.clone());
+    let target_profile = plan.target_profile().clone();
+    let mut session = SshSession::new(target_profile.clone());
 
     if let Err(error) = session.begin_connect() {
         report_failure(&mut session, error, &events).await;
@@ -588,106 +623,240 @@ async fn run_connection(
         return;
     }
 
-    let mut transport = loop {
+    if let Err(error) = plan.validate() {
+        report_failure(&mut session, error, &events).await;
+        return;
+    }
+    let (target, jumps, proxy) = plan.into_parts();
+    let jump_total = jumps.len();
+    let mut steps = jumps
+        .into_iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let stage = ConnectionStage::Jump {
+                index: index + 1,
+                total: jump_total,
+                profile_id: step.profile.id.clone(),
+            };
+            (step, stage)
+        })
+        .collect::<Vec<_>>();
+    steps.push((
+        target,
+        ConnectionStage::Target {
+            profile_id: target_profile.id.clone(),
+        },
+    ));
+
+    let mut established: Vec<SshTransport> = Vec::new();
+    let mut authentication_started = false;
+    for (step_index, (step, stage)) in steps.into_iter().enumerate() {
+        let stage_started_at = Instant::now();
+        let crate::ConnectionStep { profile, auth } = step;
+        if step_index == 0
+            && proxy.is_some()
+            && events
+                .send(ConnectionEvent::ConnectionStageChanged(
+                    ConnectionStage::Proxy,
+                ))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if events
+            .send(ConnectionEvent::ConnectionStageChanged(stage.clone()))
+            .await
+            .is_err()
+        {
+            SshTransport::disconnect_established(&established).await;
+            return;
+        }
+
+        let mut transport = loop {
+            let opened = if step_index == 0 {
+                wait_for_operation(
+                    SshTransport::open_first(&profile, proxy.as_ref()),
+                    &mut commands,
+                    &mut latest_size,
+                )
+                .await
+            } else {
+                wait_for_operation(
+                    established
+                        .last()
+                        .expect("a previous jump transport exists")
+                        .open_via(&profile),
+                    &mut commands,
+                    &mut latest_size,
+                )
+                .await
+            };
+            match opened {
+                PendingResult::Completed(Ok(TransportOpen::Connected(transport))) => {
+                    break transport;
+                }
+                PendingResult::Completed(Ok(TransportOpen::UnknownHostKey(pending))) => {
+                    host_key_verification_pending.store(true, Ordering::Release);
+                    if events
+                        .send(ConnectionEvent::HostKeyVerificationRequired {
+                            stage: stage.clone(),
+                            info: pending.info().clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        host_key_verification_pending.store(false, Ordering::Release);
+                        SshTransport::disconnect_established(&established).await;
+                        return;
+                    }
+
+                    let decision = wait_for_host_key_decision(
+                        &mut host_key_decisions,
+                        &mut commands,
+                        &mut latest_size,
+                    )
+                    .await;
+                    host_key_verification_pending.store(false, Ordering::Release);
+
+                    match decision {
+                        PendingResult::Completed(Ok(HostKeyDecision::Trust)) => {
+                            match wait_for_operation(
+                                pending.trust(),
+                                &mut commands,
+                                &mut latest_size,
+                            )
+                            .await
+                            {
+                                PendingResult::Completed(Ok(())) => continue,
+                                PendingResult::Completed(Err(error)) => {
+                                    SshTransport::disconnect_established(&established).await;
+                                    report_failure(
+                                        &mut session,
+                                        error.at_stage(stage.clone()),
+                                        &events,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                PendingResult::Disconnect => {
+                                    SshTransport::disconnect_established(&established).await;
+                                    finish_disconnection(&mut session, None, None, &events).await;
+                                    return;
+                                }
+                            }
+                        }
+                        PendingResult::Completed(Ok(HostKeyDecision::Reject)) => {
+                            SshTransport::disconnect_established(&established).await;
+                            report_failure(
+                                &mut session,
+                                pending.rejected_error().at_stage(stage.clone()),
+                                &events,
+                            )
+                            .await;
+                            return;
+                        }
+                        PendingResult::Completed(Err(error)) => {
+                            SshTransport::disconnect_established(&established).await;
+                            report_failure(&mut session, error.at_stage(stage.clone()), &events)
+                                .await;
+                            return;
+                        }
+                        PendingResult::Disconnect => {
+                            SshTransport::disconnect_established(&established).await;
+                            finish_disconnection(&mut session, None, None, &events).await;
+                            return;
+                        }
+                    }
+                }
+                PendingResult::Completed(Err(error)) => {
+                    SshTransport::disconnect_established(&established).await;
+                    report_failure(&mut session, error.at_stage(stage.clone()), &events).await;
+                    return;
+                }
+                PendingResult::Disconnect => {
+                    SshTransport::disconnect_established(&established).await;
+                    finish_disconnection(&mut session, None, None, &events).await;
+                    return;
+                }
+            }
+        };
+        tracing::info!(
+            stage = connection_stage_name(&stage),
+            elapsed_ms = stage_started_at.elapsed().as_millis() as u64,
+            result = "success",
+            "SSH transport established"
+        );
+
+        if !authentication_started {
+            if let Err(error) = session.begin_authentication() {
+                let _ = transport.disconnect().await;
+                SshTransport::disconnect_established(&established).await;
+                report_failure(&mut session, error, &events).await;
+                return;
+            }
+            authentication_started = true;
+            if !send_state(&events, SessionState::Authenticating).await {
+                let _ = transport.disconnect().await;
+                SshTransport::disconnect_established(&established).await;
+                return;
+            }
+        }
+
+        let auth_kind = auth.kind();
+        let authentication_started_at = Instant::now();
         match wait_for_operation(
-            SshTransport::open(&profile),
+            transport.authenticate(profile.username.as_str(), auth),
             &mut commands,
             &mut latest_size,
         )
         .await
         {
-            PendingResult::Completed(Ok(TransportOpen::Connected(transport))) => break transport,
-            PendingResult::Completed(Ok(TransportOpen::UnknownHostKey(pending))) => {
-                host_key_verification_pending.store(true, Ordering::Release);
+            PendingResult::Completed(Ok(())) => {
+                tracing::info!(
+                    stage = connection_stage_name(&stage),
+                    authentication = ?auth_kind,
+                    elapsed_ms = authentication_started_at.elapsed().as_millis() as u64,
+                    result = "success",
+                    "SSH authentication completed"
+                );
                 if events
-                    .send(ConnectionEvent::HostKeyVerificationRequired(
-                        pending.info().clone(),
-                    ))
+                    .send(ConnectionEvent::AuthenticationSucceeded {
+                        stage: stage.clone(),
+                        method: auth_kind,
+                    })
                     .await
                     .is_err()
                 {
-                    host_key_verification_pending.store(false, Ordering::Release);
+                    let _ = transport.disconnect().await;
+                    SshTransport::disconnect_established(&established).await;
                     return;
-                }
-
-                let decision = wait_for_host_key_decision(
-                    &mut host_key_decisions,
-                    &mut commands,
-                    &mut latest_size,
-                )
-                .await;
-                host_key_verification_pending.store(false, Ordering::Release);
-
-                match decision {
-                    PendingResult::Completed(Ok(HostKeyDecision::Trust)) => {
-                        match wait_for_operation(pending.trust(), &mut commands, &mut latest_size)
-                            .await
-                        {
-                            PendingResult::Completed(Ok(())) => continue,
-                            PendingResult::Completed(Err(error)) => {
-                                report_failure(&mut session, error, &events).await;
-                                return;
-                            }
-                            PendingResult::Disconnect => {
-                                finish_disconnection(&mut session, None, None, &events).await;
-                                return;
-                            }
-                        }
-                    }
-                    PendingResult::Completed(Ok(HostKeyDecision::Reject)) => {
-                        report_failure(&mut session, pending.rejected_error(), &events).await;
-                        return;
-                    }
-                    PendingResult::Completed(Err(error)) => {
-                        report_failure(&mut session, error, &events).await;
-                        return;
-                    }
-                    PendingResult::Disconnect => {
-                        finish_disconnection(&mut session, None, None, &events).await;
-                        return;
-                    }
                 }
             }
             PendingResult::Completed(Err(error)) => {
-                report_failure(&mut session, error, &events).await;
+                tracing::warn!(
+                    stage = connection_stage_name(&stage),
+                    authentication = ?auth_kind,
+                    elapsed_ms = authentication_started_at.elapsed().as_millis() as u64,
+                    result = "failed",
+                    "SSH authentication failed"
+                );
+                let _ = transport.disconnect().await;
+                SshTransport::disconnect_established(&established).await;
+                report_failure(&mut session, error.at_stage(stage), &events).await;
                 return;
             }
             PendingResult::Disconnect => {
+                let _ = transport.disconnect().await;
+                SshTransport::disconnect_established(&established).await;
                 finish_disconnection(&mut session, None, None, &events).await;
                 return;
             }
         }
-    };
-
-    if let Err(error) = session.begin_authentication() {
-        report_failure(&mut session, error, &events).await;
-        let _ = transport.disconnect().await;
-        return;
+        established.push(transport);
     }
 
-    if !send_state(&events, SessionState::Authenticating).await {
-        let _ = transport.disconnect().await;
-        return;
-    }
-
-    match wait_for_operation(
-        transport.authenticate(profile.username.as_str(), auth),
-        &mut commands,
-        &mut latest_size,
-    )
-    .await
-    {
-        PendingResult::Completed(Ok(())) => {}
-        PendingResult::Completed(Err(error)) => {
-            report_failure(&mut session, error, &events).await;
-            let _ = transport.disconnect().await;
-            return;
-        }
-        PendingResult::Disconnect => {
-            finish_disconnection(&mut session, Some(&transport), None, &events).await;
-            return;
-        }
-    }
+    let transport = SshTransport::combine_chain(established);
 
     let requested_size = latest_size;
     let shell = match wait_for_operation(
@@ -1380,8 +1549,21 @@ async fn report_failure(
     error: SshError,
     events: &mpsc::Sender<ConnectionEvent>,
 ) {
+    tracing::warn!(
+        stage = error.stage().map(connection_stage_name).unwrap_or("unknown"),
+        error_kind = ?error.kind(),
+        "SSH connection failed"
+    );
     session.mark_failed(error.clone());
     let _ = events.send(ConnectionEvent::Failed(error)).await;
+}
+
+fn connection_stage_name(stage: &ConnectionStage) -> &'static str {
+    match stage {
+        ConnectionStage::Proxy => "proxy",
+        ConnectionStage::Jump { .. } => "jump",
+        ConnectionStage::Target { .. } => "target",
+    }
 }
 
 async fn finish_disconnection(

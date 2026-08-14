@@ -8,6 +8,8 @@ const KEYRING_SERVICE: &str = "dev.remcmd.ssh-credentials";
 pub enum CredentialKind {
     Password,
     PrivateKeyPassphrase,
+    ProxyPassword,
+    ProxyCommand,
 }
 
 impl CredentialKind {
@@ -15,6 +17,8 @@ impl CredentialKind {
         match self {
             Self::Password => "password",
             Self::PrivateKeyPassphrase => "private-key-passphrase",
+            Self::ProxyPassword => "proxy-password",
+            Self::ProxyCommand => "proxy-command",
         }
     }
 }
@@ -25,7 +29,7 @@ pub struct CredentialStoreError {
 }
 
 impl CredentialStoreError {
-    fn new(operation: &str, error: impl fmt::Display) -> Self {
+    pub(crate) fn new(operation: &str, error: impl fmt::Display) -> Self {
         Self {
             message: format!("Failed to {operation} a credential in the system keychain: {error}"),
         }
@@ -78,17 +82,34 @@ pub fn delete_profile_credentials(profile_id: &str) -> Result<(), CredentialStor
     delete_profile_with(&SystemCredentialBackend, profile_id)
 }
 
+pub fn delete_profile_auth_credentials(profile_id: &str) -> Result<(), CredentialStoreError> {
+    let mut first_error = None;
+    for kind in [
+        CredentialKind::Password,
+        CredentialKind::PrivateKeyPassphrase,
+    ] {
+        match delete_with(&SystemCredentialBackend, profile_id, kind) {
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Ok(()) | Err(_) => {}
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 fn credential_account(profile_id: &str, kind: CredentialKind) -> String {
     format!("profile:{profile_id}:{}", kind.account_suffix())
 }
 
-trait CredentialBackend {
+pub(crate) trait CredentialBackend {
     fn load(&self, account: &str) -> Result<Option<String>, CredentialStoreError>;
     fn save(&self, account: &str, secret: &str) -> Result<(), CredentialStoreError>;
     fn delete(&self, account: &str) -> Result<(), CredentialStoreError>;
 }
 
-fn load_with(
+pub(crate) fn load_with(
     backend: &impl CredentialBackend,
     profile_id: &str,
     kind: CredentialKind,
@@ -98,7 +119,7 @@ fn load_with(
         .map(|secret| secret.map(|secret| SecretString::new(secret.into_boxed_str())))
 }
 
-fn save_with(
+pub(crate) fn save_with(
     backend: &impl CredentialBackend,
     profile_id: &str,
     kind: CredentialKind,
@@ -110,7 +131,7 @@ fn save_with(
     )
 }
 
-fn delete_with(
+pub(crate) fn delete_with(
     backend: &impl CredentialBackend,
     profile_id: &str,
     kind: CredentialKind,
@@ -122,13 +143,26 @@ fn delete_profile_with(
     backend: &impl CredentialBackend,
     profile_id: &str,
 ) -> Result<(), CredentialStoreError> {
-    let password_result = delete_with(backend, profile_id, CredentialKind::Password);
-    let passphrase_result = delete_with(backend, profile_id, CredentialKind::PrivateKeyPassphrase);
+    let mut first_error = None;
+    for kind in [
+        CredentialKind::Password,
+        CredentialKind::PrivateKeyPassphrase,
+        CredentialKind::ProxyPassword,
+        CredentialKind::ProxyCommand,
+    ] {
+        match delete_with(backend, profile_id, kind) {
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Ok(()) | Err(_) => {}
+        }
+    }
 
-    password_result.and(passphrase_result)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
-struct SystemCredentialBackend;
+pub(crate) struct SystemCredentialBackend;
 
 #[cfg(any(
     target_os = "macos",
@@ -249,29 +283,27 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_profile_removes_both_credential_kinds() {
+    fn deleting_a_profile_removes_every_credential_kind() {
         let backend = MemoryBackend::default();
         let secret = SecretString::new("test-only-secret".into());
-        save_with(&backend, "server-1", CredentialKind::Password, &secret).unwrap();
-        save_with(
-            &backend,
-            "server-1",
+        for kind in [
+            CredentialKind::Password,
             CredentialKind::PrivateKeyPassphrase,
-            &secret,
-        )
-        .unwrap();
+            CredentialKind::ProxyPassword,
+            CredentialKind::ProxyCommand,
+        ] {
+            save_with(&backend, "server-1", kind, &secret).unwrap();
+        }
 
         delete_profile_with(&backend, "server-1").unwrap();
 
-        assert!(
-            load_with(&backend, "server-1", CredentialKind::Password)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            load_with(&backend, "server-1", CredentialKind::PrivateKeyPassphrase,)
-                .unwrap()
-                .is_none()
-        );
+        for kind in [
+            CredentialKind::Password,
+            CredentialKind::PrivateKeyPassphrase,
+            CredentialKind::ProxyPassword,
+            CredentialKind::ProxyCommand,
+        ] {
+            assert!(load_with(&backend, "server-1", kind).unwrap().is_none());
+        }
     }
 }

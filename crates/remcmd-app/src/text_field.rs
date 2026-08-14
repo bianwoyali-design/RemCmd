@@ -132,6 +132,16 @@ impl TextField {
         cx.notify();
     }
 
+    pub fn replace_all(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
+        self.content.zeroize();
+        self.content = value.into();
+        let cursor = self.content.len();
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);

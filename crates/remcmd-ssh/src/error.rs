@@ -5,6 +5,9 @@ pub enum SshErrorKind {
     InvalidState,
     Configuration,
     Network,
+    Proxy,
+    ProxyAuthentication,
+    ProxyCommandApproval,
     HostKeyUntrusted,
     HostKeyChanged,
     HostKeyPersistence,
@@ -20,6 +23,7 @@ pub enum SshErrorKind {
 pub struct SshError {
     kind: SshErrorKind,
     message: String,
+    stage: Option<crate::ConnectionStage>,
 }
 
 impl SshError {
@@ -27,6 +31,7 @@ impl SshError {
         Self {
             kind,
             message: message.into(),
+            stage: None,
         }
     }
 
@@ -36,6 +41,17 @@ impl SshError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn stage(&self) -> Option<&crate::ConnectionStage> {
+        self.stage.as_ref()
+    }
+
+    pub fn at_stage(mut self, stage: crate::ConnectionStage) -> Self {
+        if self.stage.is_none() {
+            self.stage = Some(stage);
+        }
+        self
     }
 }
 
