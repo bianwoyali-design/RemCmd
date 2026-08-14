@@ -11,6 +11,8 @@ pub struct ConnectionProfile {
     pub username: String,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub route: ConnectionRoute,
 }
 
 impl ConnectionProfile {
@@ -28,6 +30,7 @@ impl ConnectionProfile {
             port,
             username: username.into(),
             auth: AuthConfig::default(),
+            route: ConnectionRoute::default(),
         }
     }
 
@@ -41,6 +44,43 @@ impl ConnectionProfile {
     pub fn address(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ConnectionRoute {
+    #[serde(default)]
+    pub upstream_proxy: Option<ProxyConfig>,
+    #[serde(default)]
+    pub jump_host_ids: Vec<String>,
+}
+
+impl ConnectionRoute {
+    pub fn is_direct(&self) -> bool {
+        self.upstream_proxy.is_none() && self.jump_host_ids.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProxyConfig {
+    HttpConnect {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        username: Option<String>,
+    },
+    Socks5 {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        username: Option<String>,
+    },
+    ProxyCommand {
+        #[serde(default)]
+        command_digest: String,
+        #[serde(default)]
+        approved_digest: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -183,6 +223,26 @@ mod tests {
             serde_json::from_str(json).expect("old profile should remain valid");
 
         assert_eq!(profile.auth, AuthConfig::Password);
+        assert!(profile.route.is_direct());
+    }
+
+    #[test]
+    fn routed_profile_round_trip_never_contains_proxy_secrets() {
+        let mut profile = ConnectionProfile::new("server-1", "Server", "host", 22, "user");
+        profile.route = ConnectionRoute {
+            upstream_proxy: Some(ProxyConfig::ProxyCommand {
+                command_digest: "command-digest".into(),
+                approved_digest: Some("sha256:example".into()),
+            }),
+            jump_host_ids: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let decoded: ConnectionProfile = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, profile);
+        assert!(!json.contains("proxy-password"));
+        assert!(!json.contains("ProxyCommand nc"));
     }
 
     #[test]

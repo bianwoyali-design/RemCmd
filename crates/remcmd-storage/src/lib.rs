@@ -1,5 +1,6 @@
 use std::{
     fs, io,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -7,11 +8,12 @@ use directories::ProjectDirs;
 use remcmd_core::{
     ConnectionProfile, LanguageMode, TabLayout, TerminalSettings, ThemeMode, TransferSettings,
 };
+use secrecy::SecretString;
 
 mod credentials;
 pub use credentials::{
-    CredentialKind, CredentialStoreError, delete_credential, delete_profile_credentials,
-    load_credential, save_credential,
+    CredentialKind, CredentialStoreError, delete_credential, delete_profile_auth_credentials,
+    delete_profile_credentials, load_credential, save_credential,
 };
 
 pub fn default_profiles_path() -> io::Result<PathBuf> {
@@ -71,12 +73,58 @@ pub fn load_profiles(path: &Path) -> io::Result<Vec<ConnectionProfile>> {
 }
 
 pub fn save_profiles(path: &Path, profiles: &[ConnectionProfile]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let content = serde_json::to_string_pretty(profiles).map_err(io::Error::other)?;
-    fs::write(path, content)
+    atomic_write(path, content.as_bytes())
+}
+
+pub fn save_profiles_with_route_secrets(
+    path: &Path,
+    profiles: &[ConnectionProfile],
+    profile_id: &str,
+    proxy_password: Option<&SecretString>,
+    proxy_command: Option<&SecretString>,
+) -> io::Result<()> {
+    let before_password =
+        load_credential(profile_id, CredentialKind::ProxyPassword).map_err(io::Error::other)?;
+    let before_command =
+        load_credential(profile_id, CredentialKind::ProxyCommand).map_err(io::Error::other)?;
+
+    let apply_secret = |kind, secret: Option<&SecretString>| match secret {
+        Some(secret) => save_credential(profile_id, kind, secret),
+        None => delete_credential(profile_id, kind),
+    };
+    if let Err(error) = apply_secret(CredentialKind::ProxyPassword, proxy_password) {
+        return Err(io::Error::other(error));
+    }
+    if let Err(error) = apply_secret(CredentialKind::ProxyCommand, proxy_command) {
+        restore_route_secret(
+            profile_id,
+            CredentialKind::ProxyPassword,
+            before_password.as_ref(),
+        );
+        return Err(io::Error::other(error));
+    }
+    if let Err(error) = save_profiles(path, profiles) {
+        restore_route_secret(
+            profile_id,
+            CredentialKind::ProxyCommand,
+            before_command.as_ref(),
+        );
+        restore_route_secret(
+            profile_id,
+            CredentialKind::ProxyPassword,
+            before_password.as_ref(),
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn restore_route_secret(profile_id: &str, kind: CredentialKind, secret: Option<&SecretString>) {
+    let _ = match secret {
+        Some(secret) => save_credential(profile_id, kind, secret),
+        None => delete_credential(profile_id, kind),
+    };
 }
 
 pub fn load_settings(path: &Path) -> io::Result<AppSettings> {
@@ -94,12 +142,22 @@ pub fn load_settings(path: &Path) -> io::Result<AppSettings> {
 }
 
 pub fn save_settings(path: &Path, settings: &AppSettings) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let content = serde_json::to_string_pretty(settings).map_err(io::Error::other)?;
-    fs::write(path, content)
+    atomic_write(path, content.as_bytes())
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(content)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]

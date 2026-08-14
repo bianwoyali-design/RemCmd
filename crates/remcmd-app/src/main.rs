@@ -69,25 +69,27 @@ use gpui::{
     WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, point,
     prelude::*, px, rgb, size, uniform_list,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use remcmd_core::{
-    AuthConfig, ConnectionProfile, LanguageMode, TabLayout, TerminalSettings, ThemeMode,
-    TransferSettings,
+    AuthConfig, ConnectionProfile, ConnectionRoute, LanguageMode, ProxyConfig, TabLayout,
+    TerminalSettings, ThemeMode, TransferSettings,
 };
 use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 #[cfg(test)]
 use remcmd_ssh::LogicalCpuSnapshot;
 use remcmd_ssh::{
-    AuthMethod, ConnectionEvent, ConnectionHandle, HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize,
-    RemoteDirectory, RemoteDirectoryTree, RemoteFile, RemoteFileEntry, RemoteFileKind,
-    ServerPerformanceSnapshot, SessionState, SftpOperation, SftpTransferDirection, ShellEvent,
-    SshConnection, SshError, SshErrorKind, TransferRateLimiter,
+    AuthMethod, ConnectionEvent, ConnectionHandle, ConnectionPlan, ConnectionStage, ConnectionStep,
+    HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize, RemoteDirectory, RemoteDirectoryTree, RemoteFile,
+    RemoteFileEntry, RemoteFileKind, RuntimeProxy, ServerPerformanceSnapshot, SessionState,
+    SftpOperation, SftpTransferDirection, ShellEvent, SshConnection, SshError, SshErrorKind,
+    TransferRateLimiter, proxy_command_content_digest,
 };
 use remcmd_storage::{
     AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
-    delete_profile_credentials, ensure_profiles_file, load_credential, load_profiles,
-    load_settings, save_credential, save_profiles, save_settings,
+    delete_profile_auth_credentials, delete_profile_credentials, ensure_profiles_file,
+    load_credential, load_profiles, load_settings, save_credential, save_profiles,
+    save_profiles_with_route_secrets, save_settings,
 };
 use remcmd_terminal::{
     Clipboard as TerminalClipboard, Scroll as TerminalScroll, TerminalDamage, TerminalEngine,
@@ -245,6 +247,9 @@ struct RemCmdApp {
     credential_lookup_task: Option<Task<()>>,
     credential_lookup_session_id: Option<SessionId>,
     credential_mutations_in_progress: HashMap<String, usize>,
+    pending_connection: Option<PendingConnectionPreparation>,
+    pending_proxy_approval: HashSet<SessionId>,
+    proxy_command_approval_prompt: Option<ProxyCommandApprovalPrompt>,
     active_panel: ActivePanel,
     language_mode: LanguageMode,
     localizer: Localizer,
@@ -385,7 +390,7 @@ struct TerminalSession {
     terminal_selecting: bool,
     terminal_scroll_accumulator: f32,
     terminal_resize_task: Option<Task<()>>,
-    connection_credential: Option<ConnectionCredential>,
+    connection_credentials: Vec<ConnectionCredential>,
     sftp_availability: SftpAvailability,
     sftp: SftpBrowserState,
     sidebar_sftp: SftpBrowserState,
@@ -419,7 +424,7 @@ impl TerminalSession {
             terminal_selecting: false,
             terminal_scroll_accumulator: 0.0,
             terminal_resize_task: None,
-            connection_credential: None,
+            connection_credentials: Vec::new(),
             sftp_availability: SftpAvailability::Checking,
             sftp: SftpBrowserState::default(),
             sidebar_sftp: SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START),
@@ -2049,6 +2054,15 @@ struct ProfileEditor {
     username: Entity<TextField>,
     auth_kind: ProfileAuthKind,
     private_key_path: Entity<TextField>,
+    proxy_kind: ProfileProxyKind,
+    proxy_host: Entity<TextField>,
+    proxy_port: Entity<TextField>,
+    proxy_username: Entity<TextField>,
+    proxy_password: Entity<TextField>,
+    proxy_command: Entity<TextField>,
+    jump_search: Entity<TextField>,
+    jump_host_ids: Vec<String>,
+    proxy_secret_loaded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2063,6 +2077,41 @@ enum ProfileAuthKind {
     Password,
     PrivateKey,
     Agent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileProxyKind {
+    Direct,
+    HttpConnect,
+    Socks5,
+    ProxyCommand,
+}
+
+impl ProfileProxyKind {
+    const OPTIONS: [Self; 4] = [
+        Self::Direct,
+        Self::HttpConnect,
+        Self::Socks5,
+        Self::ProxyCommand,
+    ];
+
+    fn from_config(config: Option<&ProxyConfig>) -> Self {
+        match config {
+            None => Self::Direct,
+            Some(ProxyConfig::HttpConnect { .. }) => Self::HttpConnect,
+            Some(ProxyConfig::Socks5 { .. }) => Self::Socks5,
+            Some(ProxyConfig::ProxyCommand { .. }) => Self::ProxyCommand,
+        }
+    }
+
+    const fn label_key(self) -> &'static str {
+        match self {
+            Self::Direct => "profile-proxy-direct",
+            Self::HttpConnect => "profile-proxy-http",
+            Self::Socks5 => "profile-proxy-socks5",
+            Self::ProxyCommand => "profile-proxy-command",
+        }
+    }
 }
 
 impl ProfileAuthKind {
@@ -2110,10 +2159,11 @@ struct CredentialPrompt {
     error: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum CredentialPromptKind {
     Password,
     PrivateKeyPassphrase { path: PathBuf },
+    ProxyPassword,
 }
 
 impl CredentialPromptKind {
@@ -2121,6 +2171,7 @@ impl CredentialPromptKind {
         match self {
             Self::Password => CredentialKind::Password,
             Self::PrivateKeyPassphrase { .. } => CredentialKind::PrivateKeyPassphrase,
+            Self::ProxyPassword => CredentialKind::ProxyPassword,
         }
     }
 }
@@ -2136,6 +2187,27 @@ struct ConnectionCredential {
     kind: CredentialKind,
     source: CredentialSource,
     save_on_success: Option<secrecy::SecretString>,
+}
+
+struct PendingConnectionPreparation {
+    session_id: SessionId,
+    target_profile: ConnectionProfile,
+    steps: Vec<ConnectionProfile>,
+    next_step: usize,
+    prepared_steps: Vec<ConnectionStep>,
+    credentials: Vec<ConnectionCredential>,
+    runtime_proxy: Option<RuntimeProxy>,
+    proxy_prepared: bool,
+    force_prompt: Option<(String, CredentialKind, Option<String>)>,
+}
+
+struct ProxyCommandApprovalPrompt {
+    session_id: SessionId,
+    target_profile: ConnectionProfile,
+    plan: ConnectionPlan,
+    credentials: Vec<ConnectionCredential>,
+    expanded_command: SecretString,
+    approval_digest: String,
 }
 
 impl ConnectionCredential {
@@ -2263,6 +2335,9 @@ impl RemCmdApp {
             credential_lookup_task: None,
             credential_lookup_session_id: None,
             credential_mutations_in_progress: HashMap::new(),
+            pending_connection: None,
+            pending_proxy_approval: HashSet::new(),
+            proxy_command_approval_prompt: None,
             active_panel: ActivePanel::Home,
             language_mode,
             localizer,
@@ -4129,6 +4204,21 @@ impl RemCmdApp {
             self.credential_lookup_session_id = None;
         }
         if self
+            .pending_connection
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            self.pending_connection = None;
+        }
+        if self
+            .proxy_command_approval_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.session_id == session_id)
+        {
+            self.proxy_command_approval_prompt = None;
+            self.pending_proxy_approval.remove(&session_id);
+        }
+        if self
             .credential_prompt
             .as_ref()
             .is_some_and(|prompt| prompt.session_id == session_id)
@@ -4189,6 +4279,12 @@ impl RemCmdApp {
                 (editor.port.clone(), "field-port"),
                 (editor.username.clone(), "field-username"),
                 (editor.private_key_path.clone(), "field-private-key"),
+                (editor.proxy_host.clone(), "field-proxy-host"),
+                (editor.proxy_port.clone(), "field-proxy-port"),
+                (editor.proxy_username.clone(), "field-proxy-username"),
+                (editor.proxy_password.clone(), "field-proxy-password"),
+                (editor.proxy_command.clone(), "field-proxy-command"),
+                (editor.jump_search.clone(), "sidebar-search-placeholder"),
             ] {
                 let placeholder = self.tr(key);
                 field.update(cx, |field, cx| field.set_placeholder(placeholder, cx));
@@ -4198,6 +4294,7 @@ impl RemCmdApp {
             let key = match prompt.kind {
                 CredentialPromptKind::Password => "credential-password",
                 CredentialPromptKind::PrivateKeyPassphrase { .. } => "credential-passphrase",
+                CredentialPromptKind::ProxyPassword => "field-proxy-password",
             };
             let placeholder = self.tr(key);
             prompt
@@ -4460,6 +4557,36 @@ impl RemCmdApp {
             AuthConfig::PrivateKey { path } => path.to_string_lossy().into_owned(),
             AuthConfig::None | AuthConfig::Password | AuthConfig::Agent => String::new(),
         };
+        let proxy_kind = ProfileProxyKind::from_config(profile.route.upstream_proxy.as_ref());
+        let (proxy_host, proxy_port, proxy_username) = match &profile.route.upstream_proxy {
+            Some(ProxyConfig::HttpConnect {
+                host,
+                port,
+                username,
+            })
+            | Some(ProxyConfig::Socks5 {
+                host,
+                port,
+                username,
+            }) => (
+                host.clone(),
+                port.to_string(),
+                username.clone().unwrap_or_default(),
+            ),
+            Some(ProxyConfig::ProxyCommand { .. }) | None => {
+                (String::new(), String::new(), String::new())
+            }
+        };
+        let proxy_secret_kind = match proxy_kind {
+            ProfileProxyKind::HttpConnect | ProfileProxyKind::Socks5 => {
+                Some(CredentialKind::ProxyPassword)
+            }
+            ProfileProxyKind::ProxyCommand => Some(CredentialKind::ProxyCommand),
+            ProfileProxyKind::Direct => None,
+        };
+        let jump_search =
+            cx.new(|cx| TextField::new(cx, "", self.tr("sidebar-search-placeholder")));
+        cx.observe(&jump_search, |_, _, cx| cx.notify()).detach();
 
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Edit,
@@ -4471,7 +4598,61 @@ impl RemCmdApp {
             auth_kind,
             private_key_path: cx
                 .new(|cx| TextField::new(cx, private_key_path, self.tr("field-private-key"))),
+            proxy_kind,
+            proxy_host: cx.new(|cx| TextField::new(cx, proxy_host, self.tr("field-proxy-host"))),
+            proxy_port: cx.new(|cx| TextField::new(cx, proxy_port, self.tr("field-proxy-port"))),
+            proxy_username: cx
+                .new(|cx| TextField::new(cx, proxy_username, self.tr("field-proxy-username"))),
+            proxy_password: cx.new(|cx| TextField::new_secure(cx, self.tr("field-proxy-password"))),
+            proxy_command: cx.new(|cx| TextField::new(cx, "", self.tr("field-proxy-command"))),
+            jump_search,
+            jump_host_ids: profile.route.jump_host_ids.clone(),
+            proxy_secret_loaded: proxy_secret_kind.is_none(),
         });
+
+        if let Some(kind) = proxy_secret_kind {
+            let profile_id = profile.id.clone();
+            let runtime = cx.global::<SshRuntime>().handle();
+            cx.spawn(async move |this, cx| {
+                let lookup_id = profile_id.clone();
+                let result = runtime
+                    .spawn_blocking(move || load_credential(&lookup_id, kind))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    let Some(editor) = this
+                        .editor
+                        .as_mut()
+                        .filter(|editor| editor.profile_id == profile_id)
+                    else {
+                        return;
+                    };
+                    match result {
+                        Ok(Ok(secret)) => {
+                            if let Some(secret) = secret {
+                                let value = secret.expose_secret().to_owned();
+                                match kind {
+                                    CredentialKind::ProxyPassword => editor
+                                        .proxy_password
+                                        .update(cx, |field, cx| field.replace_all(value, cx)),
+                                    CredentialKind::ProxyCommand => editor
+                                        .proxy_command
+                                        .update(cx, |field, cx| field.replace_all(value, cx)),
+                                    CredentialKind::Password
+                                    | CredentialKind::PrivateKeyPassphrase => unreachable!(),
+                                }
+                            }
+                            editor.proxy_secret_loaded = true;
+                        }
+                        Ok(Err(error)) => {
+                            this.form_error = Some(error.to_string());
+                        }
+                        Err(error) => this.form_error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         self.profile_auth_selector_open = false;
         self.form_error = None;
@@ -4479,6 +4660,9 @@ impl RemCmdApp {
 
     fn open_new_profile_editor(&mut self, cx: &mut Context<Self>) {
         let number = self.next_profile_number;
+        let jump_search =
+            cx.new(|cx| TextField::new(cx, "", self.tr("sidebar-search-placeholder")));
+        cx.observe(&jump_search, |_, _, cx| cx.notify()).detach();
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Create,
             profile_id: format!("demo-{number}"),
@@ -4488,6 +4672,15 @@ impl RemCmdApp {
             username: cx.new(|cx| TextField::new(cx, "", self.tr("field-username"))),
             auth_kind: ProfileAuthKind::Password,
             private_key_path: cx.new(|cx| TextField::new(cx, "", self.tr("field-private-key"))),
+            proxy_kind: ProfileProxyKind::Direct,
+            proxy_host: cx.new(|cx| TextField::new(cx, "", self.tr("field-proxy-host"))),
+            proxy_port: cx.new(|cx| TextField::new(cx, "", self.tr("field-proxy-port"))),
+            proxy_username: cx.new(|cx| TextField::new(cx, "", self.tr("field-proxy-username"))),
+            proxy_password: cx.new(|cx| TextField::new_secure(cx, self.tr("field-proxy-password"))),
+            proxy_command: cx.new(|cx| TextField::new(cx, "", self.tr("field-proxy-command"))),
+            jump_search,
+            jump_host_ids: Vec::new(),
+            proxy_secret_loaded: true,
         });
         self.profile_auth_selector_open = false;
         self.form_error = None;
@@ -4507,10 +4700,11 @@ impl RemCmdApp {
     ) -> Entity<TextField> {
         self.dismiss_credential_prompt(cx);
 
-        let placeholder = self.tr(match kind {
-            CredentialPromptKind::Password => "credential-password",
-            CredentialPromptKind::PrivateKeyPassphrase { .. } => "credential-passphrase",
-        });
+        let placeholder = match kind {
+            CredentialPromptKind::Password => self.tr("credential-password"),
+            CredentialPromptKind::PrivateKeyPassphrase { .. } => self.tr("credential-passphrase"),
+            CredentialPromptKind::ProxyPassword => self.tr("field-proxy-password"),
+        };
         let input = cx.new(|cx| TextField::new_secure(cx, placeholder));
         cx.observe(&input, |this, input, cx| {
             if let Some(prompt) = this.credential_prompt.as_mut()
@@ -5021,6 +5215,22 @@ impl RemCmdApp {
     }
 
     fn delete_profile(&mut self, selected_id: String, cx: &mut Context<Self>) {
+        if let Some(referrer) = self.profiles.iter().find(|profile| {
+            profile.id != selected_id
+                && profile
+                    .route
+                    .jump_host_ids
+                    .iter()
+                    .any(|jump_id| jump_id == &selected_id)
+        }) {
+            self.form_error = Some(format!(
+                "{}: {}",
+                self.tr("profile-delete-in-use"),
+                referrer.name
+            ));
+            cx.notify();
+            return;
+        }
         if self.sessions.iter().any(|session| {
             session.profile_id == selected_id && session.connection_state.can_disconnect()
         }) {
@@ -5090,6 +5300,60 @@ impl RemCmdApp {
         }
 
         cx.notify();
+    }
+
+    fn select_proxy_method(&mut self, proxy_kind: ProfileProxyKind, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        editor.proxy_kind = proxy_kind;
+        editor.proxy_secret_loaded = true;
+        if proxy_kind == ProfileProxyKind::ProxyCommand {
+            editor.jump_host_ids.clear();
+        }
+        self.form_error = None;
+        cx.notify();
+    }
+
+    fn toggle_jump_host(&mut self, jump_id: String, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if jump_id == editor.profile_id {
+            return;
+        }
+        if let Some(index) = editor
+            .jump_host_ids
+            .iter()
+            .position(|candidate| candidate == &jump_id)
+        {
+            editor.jump_host_ids.remove(index);
+        } else {
+            if editor.proxy_kind == ProfileProxyKind::ProxyCommand {
+                editor.proxy_kind = ProfileProxyKind::Direct;
+            }
+            editor.jump_host_ids.push(jump_id);
+        }
+        self.form_error = None;
+        cx.notify();
+    }
+
+    fn move_jump_host(&mut self, jump_id: String, direction: isize, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let Some(index) = editor
+            .jump_host_ids
+            .iter()
+            .position(|candidate| candidate == &jump_id)
+        else {
+            return;
+        };
+        let next = index.saturating_add_signed(direction);
+        if next < editor.jump_host_ids.len() {
+            editor.jump_host_ids.swap(index, next);
+            cx.notify();
+        }
     }
 
     fn toggle_profile_auth_selector(&mut self, cx: &mut Context<Self>) {
@@ -5186,6 +5450,12 @@ impl RemCmdApp {
             return;
         };
 
+        if !editor.proxy_secret_loaded {
+            self.form_error = Some(self.tr("credential-checking"));
+            cx.notify();
+            return;
+        }
+
         let name = editor.name.read(cx).text().trim().to_owned();
         let host = editor.host.read(cx).text().trim().to_owned();
         let port_text = editor.port.read(cx).text();
@@ -5228,44 +5498,184 @@ impl RemCmdApp {
                     credentials_invalidated_by_edit(profile, &host, port, &username, &auth)
                 });
 
-        match editor.mode {
-            ProfileEditorMode::Create => {
-                let mut profile =
-                    ConnectionProfile::new(&editor.profile_id, name, host, port, username);
-                profile.auth = auth;
-                self.selected_profile_id = Some(profile.id.clone());
-                self.profiles.push(profile);
-                self.next_profile_number += 1;
-                self.active_panel = ActivePanel::Server;
-            }
-            ProfileEditorMode::Edit => {
-                if let Some(profile) = self
-                    .profiles
-                    .iter_mut()
-                    .find(|profile| profile.id == editor.profile_id)
-                {
-                    profile.name = name;
-                    profile.host = host;
-                    profile.port = port;
-                    profile.username = username;
-                    profile.auth = auth;
+        let proxy_host = editor.proxy_host.read(cx).text().trim().to_owned();
+        let proxy_port_text = editor.proxy_port.read(cx).text();
+        let proxy_username = editor.proxy_username.read(cx).text().trim().to_owned();
+        let proxy_password_text = editor.proxy_password.read(cx).text();
+        let proxy_command_text = editor.proxy_command.read(cx).text();
+        let existing = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == editor.profile_id)
+            .cloned();
+        let mut proxy_password = None;
+        let mut proxy_command = None;
+        let upstream_proxy = match editor.proxy_kind {
+            ProfileProxyKind::Direct => None,
+            ProfileProxyKind::HttpConnect | ProfileProxyKind::Socks5 => {
+                let Ok(proxy_port) = proxy_port_text.trim().parse::<u16>() else {
+                    self.form_error = Some(self.tr("profile-validation-port"));
+                    cx.notify();
+                    return;
+                };
+                if proxy_host.is_empty() || proxy_port == 0 {
+                    self.form_error = Some(self.tr("profile-validation-proxy"));
+                    cx.notify();
+                    return;
                 }
+                if proxy_username.is_empty() && !proxy_password_text.is_empty() {
+                    self.form_error = Some(self.tr("profile-validation-proxy-auth"));
+                    cx.notify();
+                    return;
+                }
+                if !proxy_password_text.is_empty() {
+                    proxy_password = Some(SecretString::new(proxy_password_text.into_boxed_str()));
+                }
+                let username = (!proxy_username.is_empty()).then_some(proxy_username);
+                Some(match editor.proxy_kind {
+                    ProfileProxyKind::HttpConnect => ProxyConfig::HttpConnect {
+                        host: proxy_host,
+                        port: proxy_port,
+                        username,
+                    },
+                    ProfileProxyKind::Socks5 => ProxyConfig::Socks5 {
+                        host: proxy_host,
+                        port: proxy_port,
+                        username,
+                    },
+                    ProfileProxyKind::Direct | ProfileProxyKind::ProxyCommand => unreachable!(),
+                })
             }
+            ProfileProxyKind::ProxyCommand => {
+                let command = proxy_command_text.trim();
+                if command.is_empty() {
+                    self.form_error = Some(self.tr("profile-validation-proxy-command"));
+                    cx.notify();
+                    return;
+                }
+                let command_digest = proxy_command_content_digest(command);
+                let approved_digest = existing.as_ref().and_then(|profile| {
+                    let unchanged_endpoint = profile.name == name
+                        && profile.host == host
+                        && profile.port == port
+                        && profile.username == username;
+                    match profile.route.upstream_proxy.as_ref() {
+                        Some(ProxyConfig::ProxyCommand {
+                            command_digest: existing_digest,
+                            approved_digest,
+                        }) if unchanged_endpoint && existing_digest == &command_digest => {
+                            approved_digest.clone()
+                        }
+                        _ => None,
+                    }
+                });
+                proxy_command = Some(SecretString::new(command.to_owned().into_boxed_str()));
+                Some(ProxyConfig::ProxyCommand {
+                    command_digest,
+                    approved_digest,
+                })
+            }
+        };
+
+        let mut seen_jumps = HashSet::new();
+        if editor.jump_host_ids.iter().any(|jump_id| {
+            jump_id == &editor.profile_id
+                || !seen_jumps.insert(jump_id)
+                || !self.profiles.iter().any(|profile| &profile.id == jump_id)
+        }) {
+            self.form_error = Some(self.tr("profile-validation-jumps"));
+            cx.notify();
+            return;
+        }
+        if matches!(upstream_proxy, Some(ProxyConfig::ProxyCommand { .. }))
+            && !editor.jump_host_ids.is_empty()
+        {
+            self.form_error = Some(self.tr("profile-validation-proxy-jump"));
+            cx.notify();
+            return;
         }
 
+        let mut profile = existing
+            .clone()
+            .unwrap_or_else(|| ConnectionProfile::new(&editor.profile_id, "", "", 22, ""));
+        profile.name = name;
+        profile.host = host;
+        profile.port = port;
+        profile.username = username;
+        profile.auth = auth;
+        profile.route = ConnectionRoute {
+            upstream_proxy,
+            jump_host_ids: editor.jump_host_ids,
+        };
+
+        let mut next_profiles = self.profiles.clone();
+        if let Some(index) = next_profiles
+            .iter()
+            .position(|candidate| candidate.id == profile.id)
+        {
+            next_profiles[index] = profile.clone();
+        } else {
+            next_profiles.push(profile.clone());
+        }
+        let had_proxy = existing
+            .as_ref()
+            .is_some_and(|profile| profile.route.upstream_proxy.is_some());
+        let route_changed = existing
+            .as_ref()
+            .is_some_and(|existing| existing.route.upstream_proxy != profile.route.upstream_proxy);
+        let route_secrets_changed =
+            proxy_password.is_some() || proxy_command.is_some() || (had_proxy && route_changed);
+        let profile_id = profile.id.clone();
+        let profiles_path = self.profiles_path.clone();
+        let runtime = cx.global::<SshRuntime>().handle();
+        *self
+            .credential_mutations_in_progress
+            .entry(profile_id.clone())
+            .or_default() += 1;
         self.form_error = None;
-        self.editor = None;
-        self.profile_auth_selector_open = false;
-        self.persist_profiles();
-        if credentials_changed {
-            self.delete_stored_credentials(
-                editor.profile_id,
-                None,
-                Some(self.tr("credential-cleared-after-change")),
-                cx,
-            );
-        }
-
+        cx.spawn(async move |this, cx| {
+            let task_profile_id = profile_id.clone();
+            let result = runtime
+                .spawn_blocking(move || {
+                    if route_secrets_changed {
+                        save_profiles_with_route_secrets(
+                            &profiles_path,
+                            &next_profiles,
+                            &task_profile_id,
+                            proxy_password.as_ref(),
+                            proxy_command.as_ref(),
+                        )?;
+                    } else {
+                        save_profiles(&profiles_path, &next_profiles)?;
+                    }
+                    let auth_cleanup_error = credentials_changed
+                        .then(|| delete_profile_auth_credentials(&task_profile_id))
+                        .and_then(Result::err)
+                        .map(|error| error.to_string());
+                    Ok::<_, std::io::Error>((next_profiles, auth_cleanup_error))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.credential_mutations_in_progress.remove(&profile_id);
+                match result {
+                    Ok(Ok((profiles, warning))) => {
+                        this.profiles = profiles;
+                        this.selected_profile_id = Some(profile_id.clone());
+                        this.active_panel = ActivePanel::Server;
+                        if editor.mode == ProfileEditorMode::Create {
+                            this.next_profile_number += 1;
+                        }
+                        this.editor = None;
+                        this.profile_auth_selector_open = false;
+                        this.form_error = warning;
+                    }
+                    Ok(Err(error)) => this.form_error = Some(error.to_string()),
+                    Err(error) => this.form_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -5414,6 +5824,8 @@ impl RemCmdApp {
             .session(session_id)
             .is_some_and(|session| session.connection_state.can_connect())
             || self.credential_lookup_task.is_some()
+            || self.pending_connection.is_some()
+            || self.pending_proxy_approval.contains(&session_id)
         {
             cx.notify();
             return;
@@ -5425,33 +5837,12 @@ impl RemCmdApp {
             return;
         }
 
-        match &profile.auth {
-            AuthConfig::None => {
-                if self.activate_session_in_window(session_id, window, cx) {
-                    self.start_connection(session_id, profile, AuthMethod::None, None, cx);
-                }
-            }
-            AuthConfig::Password => {
-                self.lookup_credential_and_connect(
-                    session_id,
-                    profile,
-                    CredentialPromptKind::Password,
-                    window,
-                    cx,
-                );
-            }
-            AuthConfig::PrivateKey { path } => {
-                let prompt_kind = CredentialPromptKind::PrivateKeyPassphrase { path: path.clone() };
-                self.lookup_credential_and_connect(session_id, profile, prompt_kind, window, cx);
-            }
-            AuthConfig::Agent => {
-                if self.activate_session_in_window(session_id, window, cx) {
-                    self.start_connection(session_id, profile, AuthMethod::Agent, None, cx);
-                }
-            }
+        if self.activate_session_in_window(session_id, window, cx) {
+            self.begin_connection_preparation(session_id, profile, None, cx);
         }
     }
 
+    #[allow(dead_code)]
     fn lookup_credential_and_connect(
         &mut self,
         session_id: SessionId,
@@ -5529,6 +5920,15 @@ impl RemCmdApp {
                                 this.start_connection(session_id, profile, auth, None, cx);
                             }
                         }
+                        CredentialPromptKind::ProxyPassword => {
+                            this.open_credential_prompt(
+                                session_id,
+                                profile_id,
+                                CredentialPromptKind::ProxyPassword,
+                                None,
+                                cx,
+                            );
+                        }
                     },
                     Err(error) => match prompt_kind {
                         CredentialPromptKind::Password => {
@@ -5552,6 +5952,15 @@ impl RemCmdApp {
                                 }
                             }
                         }
+                        CredentialPromptKind::ProxyPassword => {
+                            this.open_credential_prompt(
+                                session_id,
+                                profile_id,
+                                CredentialPromptKind::ProxyPassword,
+                                Some(error),
+                                cx,
+                            );
+                        }
                     },
                 }
             });
@@ -5560,6 +5969,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     fn start_connection(
         &mut self,
         session_id: SessionId,
@@ -5594,11 +6004,11 @@ impl RemCmdApp {
         session.connection_state = SessionState::Connecting;
         session.connection_handle = Some(handle);
         session.local_terminal_handle = None;
-        session.connection_credential = credential;
+        session.connection_credentials = credential.into_iter().collect();
         session.connection_error = None;
         session.connection_message = None;
         session.terminal_end_reason = None;
-        session.terminal = Some(ActiveTerminal::new(profile.id, pty_size));
+        session.terminal = Some(ActiveTerminal::new(profile.id.clone(), pty_size));
         session.terminal_marked_text.clear();
         session.terminal_selection = None;
         session.terminal_selecting = false;
@@ -5636,23 +6046,655 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn begin_connection_preparation(
+        &mut self,
+        session_id: SessionId,
+        target_profile: ConnectionProfile,
+        force_prompt: Option<(String, CredentialKind, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_credential_prompt(cx);
+        let mut steps = Vec::with_capacity(target_profile.route.jump_host_ids.len() + 1);
+        for jump_id in &target_profile.route.jump_host_ids {
+            let Some(mut jump) = self
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == jump_id)
+                .cloned()
+            else {
+                let message = format!("{}: {jump_id}", self.tr("connection-missing-jump"));
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_error = Some(message);
+                }
+                cx.notify();
+                return;
+            };
+            // Referenced profiles contribute only their endpoint and authentication.
+            jump.route = ConnectionRoute::default();
+            steps.push(jump);
+        }
+        steps.push(target_profile.clone());
+        self.pending_connection = Some(PendingConnectionPreparation {
+            session_id,
+            target_profile,
+            steps,
+            next_step: 0,
+            prepared_steps: Vec::new(),
+            credentials: Vec::new(),
+            runtime_proxy: None,
+            proxy_prepared: false,
+            force_prompt,
+        });
+        let checking_message = self.tr("credential-checking");
+        if let Some(session) = self.session_mut(session_id) {
+            session.connection_error = None;
+            session.connection_message = Some(checking_message);
+        }
+        self.continue_connection_preparation(cx);
+    }
+
+    fn continue_connection_preparation(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let Some(mut pending) = self.pending_connection.take() else {
+                return;
+            };
+            if self.session(pending.session_id).is_none() {
+                return;
+            }
+
+            if !pending.proxy_prepared {
+                let target_id = pending.target_profile.id.clone();
+                match pending.target_profile.route.upstream_proxy.as_ref() {
+                    None => {
+                        pending.proxy_prepared = true;
+                        self.pending_connection = Some(pending);
+                        continue;
+                    }
+                    Some(ProxyConfig::HttpConnect {
+                        host,
+                        port,
+                        username,
+                    }) if username.is_none() => {
+                        pending.runtime_proxy =
+                            Some(RuntimeProxy::http_connect(host.clone(), *port, None, None));
+                        pending.proxy_prepared = true;
+                        self.pending_connection = Some(pending);
+                        continue;
+                    }
+                    Some(ProxyConfig::Socks5 {
+                        host,
+                        port,
+                        username,
+                    }) if username.is_none() => {
+                        pending.runtime_proxy =
+                            Some(RuntimeProxy::socks5(host.clone(), *port, None, None));
+                        pending.proxy_prepared = true;
+                        self.pending_connection = Some(pending);
+                        continue;
+                    }
+                    Some(ProxyConfig::HttpConnect { .. }) | Some(ProxyConfig::Socks5 { .. }) => {
+                        let forced =
+                            pending
+                                .force_prompt
+                                .as_ref()
+                                .is_some_and(|(profile_id, kind, _)| {
+                                    profile_id == &target_id
+                                        && *kind == CredentialKind::ProxyPassword
+                                });
+                        let prompt_error = forced
+                            .then(|| pending.force_prompt.take().and_then(|(_, _, error)| error))
+                            .flatten();
+                        let prompt_session_id = pending.session_id;
+                        self.pending_connection = Some(pending);
+                        if forced {
+                            self.open_credential_prompt(
+                                prompt_session_id,
+                                target_id,
+                                CredentialPromptKind::ProxyPassword,
+                                prompt_error,
+                                cx,
+                            );
+                        } else {
+                            self.lookup_preparation_credential(
+                                target_id,
+                                CredentialKind::ProxyPassword,
+                                Some(CredentialPromptKind::ProxyPassword),
+                                cx,
+                            );
+                        }
+                        return;
+                    }
+                    Some(ProxyConfig::ProxyCommand { .. }) => {
+                        self.pending_connection = Some(pending);
+                        self.lookup_preparation_credential(
+                            target_id,
+                            CredentialKind::ProxyCommand,
+                            None,
+                            cx,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            if pending.next_step < pending.steps.len() {
+                let step = pending.steps[pending.next_step].clone();
+                let profile_id = step.id.clone();
+                match &step.auth {
+                    AuthConfig::None => {
+                        pending
+                            .prepared_steps
+                            .push(ConnectionStep::new(step, AuthMethod::None));
+                        pending.next_step += 1;
+                        self.pending_connection = Some(pending);
+                        continue;
+                    }
+                    AuthConfig::Agent => {
+                        pending
+                            .prepared_steps
+                            .push(ConnectionStep::new(step, AuthMethod::Agent));
+                        pending.next_step += 1;
+                        self.pending_connection = Some(pending);
+                        continue;
+                    }
+                    AuthConfig::Password => {
+                        let kind = CredentialKind::Password;
+                        let forced = pending.force_prompt.as_ref().is_some_and(
+                            |(forced_profile_id, forced_kind, _)| {
+                                forced_profile_id == &profile_id && *forced_kind == kind
+                            },
+                        );
+                        let prompt_error = forced
+                            .then(|| pending.force_prompt.take().and_then(|(_, _, error)| error))
+                            .flatten();
+                        let prompt_session_id = pending.session_id;
+                        self.pending_connection = Some(pending);
+                        if forced {
+                            self.open_credential_prompt(
+                                prompt_session_id,
+                                profile_id,
+                                CredentialPromptKind::Password,
+                                prompt_error,
+                                cx,
+                            );
+                        } else {
+                            self.lookup_preparation_credential(
+                                profile_id,
+                                kind,
+                                Some(CredentialPromptKind::Password),
+                                cx,
+                            );
+                        }
+                        return;
+                    }
+                    AuthConfig::PrivateKey { path } => {
+                        let kind = CredentialKind::PrivateKeyPassphrase;
+                        let prompt =
+                            CredentialPromptKind::PrivateKeyPassphrase { path: path.clone() };
+                        let forced = pending.force_prompt.as_ref().is_some_and(
+                            |(forced_profile_id, forced_kind, _)| {
+                                forced_profile_id == &profile_id && *forced_kind == kind
+                            },
+                        );
+                        let prompt_error = forced
+                            .then(|| pending.force_prompt.take().and_then(|(_, _, error)| error))
+                            .flatten();
+                        let prompt_session_id = pending.session_id;
+                        self.pending_connection = Some(pending);
+                        if forced {
+                            self.open_credential_prompt(
+                                prompt_session_id,
+                                profile_id,
+                                prompt,
+                                prompt_error,
+                                cx,
+                            );
+                        } else {
+                            self.lookup_preparation_credential(profile_id, kind, Some(prompt), cx);
+                        }
+                        return;
+                    }
+                }
+            }
+
+            let target_step = pending
+                .prepared_steps
+                .pop()
+                .expect("connection preparation includes the target step");
+            let mut plan = ConnectionPlan::new(target_step);
+            for jump in pending.prepared_steps {
+                plan.push_jump(jump);
+            }
+            if let Some(proxy) = pending.runtime_proxy {
+                plan.set_proxy(proxy);
+            }
+            if let Err(error) = plan.validate() {
+                let message = localized_connection_error(&error, &self.localizer);
+                if let Some(session) = self.session_mut(pending.session_id) {
+                    session.connection_error = Some(message);
+                    session.connection_message = None;
+                }
+                cx.notify();
+                return;
+            }
+            self.finish_connection_preparation(
+                pending.session_id,
+                pending.target_profile,
+                plan,
+                pending.credentials,
+                cx,
+            );
+            return;
+        }
+    }
+
+    fn lookup_preparation_credential(
+        &mut self,
+        profile_id: String,
+        credential_kind: CredentialKind,
+        prompt_kind: Option<CredentialPromptKind>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self
+            .pending_connection
+            .as_ref()
+            .map(|pending| pending.session_id)
+        else {
+            return;
+        };
+        let runtime = cx.global::<SshRuntime>().handle();
+        let checking_message = self.tr("credential-checking");
+        if let Some(session) = self.session_mut(session_id) {
+            session.connection_error = None;
+            session.connection_message = Some(checking_message);
+        }
+        self.credential_lookup_session_id = Some(session_id);
+        self.credential_lookup_task = Some(cx.spawn(async move |this, cx| {
+            let lookup_profile_id = profile_id.clone();
+            let result = runtime
+                .spawn_blocking(move || load_credential(&lookup_profile_id, credential_kind))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.credential_lookup_task = None;
+                this.credential_lookup_session_id = None;
+                if this
+                    .pending_connection
+                    .as_ref()
+                    .is_none_or(|pending| pending.session_id != session_id)
+                {
+                    return;
+                }
+                let loaded = match result {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                match loaded {
+                    Ok(Some(secret)) => {
+                        let credential = ConnectionCredential::from_keychain(
+                            profile_id.clone(),
+                            credential_kind,
+                        );
+                        this.accept_preparation_secret(
+                            profile_id,
+                            credential_kind,
+                            prompt_kind,
+                            secret,
+                            credential,
+                            cx,
+                        );
+                    }
+                    Ok(None) => this.handle_missing_preparation_secret(
+                        profile_id,
+                        credential_kind,
+                        prompt_kind,
+                        None,
+                        cx,
+                    ),
+                    Err(error) => this.handle_missing_preparation_secret(
+                        profile_id,
+                        credential_kind,
+                        prompt_kind,
+                        Some(error),
+                        cx,
+                    ),
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn handle_missing_preparation_secret(
+        &mut self,
+        profile_id: String,
+        credential_kind: CredentialKind,
+        prompt_kind: Option<CredentialPromptKind>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match (credential_kind, prompt_kind) {
+            (
+                CredentialKind::PrivateKeyPassphrase,
+                Some(CredentialPromptKind::PrivateKeyPassphrase { path }),
+            ) if error.is_none() => {
+                self.accept_preparation_auth(
+                    profile_id,
+                    AuthMethod::PrivateKey {
+                        path,
+                        passphrase: None,
+                    },
+                    None,
+                    cx,
+                );
+            }
+            (CredentialKind::ProxyCommand, None) => {
+                let message = error.unwrap_or_else(|| self.tr("proxy-command-keychain-missing"));
+                let session_id = self
+                    .pending_connection
+                    .take()
+                    .map(|pending| pending.session_id);
+                if let Some(session_id) = session_id
+                    && let Some(session) = self.session_mut(session_id)
+                {
+                    session.connection_error = Some(message);
+                    session.connection_message = None;
+                }
+                cx.notify();
+            }
+            (_, Some(prompt_kind)) => {
+                if let Some(session_id) = self
+                    .pending_connection
+                    .as_ref()
+                    .map(|pending| pending.session_id)
+                {
+                    self.open_credential_prompt(session_id, profile_id, prompt_kind, error, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn accept_preparation_secret(
+        &mut self,
+        profile_id: String,
+        credential_kind: CredentialKind,
+        prompt_kind: Option<CredentialPromptKind>,
+        secret: SecretString,
+        credential: ConnectionCredential,
+        cx: &mut Context<Self>,
+    ) {
+        if credential_kind == CredentialKind::ProxyCommand {
+            let Some(pending) = self.pending_connection.as_mut() else {
+                return;
+            };
+            let Some(ProxyConfig::ProxyCommand {
+                approved_digest, ..
+            }) = pending.target_profile.route.upstream_proxy.as_ref()
+            else {
+                return;
+            };
+            pending.runtime_proxy =
+                Some(RuntimeProxy::proxy_command(secret, approved_digest.clone()));
+            pending.proxy_prepared = true;
+            self.continue_connection_preparation(cx);
+            return;
+        }
+        let Some(prompt_kind) = prompt_kind else {
+            return;
+        };
+        if prompt_kind == CredentialPromptKind::ProxyPassword {
+            let Some(pending) = self.pending_connection.as_mut() else {
+                return;
+            };
+            pending.runtime_proxy = runtime_proxy_with_password(&pending.target_profile, secret);
+            pending.proxy_prepared = true;
+            pending.credentials.push(credential);
+            self.continue_connection_preparation(cx);
+            return;
+        }
+        self.accept_preparation_auth(
+            profile_id,
+            auth_method_with_secret(prompt_kind, secret),
+            Some(credential),
+            cx,
+        );
+    }
+
+    fn accept_preparation_auth(
+        &mut self,
+        profile_id: String,
+        auth: AuthMethod,
+        credential: Option<ConnectionCredential>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_connection.as_mut() else {
+            return;
+        };
+        let Some(step) = pending.steps.get(pending.next_step).cloned() else {
+            return;
+        };
+        if step.id != profile_id {
+            return;
+        }
+        pending.prepared_steps.push(ConnectionStep::new(step, auth));
+        pending.next_step += 1;
+        if let Some(credential) = credential {
+            pending.credentials.push(credential);
+        }
+        self.continue_connection_preparation(cx);
+    }
+
+    fn finish_connection_preparation(
+        &mut self,
+        session_id: SessionId,
+        target_profile: ConnectionProfile,
+        plan: ConnectionPlan,
+        credentials: Vec<ConnectionCredential>,
+        cx: &mut Context<Self>,
+    ) {
+        match plan.proxy_command_preview() {
+            Ok(Some(preview)) if !preview.is_approved() => {
+                self.pending_proxy_approval.insert(session_id);
+                self.proxy_command_approval_prompt = Some(ProxyCommandApprovalPrompt {
+                    session_id,
+                    target_profile,
+                    plan,
+                    credentials,
+                    expanded_command: preview.expanded_command().clone(),
+                    approval_digest: preview.approval_digest().to_owned(),
+                });
+                let approval_message = self.tr("proxy-command-approval-title");
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some(approval_message);
+                }
+                cx.notify();
+            }
+            Ok(_) => self.start_connection_plan(session_id, target_profile, plan, credentials, cx),
+            Err(error) => {
+                let message = localized_connection_error(&error, &self.localizer);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_error = Some(message);
+                    session.connection_message = None;
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn approve_proxy_command(&mut self, cx: &mut Context<Self>) {
+        let Some(mut prompt) = self.proxy_command_approval_prompt.take() else {
+            return;
+        };
+        self.pending_proxy_approval.remove(&prompt.session_id);
+        if let Err(error) = prompt
+            .plan
+            .approve_proxy_command(prompt.approval_digest.clone())
+        {
+            let message = localized_connection_error(&error, &self.localizer);
+            if let Some(session) = self.session_mut(prompt.session_id) {
+                session.connection_error = Some(message);
+            }
+            cx.notify();
+            return;
+        }
+        let profile_index = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id == prompt.target_profile.id);
+        let approval_update = profile_index.and_then(|index| {
+            let profile = &mut self.profiles[index];
+            if let Some(ProxyConfig::ProxyCommand {
+                approved_digest, ..
+            }) = profile.route.upstream_proxy.as_mut()
+            {
+                let previous = approved_digest.clone();
+                *approved_digest = Some(prompt.approval_digest.clone());
+                Some((index, previous))
+            } else {
+                None
+            }
+        });
+        let Some((profile_index, previous_approval)) = approval_update else {
+            let message = self.tr("profile-validation-proxy-command");
+            if let Some(session) = self.session_mut(prompt.session_id) {
+                session.connection_error = Some(message);
+            }
+            cx.notify();
+            return;
+        };
+        if let Err(error) = save_profiles(&self.profiles_path, &self.profiles) {
+            if let Some(ProxyConfig::ProxyCommand {
+                approved_digest, ..
+            }) = self.profiles[profile_index].route.upstream_proxy.as_mut()
+            {
+                *approved_digest = previous_approval;
+            }
+            let message = format!("{}: {error}", self.tr("app-save-profiles-failed"));
+            if let Some(session) = self.session_mut(prompt.session_id) {
+                session.connection_error = Some(message);
+            }
+            cx.notify();
+            return;
+        }
+        self.start_connection_plan(
+            prompt.session_id,
+            prompt.target_profile,
+            prompt.plan,
+            prompt.credentials,
+            cx,
+        );
+    }
+
+    fn cancel_proxy_command_approval(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.proxy_command_approval_prompt.take() else {
+            return;
+        };
+        self.pending_proxy_approval.remove(&prompt.session_id);
+        let cancelled_message = self.tr("proxy-command-approval-cancelled");
+        if let Some(session) = self.session_mut(prompt.session_id) {
+            session.connection_error = Some(cancelled_message);
+            session.connection_message = None;
+        }
+        cx.notify();
+    }
+
+    fn start_connection_plan(
+        &mut self,
+        session_id: SessionId,
+        profile: ConnectionProfile,
+        plan: ConnectionPlan,
+        credentials: Vec<ConnectionCredential>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_credential_prompt(cx);
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.host_key_prompt = None;
+        self.credential_lookup_task = None;
+        self.credential_lookup_session_id = None;
+
+        let runtime = cx.global::<SshRuntime>().handle();
+        let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
+        let connection = SshConnection::spawn_plan_with_transfer_rate_limiter(
+            &runtime,
+            plan,
+            pty_size,
+            self.transfer_rate_limiter.clone(),
+        );
+        let (handle, mut events) = connection.split();
+
+        let session = self
+            .session_mut(session_id)
+            .expect("session should exist while starting a connection");
+        session.close_when_disconnected = false;
+        session.connection_state = SessionState::Connecting;
+        session.connection_handle = Some(handle);
+        session.local_terminal_handle = None;
+        session.connection_credentials = credentials;
+        session.connection_error = None;
+        session.connection_message = None;
+        session.terminal_end_reason = None;
+        session.terminal = Some(ActiveTerminal::new(profile.id.clone(), pty_size));
+        session.terminal_marked_text.clear();
+        session.terminal_selection = None;
+        session.terminal_selecting = false;
+        session.terminal_scroll_accumulator = 0.0;
+        session.terminal_resize_task = None;
+        session.sftp = SftpBrowserState::default();
+        session.sidebar_sftp =
+            SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
+        session.sftp_availability = SftpAvailability::Checking;
+
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next_event().await {
+                let mut batch = Vec::with_capacity(TERMINAL_EVENT_BATCH_LIMIT);
+                batch.push(event);
+                while batch.len() < TERMINAL_EVENT_BATCH_LIMIT {
+                    let Some(event) = events.try_next_event() else {
+                        break;
+                    };
+                    batch.push(event);
+                }
+                if this
+                    .update(cx, move |this, cx| {
+                        for event in batch {
+                            this.handle_connection_event(session_id, event, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn submit_credential_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = self.credential_prompt.as_mut() else {
+        let Some(prompt) = self.credential_prompt.as_ref() else {
             return;
         };
 
         if prompt.input.read(cx).is_empty() {
-            let label_key = match prompt.kind {
-                CredentialPromptKind::Password => "credential-password",
-                CredentialPromptKind::PrivateKeyPassphrase { .. } => "credential-passphrase",
+            let input = prompt.input.clone();
+            let label = match prompt.kind {
+                CredentialPromptKind::Password => self.tr("credential-password"),
+                CredentialPromptKind::PrivateKeyPassphrase { .. } => {
+                    self.tr("credential-passphrase")
+                }
+                CredentialPromptKind::ProxyPassword => self.tr("field-proxy-password"),
             };
             let mut args = fluent_bundle::FluentArgs::new();
-            args.set("label", self.localizer.text(label_key));
-            prompt.error = Some(self.localizer.text_with("credential-required", Some(&args)));
-            window.focus(&prompt.input.focus_handle(cx));
+            args.set("label", label);
+            let required = self.tr_with("credential-required", &args);
+            if let Some(prompt) = self.credential_prompt.as_mut() {
+                prompt.error = Some(required);
+            }
+            window.focus(&input.focus_handle(cx));
             cx.notify();
             return;
-        };
+        }
 
         let profile_id = prompt.profile_id.clone();
         let session_id = prompt.session_id;
@@ -5660,20 +6702,19 @@ impl RemCmdApp {
         let remember = prompt.remember;
         let input = prompt.input.clone();
 
-        let Some(profile) = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .cloned()
-        else {
+        if self
+            .pending_connection
+            .as_ref()
+            .is_none_or(|pending| pending.session_id != session_id)
+        {
             self.dismiss_credential_prompt(cx);
-            let message = self.localizer.text("connection-profile-missing");
+            let message = self.tr("connection-preparation-expired");
             if let Some(session) = self.session_mut(session_id) {
                 session.connection_error = Some(message);
             }
             cx.notify();
             return;
-        };
+        }
 
         let secret = SecretString::new(
             input
@@ -5684,13 +6725,16 @@ impl RemCmdApp {
 
         let credential_kind = kind.credential_kind();
         let save_on_success = remember.then(|| secret.clone());
-        let auth = auth_method_with_secret(kind, secret);
         let credential =
-            ConnectionCredential::from_prompt(profile_id, credential_kind, save_on_success);
-
-        if self.activate_session_in_window(session_id, window, cx) {
-            self.start_connection(session_id, profile, auth, Some(credential), cx);
-        }
+            ConnectionCredential::from_prompt(profile_id.clone(), credential_kind, save_on_success);
+        self.accept_preparation_secret(
+            profile_id,
+            credential_kind,
+            Some(kind),
+            secret,
+            credential,
+            cx,
+        );
     }
 
     fn on_submit_credential(
@@ -5708,6 +6752,7 @@ impl RemCmdApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_connection = None;
         self.dismiss_credential_prompt(cx);
         cx.notify();
     }
@@ -5822,19 +6867,69 @@ impl RemCmdApp {
         error: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        let uses_password = self.profiles.iter().any(|profile| {
-            profile.id == profile_id && matches!(profile.auth, AuthConfig::Password)
-        });
-        if !uses_password {
-            return false;
-        }
-
-        self.activate_session(session_id, cx);
-        self.open_credential_prompt(
+        self.retry_connection_with_prompt(
             session_id,
             profile_id,
-            CredentialPromptKind::Password,
-            Some(error),
+            CredentialKind::Password,
+            error,
+            cx,
+        )
+    }
+
+    fn retry_connection_with_prompt(
+        &mut self,
+        session_id: SessionId,
+        profile_id: String,
+        kind: CredentialKind,
+        error: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target_profile) = self
+            .session(session_id)
+            .and_then(|session| {
+                self.profiles
+                    .iter()
+                    .find(|profile| profile.id == session.profile_id)
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        let valid_step = if kind == CredentialKind::ProxyPassword {
+            matches!(
+                target_profile.route.upstream_proxy,
+                Some(ProxyConfig::HttpConnect {
+                    username: Some(_),
+                    ..
+                }) | Some(ProxyConfig::Socks5 {
+                    username: Some(_),
+                    ..
+                })
+            ) && profile_id == target_profile.id
+        } else {
+            self.profiles.iter().any(|profile| {
+                profile.id == profile_id
+                    && matches!(
+                        (&profile.auth, kind),
+                        (AuthConfig::Password, CredentialKind::Password)
+                            | (
+                                AuthConfig::PrivateKey { .. },
+                                CredentialKind::PrivateKeyPassphrase
+                            )
+                    )
+            })
+        };
+        if !valid_step {
+            return false;
+        }
+        if let Some(session) = self.session_mut(session_id) {
+            session.connection_error = None;
+            session.connection_message = Some(error.clone());
+        }
+        self.begin_connection_preparation(
+            session_id,
+            target_profile,
+            Some((profile_id, kind, Some(error))),
             cx,
         );
         true
@@ -5850,7 +6945,6 @@ impl RemCmdApp {
     ) {
         let runtime = cx.global::<SshRuntime>().handle();
         let removing_message = self.tr("credential-removing-rejected");
-        let keychain_task_failed = self.tr("credential-keychain-task-failed");
         if let Some(session) = self.session_mut(session_id) {
             session.connection_message = Some(removing_message);
         }
@@ -5872,58 +6966,71 @@ impl RemCmdApp {
                 let error = match result {
                     Ok(Ok(())) => authentication_error,
                     Ok(Err(error)) => format!("{authentication_error}\n{error}"),
-                    Err(error) => {
-                        format!("{authentication_error}\n{keychain_task_failed}: {error}")
-                    }
+                    Err(error) => format!(
+                        "{authentication_error}\n{}: {error}",
+                        this.tr("credential-keychain-task-failed")
+                    ),
                 };
 
-                match kind {
-                    CredentialKind::Password => {
-                        this.prompt_for_password(session_id, profile_id, error, cx);
-                    }
-                    CredentialKind::PrivateKeyPassphrase => {
-                        this.prompt_for_private_key_passphrase(session_id, profile_id, error, cx);
-                    }
+                if kind != CredentialKind::ProxyCommand
+                    && !this.retry_connection_with_prompt(
+                        session_id,
+                        profile_id,
+                        kind,
+                        error.clone(),
+                        cx,
+                    )
+                    && let Some(session) = this.session_mut(session_id)
+                {
+                    session.connection_error = Some(error);
                 }
                 cx.notify();
             });
         }));
     }
 
-    fn save_successful_credential(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let Some(credential) = self
-            .session_mut(session_id)
-            .and_then(|session| session.connection_credential.take())
-        else {
+    fn save_successful_credentials(
+        &mut self,
+        session_id: SessionId,
+        profile_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        let Some(secret) = credential.save_on_success else {
-            return;
-        };
-
-        let profile_id = credential.profile_id;
-        let kind = credential.kind;
-        let runtime = cx.global::<SshRuntime>().handle();
-        let credential_saved = self.tr("credential-saved");
-        let credential_save_failed = self.tr("credential-save-failed");
-        let credential_save_task_failed = self.tr("credential-save-task-failed");
-        cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn_blocking(move || save_credential(&profile_id, kind, &secret))
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                if let Some(session) = this.session_mut(session_id) {
-                    session.connection_message = Some(match result {
-                        Ok(Ok(())) => credential_saved,
-                        Ok(Err(error)) => format!("{credential_save_failed}: {error}"),
-                        Err(error) => format!("{credential_save_task_failed}: {error}"),
-                    });
-                }
-                cx.notify();
+        let credentials = std::mem::take(&mut session.connection_credentials);
+        let (successful, remaining): (Vec<_>, Vec<_>) =
+            credentials.into_iter().partition(|credential| {
+                credential.profile_id == profile_id
+                    || credential.kind == CredentialKind::ProxyPassword
             });
-        })
-        .detach();
+        session.connection_credentials = remaining;
+        let runtime = cx.global::<SshRuntime>().handle();
+        for credential in successful {
+            let Some(secret) = credential.save_on_success else {
+                continue;
+            };
+            let profile_id = credential.profile_id;
+            let kind = credential.kind;
+            let runtime = runtime.clone();
+            cx.spawn(async move |this, cx| {
+                let result = runtime
+                    .spawn_blocking(move || save_credential(&profile_id, kind, &secret))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    let saved_message = this.tr("credential-saved");
+                    if let Some(session) = this.session_mut(session_id) {
+                        session.connection_message = Some(match result {
+                            Ok(Ok(())) => saved_message,
+                            Ok(Err(error)) => error.to_string(),
+                            Err(error) => error.to_string(),
+                        });
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     fn disconnect_active_connection(&mut self, cx: &mut Context<Self>) {
@@ -6725,7 +7832,7 @@ impl RemCmdApp {
                         session.host_key_prompt = None;
                         session.terminal_resize_task = None;
                         session.connection_handle = None;
-                        session.connection_credential = None;
+                        session.connection_credentials.clear();
                         session.sftp_availability = SftpAvailability::Checking;
                         session.sftp.stop_loading();
                         session.sidebar_sftp.stop_loading();
@@ -6741,21 +7848,39 @@ impl RemCmdApp {
                     state == SessionState::Disconnected && session.close_when_disconnected
                 };
 
-                if state == SessionState::Connected {
-                    self.save_successful_credential(session_id, cx);
-                } else if close_when_disconnected {
+                if close_when_disconnected {
                     self.remove_session(session_id, cx);
                 }
                 self.sync_performance_monitoring();
 
                 true
             }
-            ConnectionEvent::HostKeyVerificationRequired(info) => {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("address", info.address());
-                let message = self.tr_with("connection-verify-host", &args);
+            ConnectionEvent::ConnectionStageChanged(stage) => {
+                let message = match stage {
+                    ConnectionStage::Proxy => self.tr("connection-connecting-proxy"),
+                    ConnectionStage::Jump { index, total, .. } => {
+                        let mut args = fluent_bundle::FluentArgs::new();
+                        args.set("index", index);
+                        args.set("total", total);
+                        self.tr_with("connection-connecting-jump", &args)
+                    }
+                    ConnectionStage::Target { .. } => self.tr("connection-connecting-target"),
+                };
                 if let Some(session) = self.session_mut(session_id) {
                     session.connection_message = Some(message);
+                }
+                true
+            }
+            ConnectionEvent::AuthenticationSucceeded { stage, .. } => {
+                if let Some(profile_id) = stage.profile_id() {
+                    self.save_successful_credentials(session_id, profile_id, cx);
+                }
+                true
+            }
+            ConnectionEvent::HostKeyVerificationRequired { stage, info } => {
+                let stage_label = connection_stage_label(&stage, &self.localizer);
+                if let Some(session) = self.session_mut(session_id) {
+                    session.connection_message = Some(format!("{stage_label}: {}", info.address()));
                     session.host_key_prompt = Some(info);
                 }
                 self.activate_session(session_id, cx);
@@ -6763,12 +7888,39 @@ impl RemCmdApp {
             }
             ConnectionEvent::Failed(error) => {
                 let connection_failed = self.tr("sftp-connection-failed");
+                let stage_profile_id = error
+                    .stage()
+                    .and_then(ConnectionStage::profile_id)
+                    .map(str::to_owned);
+                let rejected_kind = rejected_credential_kind(
+                    error.kind(),
+                    stage_profile_id.as_deref().and_then(|profile_id| {
+                        self.profiles
+                            .iter()
+                            .find(|profile| profile.id == profile_id)
+                            .map(|profile| &profile.auth)
+                    }),
+                );
                 let (failed_profile_id, failed_credential, close_when_disconnected) = {
                     let session = self
                         .session_mut(session_id)
                         .expect("checked session should still exist");
-                    let profile_id = session.profile_id.clone();
-                    let credential = session.connection_credential.take();
+                    let profile_id = stage_profile_id
+                        .clone()
+                        .unwrap_or_else(|| session.profile_id.clone());
+                    let credential_index =
+                        session
+                            .connection_credentials
+                            .iter()
+                            .position(|credential| {
+                                rejected_kind == Some(credential.kind)
+                                    && credential.profile_id == profile_id
+                            });
+                    let credential =
+                        credential_index.map(|index| session.connection_credentials.remove(index));
+                    // No credential can still succeed after the connection attempt has failed.
+                    // Drop every remaining runtime secret before presenting a retry action.
+                    session.connection_credentials.clear();
                     session.connection_state = SessionState::Failed;
                     session.terminal_resize_task = None;
                     session.connection_handle = None;
@@ -6792,7 +7944,9 @@ impl RemCmdApp {
                         (
                             profile_id,
                             Some(credential),
-                            SshErrorKind::Authentication | SshErrorKind::PrivateKeyPassphrase,
+                            SshErrorKind::Authentication
+                            | SshErrorKind::PrivateKeyPassphrase
+                            | SshErrorKind::ProxyAuthentication,
                         ) if credential.profile_id == profile_id => {
                             if credential.source == CredentialSource::SystemKeychain {
                                 self.remove_rejected_credential_then_prompt(
@@ -6818,6 +7972,15 @@ impl RemCmdApp {
                                             authentication_error,
                                             cx,
                                         ),
+                                    CredentialKind::ProxyPassword => self
+                                        .retry_connection_with_prompt(
+                                            session_id,
+                                            profile_id,
+                                            CredentialKind::ProxyPassword,
+                                            authentication_error,
+                                            cx,
+                                        ),
+                                    CredentialKind::ProxyCommand => false,
                                 }
                             }
                         }
@@ -6828,11 +7991,22 @@ impl RemCmdApp {
                                 authentication_error,
                                 cx,
                             ),
+                        (profile_id, None, SshErrorKind::ProxyAuthentication) => self
+                            .retry_connection_with_prompt(
+                                session_id,
+                                profile_id,
+                                CredentialKind::ProxyPassword,
+                                authentication_error,
+                                cx,
+                            ),
                         _ => false,
                     };
 
-                if !prompted_for_credential && let Some(session) = self.session_mut(session_id) {
-                    session.connection_error = Some(error.to_string());
+                if !prompted_for_credential {
+                    let message = localized_connection_error(&error, &self.localizer);
+                    if let Some(session) = self.session_mut(session_id) {
+                        session.connection_error = Some(message);
+                    }
                 }
                 true
             }
@@ -7460,7 +8634,9 @@ impl Render for RemCmdApp {
                 .child(deferred(self.render_terminal_context_menu(window, cx)).with_priority(20));
         }
 
-        if self
+        if self.proxy_command_approval_prompt.is_some() {
+            root = root.child(self.render_proxy_command_approval_prompt(cx));
+        } else if self
             .active_session()
             .is_some_and(|session| session.host_key_prompt.is_some())
         {
@@ -9416,6 +10592,11 @@ impl RemCmdApp {
                 self.tr("credential-passphrase"),
                 Some(path.display().to_string()),
             ),
+            CredentialPromptKind::ProxyPassword => (
+                self.tr("field-proxy-password"),
+                self.tr("field-proxy-password"),
+                None,
+            ),
         };
 
         let mut modal = self
@@ -9513,6 +10694,7 @@ impl RemCmdApp {
                         &self.theme,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.pending_connection = None;
                         this.dismiss_credential_prompt(cx);
                         cx.notify();
                     })),
@@ -9536,6 +10718,91 @@ impl RemCmdApp {
             .key_context("CredentialPrompt")
             .on_action(cx.listener(Self::on_submit_credential))
             .on_action(cx.listener(Self::on_cancel_credential))
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(self.theme.overlay_bg)
+            .occlude()
+            .child(modal)
+    }
+
+    fn render_proxy_command_approval_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let prompt = self
+            .proxy_command_approval_prompt
+            .as_ref()
+            .expect("ProxyCommand approval prompt should exist before rendering");
+        let command = prompt.expanded_command.expose_secret().to_owned();
+        let modal = self
+            .glass_floating_surface()
+            .w_full()
+            .max_w(px(620.0))
+            .mx_4()
+            .p_4()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("proxy-command-approval-title")),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .text_sm()
+                    .text_color(self.theme.status_warn)
+                    .child(self.tr("proxy-command-approval-risk")),
+            )
+            .child(
+                div()
+                    .id("proxy-command-preview")
+                    .mt_3()
+                    .max_h(px(220.0))
+                    .overflow_y_scroll()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(self.theme.border)
+                    .bg(self.theme.control_bg)
+                    .p_3()
+                    .font_family(UI_MONOSPACE_FONT_FAMILY)
+                    .text_sm()
+                    .child(command),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .mt_4()
+                    .child(
+                        text_button(
+                            "proxy-command-cancel",
+                            self.tr("common-cancel"),
+                            TextButtonTone::Secondary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_proxy_command_approval(cx);
+                        })),
+                    )
+                    .child(
+                        text_button(
+                            "proxy-command-approve",
+                            self.tr("common-trust-connect"),
+                            TextButtonTone::Primary,
+                            true,
+                            &self.theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.approve_proxy_command(cx);
+                        })),
+                    ),
+            );
+        div()
+            .id("proxy-command-approval-prompt")
             .absolute()
             .top_0()
             .right_0()
@@ -14039,6 +15306,7 @@ impl RemCmdApp {
                     ),
                 |this| this.child(self.render_saved_credential_row(cx)),
             )
+            .child(self.render_route_editor(editor, cx))
             .when_some(self.form_error.as_ref(), |this, error| {
                 this.child(
                     div()
@@ -14424,6 +15692,240 @@ impl RemCmdApp {
             .child(div().flex_none().w(px(112.0)).truncate().child(label))
             .child(div().flex_1().min_w(px(0.0)).child(field))
     }
+
+    fn render_route_editor(
+        &self,
+        editor: &ProfileEditor,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut proxy_options = div().flex().flex_wrap().gap_1();
+        for proxy_kind in ProfileProxyKind::OPTIONS {
+            let selected = editor.proxy_kind == proxy_kind;
+            proxy_options = proxy_options.child(
+                div()
+                    .id(SharedString::from(format!("profile-proxy-{proxy_kind:?}")))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(if selected {
+                        self.theme.accent
+                    } else {
+                        self.theme.control_bg
+                    })
+                    .text_color(if selected {
+                        self.theme.on_accent
+                    } else {
+                        self.theme.text_primary
+                    })
+                    .cursor_pointer()
+                    .child(self.tr(proxy_kind.label_key()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_proxy_method(proxy_kind, cx);
+                    })),
+            );
+        }
+
+        let mut route = div()
+            .flex()
+            .flex_col()
+            .mt_5()
+            .pt_4()
+            .border_t_1()
+            .border_color(self.theme.border)
+            .child(
+                div()
+                    .mb_2()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("profile-route")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .pt_1()
+                            .child(self.tr("profile-proxy")),
+                    )
+                    .child(proxy_options),
+            );
+        match editor.proxy_kind {
+            ProfileProxyKind::Direct => {}
+            ProfileProxyKind::HttpConnect | ProfileProxyKind::Socks5 => {
+                route = route
+                    .child(self.render_form_row(
+                        self.tr("field-proxy-host").into(),
+                        editor.proxy_host.clone(),
+                    ))
+                    .child(self.render_form_row(
+                        self.tr("field-proxy-port").into(),
+                        editor.proxy_port.clone(),
+                    ))
+                    .child(self.render_form_row(
+                        self.tr("field-proxy-username").into(),
+                        editor.proxy_username.clone(),
+                    ))
+                    .child(self.render_form_row(
+                        self.tr("field-proxy-password").into(),
+                        editor.proxy_password.clone(),
+                    ));
+            }
+            ProfileProxyKind::ProxyCommand => {
+                route = route.child(self.render_form_row(
+                    self.tr("field-proxy-command").into(),
+                    editor.proxy_command.clone(),
+                ));
+            }
+        }
+        if editor.proxy_kind != ProfileProxyKind::ProxyCommand {
+            route = route.child(self.render_jump_host_editor(editor, cx));
+        }
+        route
+    }
+
+    fn render_jump_host_editor(
+        &self,
+        editor: &ProfileEditor,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let query = editor.jump_search.read(cx).text().trim().to_lowercase();
+        let mut profiles = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.id != editor.profile_id)
+            .filter(|profile| {
+                query.is_empty()
+                    || profile.name.to_lowercase().contains(&query)
+                    || profile.host.to_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+        profiles.sort_by(|left, right| {
+            let left_order = editor.jump_host_ids.iter().position(|id| id == &left.id);
+            let right_order = editor.jump_host_ids.iter().position(|id| id == &right.id);
+            left_order
+                .cmp(&right_order)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        let mut rows = div()
+            .id("profile-jump-host-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(180.0))
+            .overflow_y_scroll();
+        for profile in profiles {
+            let id = profile.id.clone();
+            let toggle_id = id.clone();
+            let up_id = id.clone();
+            let down_id = id.clone();
+            let order = editor
+                .jump_host_ids
+                .iter()
+                .position(|candidate| candidate == &id);
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(30.0))
+                    .px_2()
+                    .rounded_md()
+                    .bg(self.theme.control_bg)
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("jump-toggle-{id}")))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(18.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(self.theme.border_strong)
+                            .bg(if order.is_some() {
+                                self.theme.accent
+                            } else {
+                                self.theme.transparent
+                            })
+                            .cursor_pointer()
+                            .when(order.is_some(), |this| {
+                                this.child(icon(
+                                    IconName::Check,
+                                    self.theme,
+                                    IconTone::Default,
+                                    12.0,
+                                ))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_jump_host(toggle_id.clone(), cx);
+                            })),
+                    )
+                    .child(div().flex_1().min_w(px(0.0)).truncate().child(match order {
+                        Some(index) => format!("{}. {}", index + 1, profile.name),
+                        None => profile.name.clone(),
+                    }))
+                    .when_some(order, |this, index| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("jump-up-{id}")))
+                                .px_1()
+                                .cursor_pointer()
+                                .text_color(if index > 0 {
+                                    self.theme.text_primary
+                                } else {
+                                    self.theme.text_faint
+                                })
+                                .child("↑")
+                                .when(index > 0, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_jump_host(up_id.clone(), -1, cx);
+                                    }))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("jump-down-{id}")))
+                                .px_1()
+                                .cursor_pointer()
+                                .text_color(if index + 1 < editor.jump_host_ids.len() {
+                                    self.theme.text_primary
+                                } else {
+                                    self.theme.text_faint
+                                })
+                                .child("↓")
+                                .when(index + 1 < editor.jump_host_ids.len(), |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_jump_host(down_id.clone(), 1, cx);
+                                    }))
+                                }),
+                        )
+                    }),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(112.0))
+                            .child(self.tr("profile-jump-hosts")),
+                    )
+                    .child(div().flex_1().child(editor.jump_search.clone())),
+            )
+            .child(rows)
+    }
 }
 
 impl EntityInputHandler for RemCmdApp {
@@ -14555,6 +16057,38 @@ fn auth_method_with_secret(prompt_kind: CredentialPromptKind, secret: SecretStri
             path,
             passphrase: Some(secret),
         },
+        CredentialPromptKind::ProxyPassword => {
+            unreachable!("proxy passwords are applied to RuntimeProxy")
+        }
+    }
+}
+
+fn runtime_proxy_with_password(
+    profile: &ConnectionProfile,
+    password: SecretString,
+) -> Option<RuntimeProxy> {
+    match profile.route.upstream_proxy.as_ref()? {
+        ProxyConfig::HttpConnect {
+            host,
+            port,
+            username,
+        } => Some(RuntimeProxy::http_connect(
+            host.clone(),
+            *port,
+            username.clone(),
+            Some(password),
+        )),
+        ProxyConfig::Socks5 {
+            host,
+            port,
+            username,
+        } => Some(RuntimeProxy::socks5(
+            host.clone(),
+            *port,
+            username.clone(),
+            Some(password),
+        )),
+        ProxyConfig::ProxyCommand { .. } => None,
     }
 }
 
@@ -14576,6 +16110,19 @@ const fn profile_auth_kind_key(kind: ProfileAuthKind) -> &'static str {
     }
 }
 
+fn connection_stage_label(stage: &ConnectionStage, localizer: &Localizer) -> String {
+    match stage {
+        ConnectionStage::Proxy => localizer.text("connection-stage-proxy"),
+        ConnectionStage::Jump { index, total, .. } => {
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("index", *index);
+            args.set("total", *total);
+            localizer.text_with("connection-stage-jump", Some(&args))
+        }
+        ConnectionStage::Target { .. } => localizer.text("connection-stage-target"),
+    }
+}
+
 fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String {
     let (summary_key, suggestion_key) = match error.kind() {
         SshErrorKind::InvalidState | SshErrorKind::Configuration => (
@@ -14585,6 +16132,18 @@ fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String
         SshErrorKind::Network => (
             "connection-error-summary-network",
             "connection-error-suggestion-network",
+        ),
+        SshErrorKind::Proxy => (
+            "connection-error-summary-proxy",
+            "connection-error-suggestion-proxy",
+        ),
+        SshErrorKind::ProxyAuthentication => (
+            "connection-error-summary-proxy-auth",
+            "connection-error-suggestion-proxy-auth",
+        ),
+        SshErrorKind::ProxyCommandApproval => (
+            "connection-error-summary-proxy-command",
+            "connection-error-suggestion-proxy-command",
         ),
         SshErrorKind::HostKeyUntrusted
         | SshErrorKind::HostKeyChanged
@@ -14610,9 +16169,13 @@ fn localized_connection_error(error: &SshError, localizer: &Localizer) -> String
             "connection-error-suggestion-sftp",
         ),
     };
+    let summary = localizer.text(summary_key);
+    let headline = error.stage().map_or_else(
+        || summary.clone(),
+        |stage| format!("{}: {summary}", connection_stage_label(stage, localizer)),
+    );
     format!(
-        "{}\n{}\n{}: {}",
-        localizer.text(summary_key),
+        "{headline}\n{}\n{}: {}",
         localizer.text(suggestion_key),
         localizer.text("connection-technical-details"),
         error.message()
@@ -14641,6 +16204,20 @@ fn credentials_invalidated_by_edit(
         || profile.port != port
         || profile.username != username
         || profile.auth != *auth
+}
+
+fn rejected_credential_kind(
+    error_kind: SshErrorKind,
+    authentication: Option<&AuthConfig>,
+) -> Option<CredentialKind> {
+    match error_kind {
+        SshErrorKind::ProxyAuthentication => Some(CredentialKind::ProxyPassword),
+        SshErrorKind::PrivateKeyPassphrase => Some(CredentialKind::PrivateKeyPassphrase),
+        SshErrorKind::Authentication if matches!(authentication, Some(AuthConfig::Password)) => {
+            Some(CredentialKind::Password)
+        }
+        _ => None,
+    }
 }
 
 fn clamp_sidebar_width(requested: f32, viewport_width: f32) -> f32 {
@@ -16949,6 +18526,54 @@ mod tests {
             "user",
             &AuthConfig::Agent,
         ));
+    }
+
+    #[test]
+    fn authentication_failures_select_only_the_matching_credential_kind() {
+        assert_eq!(
+            rejected_credential_kind(SshErrorKind::Authentication, Some(&AuthConfig::Password)),
+            Some(CredentialKind::Password)
+        );
+        assert_eq!(
+            rejected_credential_kind(
+                SshErrorKind::Authentication,
+                Some(&AuthConfig::PrivateKey {
+                    path: PathBuf::from("id_ed25519")
+                })
+            ),
+            None
+        );
+        assert_eq!(
+            rejected_credential_kind(SshErrorKind::ProxyAuthentication, None),
+            Some(CredentialKind::ProxyPassword)
+        );
+        assert_eq!(
+            rejected_credential_kind(
+                SshErrorKind::PrivateKeyPassphrase,
+                Some(&AuthConfig::PrivateKey {
+                    path: PathBuf::from("id_ed25519")
+                })
+            ),
+            Some(CredentialKind::PrivateKeyPassphrase)
+        );
+    }
+
+    #[test]
+    fn connection_errors_localize_summary_and_preserve_technical_details() {
+        let error = SshError::new(SshErrorKind::Network, "connection refused by 10.0.0.1")
+            .at_stage(ConnectionStage::Jump {
+                index: 1,
+                total: 2,
+                profile_id: "jump".into(),
+            });
+
+        let english = localized_connection_error(&error, &Localizer::new(LanguageMode::EnUs));
+        let chinese = localized_connection_error(&error, &Localizer::new(LanguageMode::ZhCn));
+
+        assert!(english.contains("Jump 1/2: Network connection failed"));
+        assert!(chinese.contains("跳板 1/2: 网络连接失败"));
+        assert!(english.contains(error.message()));
+        assert!(chinese.contains(error.message()));
     }
 
     #[test]

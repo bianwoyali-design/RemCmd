@@ -2,6 +2,14 @@ use std::path::PathBuf;
 
 use secrecy::SecretString;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethodKind {
+    None,
+    Password,
+    PrivateKey,
+    Agent,
+}
+
 /// Authentication information used for one SSH connection.
 ///
 /// This type intentionally does not implement Serialize, Deserialize,
@@ -24,6 +32,15 @@ pub enum AuthMethod {
 }
 
 impl AuthMethod {
+    pub const fn kind(&self) -> AuthMethodKind {
+        match self {
+            Self::None => AuthMethodKind::None,
+            Self::Password { .. } => AuthMethodKind::Password,
+            Self::PrivateKey { .. } => AuthMethodKind::PrivateKey,
+            Self::Agent => AuthMethodKind::Agent,
+        }
+    }
+
     pub fn password(password: String) -> Self {
         Self::Password {
             // Consume String and convert it into the Box<str>

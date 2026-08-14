@@ -352,6 +352,12 @@ async fn worker_reports_connection_failure() {
         next_event(&mut events).await,
         ConnectionEvent::StateChanged(SessionState::Connecting)
     );
+    assert_eq!(
+        next_event(&mut events).await,
+        ConnectionEvent::ConnectionStageChanged(ConnectionStage::Target {
+            profile_id: "worker-test".into(),
+        })
+    );
 
     let ConnectionEvent::Failed(error) = next_event(&mut events).await else {
         panic!("connection refusal should produce a failure event");
@@ -383,6 +389,12 @@ async fn worker_cancels_a_stalled_handshake() {
     assert_eq!(
         next_event(&mut events).await,
         ConnectionEvent::StateChanged(SessionState::Connecting)
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        ConnectionEvent::ConnectionStageChanged(ConnectionStage::Target {
+            profile_id: "worker-test".into(),
+        })
     );
 
     handle

@@ -27,7 +27,11 @@ use tokio::{
 };
 
 use crate::{
-    AuthMethod, HostKeyInfo, PtySize, SshError, SshErrorKind, SshShell, shell_integration,
+    AuthMethod, ConnectionPlan, ConnectionStage, HostKeyInfo, PtySize, RuntimeProxy, SshError,
+    SshErrorKind, SshShell,
+    plan::ConnectionStep,
+    proxy::{BoxedStream, open_initial_stream},
+    shell_integration,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -187,13 +191,41 @@ impl PendingHostKey {
 /// Owns the live russh connection after TCP and SSH handshakes complete.
 pub struct SshTransport {
     handle: client::Handle<ClientHandler>,
+    upstream_handles: Vec<client::Handle<ClientHandler>>,
 }
 
 impl SshTransport {
     /// Opens TCP and completes the SSH handshake without authenticating.
+    #[cfg(test)]
     async fn open_connection_with_timeout(
         profile: &ConnectionProfile,
         timeout: Duration,
+    ) -> Result<TransportOpen, SshError> {
+        Self::open_first_with_timeout(profile, None, timeout).await
+    }
+
+    async fn open_first_with_timeout(
+        profile: &ConnectionProfile,
+        proxy: Option<&RuntimeProxy>,
+        timeout: Duration,
+    ) -> Result<TransportOpen, SshError> {
+        let connection = async {
+            let stream = open_initial_stream(proxy, profile).await?;
+            Self::open_stream(profile, stream).await
+        };
+        tokio::time::timeout(timeout, connection)
+            .await
+            .map_err(|_| {
+                SshError::new(
+                    SshErrorKind::Timeout,
+                    format!("connection to {}:{} timed out", profile.host, profile.port),
+                )
+            })?
+    }
+
+    async fn open_stream(
+        profile: &ConnectionProfile,
+        stream: BoxedStream,
     ) -> Result<TransportOpen, SshError> {
         let config = Arc::new(client::Config {
             nodelay: true,
@@ -206,23 +238,13 @@ impl SshTransport {
             profile.port,
             unknown_server_key.clone(),
         );
-        let connection = async {
-            let socket = connect_tcp(&profile.host, profile.port).await?;
-            let _ = socket.set_nodelay(true);
-            client::connect_stream(config, socket, handler).await
-        };
-
-        let result = tokio::time::timeout(timeout, connection)
-            .await
-            .map_err(|_| {
-                SshError::new(
-                    SshErrorKind::Timeout,
-                    format!("connection to {}:{} timed out", profile.host, profile.port),
-                )
-            })?;
+        let result = client::connect_stream(config, stream, handler).await;
 
         match result {
-            Ok(handle) => Ok(TransportOpen::Connected(Self { handle })),
+            Ok(handle) => Ok(TransportOpen::Connected(Self {
+                handle,
+                upstream_handles: Vec::new(),
+            })),
             Err(error) => {
                 if error.kind() != SshErrorKind::HostKeyUntrusted {
                     return Err(error);
@@ -244,6 +266,32 @@ impl SshTransport {
                 )))
             }
         }
+    }
+
+    async fn open_via_with_timeout(
+        &self,
+        profile: &ConnectionProfile,
+        timeout: Duration,
+    ) -> Result<TransportOpen, SshError> {
+        let connection = async {
+            let channel = self
+                .handle
+                .channel_open_direct_tcpip(&profile.host, u32::from(profile.port), "127.0.0.1", 0)
+                .await
+                .map_err(SshError::from)?;
+            Self::open_stream(profile, Box::new(channel.into_stream())).await
+        };
+        tokio::time::timeout(timeout, connection)
+            .await
+            .map_err(|_| {
+                SshError::new(
+                    SshErrorKind::Timeout,
+                    format!(
+                        "opening tunneled connection to {}:{} timed out",
+                        profile.host, profile.port
+                    ),
+                )
+            })?
     }
 
     async fn authenticate_with_timeout(
@@ -516,12 +564,18 @@ impl SshTransport {
         ))
     }
 
-    /// Opens TCP and completes the SSH handshake without authenticating.
-    ///
-    /// This remains crate-private so callers outside remcmd-ssh cannot retain
-    /// an unauthenticated transport accidentally.
-    pub(crate) async fn open(profile: &ConnectionProfile) -> Result<TransportOpen, SshError> {
-        Self::open_connection_with_timeout(profile, CONNECT_TIMEOUT).await
+    pub(crate) async fn open_first(
+        profile: &ConnectionProfile,
+        proxy: Option<&RuntimeProxy>,
+    ) -> Result<TransportOpen, SshError> {
+        Self::open_first_with_timeout(profile, proxy, CONNECT_TIMEOUT).await
+    }
+
+    pub(crate) async fn open_via(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<TransportOpen, SshError> {
+        self.open_via_with_timeout(profile, CONNECT_TIMEOUT).await
     }
 
     /// Authenticates an already-open SSH transport.
@@ -541,16 +595,76 @@ impl SshTransport {
     /// This convenience API remains available to callers that do not need
     /// progress events for the individual connection stages.
     pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
-        let mut transport = match Self::open(profile).await? {
-            TransportOpen::Connected(transport) => transport,
-            TransportOpen::UnknownHostKey(pending) => return Err(pending.rejected_error()),
+        Self::connect_plan(ConnectionPlan::direct(profile.clone(), auth)).await
+    }
+
+    /// Establishes every proxy, jump, and target step in a validated runtime plan.
+    pub async fn connect_plan(plan: ConnectionPlan) -> Result<Self, SshError> {
+        plan.validate()?;
+        let (target, jumps, proxy) = plan.into_parts();
+        let jump_total = jumps.len();
+        let mut steps = jumps
+            .into_iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let stage = ConnectionStage::Jump {
+                    index: index + 1,
+                    total: jump_total,
+                    profile_id: step.profile.id.clone(),
+                };
+                (step, stage)
+            })
+            .collect::<Vec<_>>();
+        let target_stage = ConnectionStage::Target {
+            profile_id: target.profile.id.clone(),
         };
+        steps.push((target, target_stage));
 
-        transport
-            .authenticate(profile.username.as_str(), auth)
-            .await?;
+        let mut established: Vec<Self> = Vec::new();
+        for (step_index, (step, stage)) in steps.into_iter().enumerate() {
+            let ConnectionStep { profile, auth } = step;
+            let opened = if step_index == 0 {
+                Self::open_first(&profile, proxy.as_ref()).await
+            } else {
+                established
+                    .last()
+                    .expect("a previous jump transport exists")
+                    .open_via(&profile)
+                    .await
+            };
+            let mut transport = match opened {
+                Ok(TransportOpen::Connected(transport)) => transport,
+                Ok(TransportOpen::UnknownHostKey(pending)) => {
+                    Self::disconnect_established(&established).await;
+                    return Err(pending.rejected_error().at_stage(stage));
+                }
+                Err(error) => {
+                    Self::disconnect_established(&established).await;
+                    return Err(error.at_stage(stage));
+                }
+            };
+            let auth_kind = auth.kind();
+            if let Err(error) = transport.authenticate(&profile.username, auth).await {
+                let _ = transport.disconnect_current().await;
+                Self::disconnect_established(&established).await;
+                tracing::warn!(
+                    stage = stage_name(&stage),
+                    authentication = ?auth_kind,
+                    result = "failed",
+                    "SSH authentication failed"
+                );
+                return Err(error.at_stage(stage));
+            }
+            tracing::info!(
+                stage = stage_name(&stage),
+                authentication = ?auth_kind,
+                result = "success",
+                "SSH authentication completed"
+            );
+            established.push(transport);
+        }
 
-        Ok(transport)
+        Ok(Self::combine_chain(established))
     }
 
     pub async fn open_shell(&self, size: PtySize) -> Result<SshShell, SshError> {
@@ -666,6 +780,28 @@ impl SshTransport {
     /// Dropping SshTransport also closes local resources, but this method
     /// lets the server receive an explicit and orderly disconnect message.
     pub async fn disconnect(&self) -> Result<(), SshError> {
+        let mut first_error = self.disconnect_current().await.err();
+        for handle in self.upstream_handles.iter().rev() {
+            if let Err(error) = handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "Disconnected by user",
+                    "en",
+                )
+                .await
+                .map_err(SshError::from)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn disconnect_current(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(
                 russh::Disconnect::ByApplication,
@@ -676,13 +812,33 @@ impl SshTransport {
             .map_err(SshError::from)
     }
 
+    pub(crate) async fn disconnect_established(transports: &[Self]) {
+        for transport in transports.iter().rev() {
+            let _ = transport.disconnect_current().await;
+        }
+    }
+
+    pub(crate) fn combine_chain(mut transports: Vec<Self>) -> Self {
+        let mut final_transport = transports
+            .pop()
+            .expect("an SSH transport chain always contains a target");
+        let mut upstream_handles = Vec::new();
+        for mut transport in transports {
+            upstream_handles.append(&mut transport.upstream_handles);
+            upstream_handles.push(transport.handle);
+        }
+        upstream_handles.append(&mut final_transport.upstream_handles);
+        final_transport.upstream_handles = upstream_handles;
+        final_transport
+    }
+
     /// Reports whether the russh background connection has stopped.
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
     }
 }
 
-async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
+pub(crate) async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
     let addresses = lookup_host((host, port)).await.map_err(|error| {
         SshError::new(
             SshErrorKind::Network,
@@ -690,6 +846,14 @@ async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
         )
     })?;
     race_tcp_connections(addresses).await
+}
+
+fn stage_name(stage: &ConnectionStage) -> &'static str {
+    match stage {
+        ConnectionStage::Proxy => "proxy",
+        ConnectionStage::Jump { .. } => "jump",
+        ConnectionStage::Target { .. } => "target",
+    }
 }
 
 async fn race_tcp_connections(
