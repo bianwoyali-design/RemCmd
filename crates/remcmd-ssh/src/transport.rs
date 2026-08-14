@@ -790,9 +790,10 @@ impl SshTransport {
                 )
                 .await
                 .map_err(SshError::from)
-                && first_error.is_none()
             {
-                first_error = Some(error);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
         match first_error {
