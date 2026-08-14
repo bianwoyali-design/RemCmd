@@ -11,9 +11,15 @@ use remcmd_core::{
 use secrecy::SecretString;
 
 mod credentials;
+mod openssh;
 pub use credentials::{
     CredentialKind, CredentialStoreError, delete_credential, delete_profile_auth_credentials,
     delete_profile_credentials, load_credential, save_credential,
+};
+pub use openssh::{
+    OpenSshApplyError, OpenSshImportCandidate, OpenSshImportPreview, OpenSshImportStatus,
+    OpenSshImportWarning, apply_openssh_import, default_openssh_config_path,
+    preview_openssh_import, profile_import_digest,
 };
 
 pub fn default_profiles_path() -> io::Result<PathBuf> {

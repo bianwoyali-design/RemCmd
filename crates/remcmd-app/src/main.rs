@@ -86,10 +86,11 @@ use remcmd_ssh::{
     TransferRateLimiter, proxy_command_content_digest,
 };
 use remcmd_storage::{
-    AppSettings, CredentialKind, default_profiles_path, default_settings_path, delete_credential,
+    AppSettings, CredentialKind, OpenSshImportPreview, OpenSshImportStatus, apply_openssh_import,
+    default_openssh_config_path, default_profiles_path, default_settings_path, delete_credential,
     delete_profile_auth_credentials, delete_profile_credentials, ensure_profiles_file,
-    load_credential, load_profiles, load_settings, save_credential, save_profiles,
-    save_profiles_with_route_secrets, save_settings,
+    load_credential, load_profiles, load_settings, preview_openssh_import, save_credential,
+    save_profiles, save_profiles_with_route_secrets, save_settings,
 };
 use remcmd_terminal::{
     Clipboard as TerminalClipboard, Scroll as TerminalScroll, TerminalDamage, TerminalEngine,
@@ -281,6 +282,11 @@ struct RemCmdApp {
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
+    openssh_import_preview: Option<OpenSshImportPreview>,
+    openssh_selected_aliases: HashSet<String>,
+    openssh_overwrite_conflicts: HashSet<String>,
+    openssh_import_loading: bool,
+    openssh_import_error: Option<String>,
     about_window: Option<WindowHandle<AboutWindow>>,
     _appearance_subscription: Subscription,
 }
@@ -780,6 +786,7 @@ enum ActivePanel {
     Server,
     Connection,
     Settings,
+    OpenSshImport,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2369,6 +2376,11 @@ impl RemCmdApp {
             theme,
             settings_path,
             settings_error,
+            openssh_import_preview: None,
+            openssh_selected_aliases: HashSet::new(),
+            openssh_overwrite_conflicts: HashSet::new(),
+            openssh_import_loading: false,
+            openssh_import_error: None,
             about_window: None,
             _appearance_subscription: appearance_subscription,
         };
@@ -4945,6 +4957,190 @@ impl RemCmdApp {
         self.active_panel = ActivePanel::Settings;
         self.open_settings_selector = None;
         self.settings_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn show_openssh_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_credential_prompt(cx);
+        self.active_panel = ActivePanel::OpenSshImport;
+        self.settings_focus_handle.focus(window);
+        if self.openssh_import_preview.is_none()
+            && !self.openssh_import_loading
+            && let Ok(path) = default_openssh_config_path()
+        {
+            self.load_openssh_preview(path, cx);
+        }
+        cx.notify();
+    }
+
+    fn choose_openssh_config(&mut self, cx: &mut Context<Self>) {
+        let selected_paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.tr("common-select").into()),
+        });
+        cx.spawn(async move |this, cx| match selected_paths.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |this, cx| this.load_openssh_preview(path, cx));
+                }
+            }
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.openssh_import_error =
+                        Some(format!("{}: {error}", this.tr("app-file-picker-failed")));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn load_openssh_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.openssh_import_loading {
+            return;
+        }
+        self.openssh_import_loading = true;
+        self.openssh_import_error = None;
+        let profiles = self.profiles.clone();
+        let runtime = cx.global::<SshRuntime>().handle();
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn_blocking(move || preview_openssh_import(&path, &profiles))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.openssh_import_loading = false;
+                match result {
+                    Ok(Ok(preview)) => {
+                        let mut selected = preview
+                            .candidates
+                            .iter()
+                            .filter(|candidate| {
+                                matches!(
+                                    candidate.status,
+                                    OpenSshImportStatus::New | OpenSshImportStatus::Update
+                                )
+                            })
+                            .map(|candidate| candidate.alias.clone())
+                            .collect();
+                        include_openssh_dependencies(&preview, &mut selected);
+                        this.openssh_selected_aliases = selected;
+                        this.openssh_overwrite_conflicts.clear();
+                        this.openssh_import_preview = Some(preview);
+                    }
+                    Ok(Err(error)) => {
+                        this.openssh_import_error =
+                            Some(format!("{}: {error}", this.tr("import-preview-failed")));
+                    }
+                    Err(error) => {
+                        this.openssh_import_error =
+                            Some(format!("{}: {error}", this.tr("import-preview-failed")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn toggle_openssh_candidate(&mut self, alias: String, cx: &mut Context<Self>) {
+        if !self.openssh_selected_aliases.remove(&alias) {
+            self.openssh_selected_aliases.insert(alias);
+            if let Some(preview) = self.openssh_import_preview.as_ref() {
+                include_openssh_dependencies(preview, &mut self.openssh_selected_aliases);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_openssh_conflict_policy(&mut self, alias: String, cx: &mut Context<Self>) {
+        if !self.openssh_overwrite_conflicts.remove(&alias) {
+            self.openssh_overwrite_conflicts.insert(alias);
+        }
+        cx.notify();
+    }
+
+    fn cycle_openssh_authentication(&mut self, alias: String, cx: &mut Context<Self>) {
+        let Some(candidate) = self.openssh_import_preview.as_mut().and_then(|preview| {
+            preview
+                .candidates
+                .iter_mut()
+                .find(|candidate| candidate.alias == alias)
+        }) else {
+            return;
+        };
+        let identity_file = candidate.identity_file().map(Path::to_path_buf);
+        let Some(profile) = candidate.profile.as_mut() else {
+            return;
+        };
+        profile.auth = match &profile.auth {
+            AuthConfig::None => AuthConfig::Password,
+            AuthConfig::Password => identity_file
+                .map(|path| AuthConfig::PrivateKey { path })
+                .unwrap_or(AuthConfig::Agent),
+            AuthConfig::Agent => AuthConfig::None,
+            AuthConfig::PrivateKey { .. } => AuthConfig::Agent,
+        };
+        cx.notify();
+    }
+
+    fn apply_openssh_preview(&mut self, cx: &mut Context<Self>) {
+        if self.openssh_import_loading || self.openssh_selected_aliases.is_empty() {
+            return;
+        }
+        let Some(preview) = self.openssh_import_preview.clone() else {
+            return;
+        };
+        let root_path = preview.root_path.clone();
+        self.openssh_import_loading = true;
+        self.openssh_import_error = None;
+        let existing = self.profiles.clone();
+        let profiles_path = self.profiles_path.clone();
+        let selected = self.openssh_selected_aliases.clone();
+        let overwrite = self.openssh_overwrite_conflicts.clone();
+        let runtime = cx.global::<SshRuntime>().handle();
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn_blocking(move || {
+                    apply_openssh_import(
+                        &profiles_path,
+                        &existing,
+                        &preview.candidates,
+                        &selected,
+                        &overwrite,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.openssh_import_loading = false;
+                match result {
+                    Ok(Ok(profiles)) => {
+                        this.profiles = profiles;
+                        this.selected_profile_id = this
+                            .selected_profile_id
+                            .clone()
+                            .filter(|id| this.profiles.iter().any(|profile| &profile.id == id))
+                            .or_else(|| this.profiles.first().map(|profile| profile.id.clone()));
+                        this.openssh_import_error = None;
+                        this.openssh_selected_aliases.clear();
+                        this.load_openssh_preview(root_path, cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.openssh_import_error =
+                            Some(format!("{}: {error}", this.tr("import-apply-failed")));
+                    }
+                    Err(error) => {
+                        this.openssh_import_error =
+                            Some(format!("{}: {error}", this.tr("import-apply-failed")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -12584,6 +12780,7 @@ impl RemCmdApp {
             ActivePanel::Home => return self.render_home(cx),
             ActivePanel::Server => return self.render_server_overview(selected_profile, cx),
             ActivePanel::Settings => return self.render_settings(cx),
+            ActivePanel::OpenSshImport => return self.render_openssh_import(cx),
             ActivePanel::Connection => {}
         }
         if self.active_session().is_some_and(TerminalSession::is_local)
@@ -12842,6 +13039,33 @@ impl RemCmdApp {
                     .child(self.tr("settings-transfers")),
             )
             .child(transfer_group)
+            .child(
+                div()
+                    .w_full()
+                    .mt_6()
+                    .mb_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("import-title")),
+            )
+            .child(
+                div()
+                    .id("open-openssh-import")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .min_h(px(38.0))
+                    .px(px(10.0))
+                    .rounded_lg()
+                    .bg(self.theme.settings_group_bg)
+                    .cursor_pointer()
+                    .hover(|this| this.bg(self.theme.control_hover_bg))
+                    .child(self.tr("import-openssh"))
+                    .child(icon(IconName::Expand, self.theme, IconTone::Default, 15.0))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_openssh_import(window, cx);
+                    })),
+            )
             .when_some(self.settings_error.as_ref(), |this, error| {
                 this.child(
                     div()
@@ -12858,6 +13082,303 @@ impl RemCmdApp {
             .track_focus(&self.settings_focus_handle)
             .on_action(cx.listener(Self::on_cancel_settings_selector))
             .child(content)
+    }
+
+    fn render_openssh_import(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut candidates = div().flex().flex_col().gap_2().w_full();
+        if let Some(preview) = self.openssh_import_preview.as_ref() {
+            if !preview.warnings.is_empty() {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", preview.warnings.len());
+                let warning_text = preview
+                    .warnings
+                    .iter()
+                    .map(|warning| {
+                        format!(
+                            "{}:{}: {}",
+                            warning.path.display(),
+                            warning.line,
+                            warning.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                candidates = candidates.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(self.theme.control_bg)
+                        .text_sm()
+                        .text_color(self.theme.status_warn)
+                        .child(self.tr_with("import-warning-count", &args))
+                        .child(
+                            div()
+                                .font_family(UI_MONOSPACE_FONT_FAMILY)
+                                .text_xs()
+                                .child(warning_text),
+                        ),
+                );
+            }
+            for candidate in &preview.candidates {
+                let alias = candidate.alias.clone();
+                let toggle_alias = alias.clone();
+                let policy_alias = alias.clone();
+                let auth_alias = alias.clone();
+                let selected = self.openssh_selected_aliases.contains(&alias);
+                let invalid = candidate.status == OpenSshImportStatus::Invalid;
+                let overwrite = self.openssh_overwrite_conflicts.contains(&alias);
+                let status_key = openssh_status_key(candidate.status);
+                let auth_label = candidate
+                    .profile
+                    .as_ref()
+                    .map(|profile| profile_auth_label(&profile.auth, &self.localizer))
+                    .unwrap_or_else(|| self.tr("common-none"));
+                let endpoint = candidate
+                    .profile
+                    .as_ref()
+                    .map(ConnectionProfile::address)
+                    .unwrap_or_default();
+                let warning_text = candidate
+                    .warnings
+                    .iter()
+                    .map(|warning| {
+                        format!(
+                            "{}:{}: {}",
+                            warning.path.display(),
+                            warning.line,
+                            warning.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                candidates = candidates.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_3()
+                        .py_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(self.theme.border)
+                        .bg(self.theme.settings_group_bg)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("import-select-{alias}")))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(20.0))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(self.theme.border_strong)
+                                        .bg(if selected {
+                                            self.theme.accent
+                                        } else {
+                                            self.theme.control_bg
+                                        })
+                                        .cursor_pointer()
+                                        .when(selected, |this| {
+                                            this.child(icon(
+                                                IconName::Check,
+                                                self.theme,
+                                                IconTone::Default,
+                                                13.0,
+                                            ))
+                                        })
+                                        .when(!invalid, |this| {
+                                            this.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_openssh_candidate(
+                                                    toggle_alias.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(alias.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(self.theme.text_muted)
+                                                .child(endpoint),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .bg(self.theme.control_bg)
+                                        .child(self.tr(status_key)),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("import-auth-{alias}")))
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .bg(self.theme.control_bg)
+                                        .cursor_pointer()
+                                        .child(auth_label)
+                                        .when(!invalid, |this| {
+                                            this.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.cycle_openssh_authentication(
+                                                    auth_alias.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                        }),
+                                ),
+                        )
+                        .when(candidate.status == OpenSshImportStatus::Conflict, |this| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("import-policy-{alias}")))
+                                    .text_sm()
+                                    .text_color(self.theme.status_warn)
+                                    .cursor_pointer()
+                                    .child(if overwrite {
+                                        self.tr("import-overwrite-local")
+                                    } else {
+                                        self.tr("import-keep-local")
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_openssh_conflict_policy(
+                                            policy_alias.clone(),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                        })
+                        .when(!warning_text.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .font_family(UI_MONOSPACE_FONT_FAMILY)
+                                    .text_xs()
+                                    .text_color(self.theme.status_warn)
+                                    .child(warning_text),
+                            )
+                        }),
+                );
+            }
+            if preview.candidates.is_empty() {
+                candidates = candidates.child(
+                    div()
+                        .py_8()
+                        .text_center()
+                        .text_color(self.theme.text_muted)
+                        .child(self.tr("import-no-candidates")),
+                );
+            }
+        }
+
+        let browse = text_button(
+            "openssh-browse",
+            self.tr("common-browse"),
+            TextButtonTone::Secondary,
+            !self.openssh_import_loading,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.choose_openssh_config(cx)));
+        let apply = text_button(
+            "openssh-apply",
+            if self.openssh_import_loading {
+                self.tr("common-loading")
+            } else {
+                self.tr("import-apply")
+            },
+            TextButtonTone::Primary,
+            !self.openssh_import_loading && !self.openssh_selected_aliases.is_empty(),
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.apply_openssh_preview(cx)));
+        let source = self
+            .openssh_import_preview
+            .as_ref()
+            .map(|preview| preview.root_path.display().to_string())
+            .unwrap_or_else(|| {
+                default_openssh_config_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            });
+
+        self.detail_panel_shell().child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap_3()
+                .pt_4()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.tr("import-title")),
+                        )
+                        .child(div().flex().gap_2().child(browse).child(apply)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(
+                            div()
+                                .text_color(self.theme.text_muted)
+                                .child(self.tr("import-source")),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_MONOSPACE_FONT_FAMILY)
+                                .truncate()
+                                .child(source),
+                        ),
+                )
+                .when_some(self.openssh_import_error.as_ref(), |this, error| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(self.theme.error_text)
+                            .child(error.clone()),
+                    )
+                })
+                .child(
+                    div()
+                        .id("openssh-import-candidates")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .child(candidates),
+                ),
+        )
     }
 
     fn render_settings_row(
@@ -16089,6 +16610,51 @@ fn runtime_proxy_with_password(
             Some(password),
         )),
         ProxyConfig::ProxyCommand { .. } => None,
+    }
+}
+
+const fn openssh_status_key(status: OpenSshImportStatus) -> &'static str {
+    match status {
+        OpenSshImportStatus::New => "import-status-new",
+        OpenSshImportStatus::Update => "import-status-update",
+        OpenSshImportStatus::Unchanged => "import-status-unchanged",
+        OpenSshImportStatus::Conflict => "import-status-conflict",
+        OpenSshImportStatus::Invalid => "import-status-invalid",
+    }
+}
+
+fn include_openssh_dependencies(
+    preview: &OpenSshImportPreview,
+    selected_aliases: &mut HashSet<String>,
+) {
+    let alias_by_id = preview
+        .candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .profile
+                .as_ref()
+                .map(|profile| (profile.id.as_str(), candidate.alias.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    loop {
+        let mut added = false;
+        for candidate in &preview.candidates {
+            if !selected_aliases.contains(&candidate.alias) {
+                continue;
+            }
+            let Some(profile) = candidate.profile.as_ref() else {
+                continue;
+            };
+            for jump_id in &profile.route.jump_host_ids {
+                if let Some(alias) = alias_by_id.get(jump_id.as_str()) {
+                    added |= selected_aliases.insert((*alias).to_owned());
+                }
+            }
+        }
+        if !added {
+            break;
+        }
     }
 }
 

@@ -13,6 +13,8 @@ pub struct ConnectionProfile {
     pub auth: AuthConfig,
     #[serde(default)]
     pub route: ConnectionRoute,
+    #[serde(default)]
+    pub source: Option<ProfileSource>,
 }
 
 impl ConnectionProfile {
@@ -31,6 +33,7 @@ impl ConnectionProfile {
             username: username.into(),
             auth: AuthConfig::default(),
             route: ConnectionRoute::default(),
+            source: None,
         }
     }
 
@@ -80,6 +83,16 @@ pub enum ProxyConfig {
         command_digest: String,
         #[serde(default)]
         approved_digest: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProfileSource {
+    OpenSsh {
+        root_path: PathBuf,
+        alias: String,
+        last_import_digest: String,
     },
 }
 
@@ -224,6 +237,7 @@ mod tests {
 
         assert_eq!(profile.auth, AuthConfig::Password);
         assert!(profile.route.is_direct());
+        assert_eq!(profile.source, None);
     }
 
     #[test]
@@ -236,6 +250,11 @@ mod tests {
             }),
             jump_host_ids: Vec::new(),
         };
+        profile.source = Some(ProfileSource::OpenSsh {
+            root_path: PathBuf::from("/Users/test/.ssh/config"),
+            alias: "server".into(),
+            last_import_digest: "import-digest".into(),
+        });
 
         let json = serde_json::to_string(&profile).unwrap();
         let decoded: ConnectionProfile = serde_json::from_str(&json).unwrap();
