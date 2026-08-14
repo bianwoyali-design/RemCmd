@@ -88,6 +88,7 @@ common-copy = 复制
 common-paste = 粘贴
 common-select-all = 全选
 common-view = 查看
+settings-back = 返回设置
 common-maximize = 最大化
 common-restore = 还原
 

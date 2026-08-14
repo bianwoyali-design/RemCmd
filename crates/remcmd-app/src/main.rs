@@ -130,6 +130,7 @@ const BOTTOM_PANEL_DEFAULT_HEIGHT: f32 = 240.0;
 const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
 const BOTTOM_PANEL_MAX_HEIGHT: f32 = 520.0;
 const BOTTOM_PANEL_HEADER_HEIGHT: f32 = 34.0;
+const PROFILE_FORM_LABEL_WIDTH: f32 = 128.0;
 const COLLAPSED_TITLEBAR_LEADING_WIDTH: f32 = 140.0;
 const TITLEBAR_HEIGHT: f32 = 52.0;
 const TITLEBAR_TAB_HEIGHT: f32 = 30.0;
@@ -13217,6 +13218,8 @@ impl RemCmdApp {
                     .px(px(10.0))
                     .rounded_lg()
                     .bg(self.theme.settings_group_bg)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
                     .hover(|this| this.bg(self.theme.control_hover_bg))
                     .child(self.tr("import-openssh"))
@@ -13688,6 +13691,17 @@ impl RemCmdApp {
                     .map(|path| path.display().to_string())
                     .unwrap_or_default()
             });
+        let back = self
+            .render_icon_button(
+                "openssh-back-to-settings",
+                IconName::ArrowLeft,
+                self.tr("settings-back"),
+                IconTone::Default,
+                true,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_settings(window, cx);
+            }));
 
         self.detail_panel_shell().child(
             div()
@@ -13703,10 +13717,12 @@ impl RemCmdApp {
                         .items_center()
                         .justify_between()
                         .child(
-                            div()
-                                .text_xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(self.tr("import-title")),
+                            div().flex().items_center().gap_2().child(back).child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.tr("import-title")),
+                            ),
                         )
                         .child(div().flex().gap_2().child(browse).child(apply)),
                 )
@@ -16503,7 +16519,7 @@ impl RemCmdApp {
             .child(
                 div()
                     .flex_none()
-                    .w(px(112.0))
+                    .w(px(PROFILE_FORM_LABEL_WIDTH))
                     .truncate()
                     .child(self.tr("profile-authentication")),
             )
@@ -16518,11 +16534,12 @@ impl RemCmdApp {
         div()
             .flex()
             .items_center()
+            .gap_3()
             .mt_3()
             .child(
                 div()
                     .flex_none()
-                    .w(px(112.0))
+                    .w(px(PROFILE_FORM_LABEL_WIDTH))
                     .truncate()
                     .child(self.tr("profile-key-file")),
             )
@@ -16553,11 +16570,12 @@ impl RemCmdApp {
         div()
             .flex()
             .items_center()
+            .gap_3()
             .mt_3()
             .child(
                 div()
                     .flex_none()
-                    .w(px(112.0))
+                    .w(px(PROFILE_FORM_LABEL_WIDTH))
                     .truncate()
                     .child(self.tr("profile-credential")),
             )
@@ -16579,8 +16597,15 @@ impl RemCmdApp {
         div()
             .flex()
             .items_center()
+            .gap_3()
             .mt_3()
-            .child(div().flex_none().w(px(112.0)).truncate().child(label))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(PROFILE_FORM_LABEL_WIDTH))
+                    .truncate()
+                    .child(label),
+            )
             .child(div().flex_1().min_w(px(0.0)).child(field))
     }
 
@@ -16638,7 +16663,7 @@ impl RemCmdApp {
                     .child(
                         div()
                             .flex_none()
-                            .w(px(112.0))
+                            .w(px(PROFILE_FORM_LABEL_WIDTH))
                             .pt_1()
                             .child(self.tr("profile-proxy")),
                     )
@@ -16810,7 +16835,7 @@ impl RemCmdApp {
                     .child(
                         div()
                             .flex_none()
-                            .w(px(112.0))
+                            .w(px(PROFILE_FORM_LABEL_WIDTH))
                             .child(self.tr("profile-jump-hosts")),
                     )
                     .child(div().flex_1().child(editor.jump_search.clone())),
