@@ -62,6 +62,7 @@ const ASH_INSTALL_COMMAND: &str = r#"__remcmd_report_cwd(){ if [ "${__remcmd_las
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::process::Command;
 
     use super::*;
@@ -107,6 +108,7 @@ mod tests {
         assert!(!ash.contains("PROMPT_COMMAND"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_hooks_pass_native_syntax_checks() {
         let combined = install_command(":").replace('\r', "\n");
@@ -120,6 +122,7 @@ mod tests {
         assert_shell_syntax("/bin/sh", ASH_INSTALL_COMMAND);
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_hooks_report_directory_changes() {
         let bash_script = format!("{BASH_INSTALL_COMMAND}; cd /tmp; eval \"$PROMPT_COMMAND\"");
@@ -132,6 +135,7 @@ mod tests {
         assert_cwd_report("/bin/sh", &format!("{ASH_INSTALL_COMMAND}; cd /tmp"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_install_command_dispatches_and_reaches_ready_line() {
         let command = install_command("printf 'remcmd-ready'").replace('\r', "\n");
@@ -147,6 +151,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_install_command_dispatches_to_ash_hook() {
         let command = install_command(":").replace('\r', "\n");
@@ -165,6 +170,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsupported_posix_shell_reaches_ready_line_without_stty() {
         let command = install_command("printf 'remcmd-ready'").replace('\r', "\n");
@@ -180,6 +186,7 @@ mod tests {
         assert!(command.starts_with(" if ["));
     }
 
+    #[cfg(unix)]
     fn assert_shell_syntax(shell: &str, script: &str) {
         let output = Command::new(shell)
             .args(["-n", "-c", script])
@@ -192,6 +199,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn assert_cwd_report(shell: &str, script: &str) {
         let output = Command::new(shell)
             .args(["-f", "-c", script])
@@ -212,6 +220,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn assert_install_command(shell: &str, script: &str) {
         let output = Command::new(shell)
             .args(["-f", "-c", script])

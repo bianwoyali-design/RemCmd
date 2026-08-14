@@ -50,6 +50,19 @@ RemCmd needs a Wayland or X11 desktop session. A bare WSL terminal has no
 compositor and cannot launch the GPUI window; use WSLg or a native Linux desktop
 session instead.
 
+Password, passphrase, proxy-password, and ProxyCommand persistence also needs a
+working desktop Secret Service/keyring. A connection can still use secrets for
+the current run when it does not need to persist them; importing or saving a
+ProxyCommand is rejected if secure storage is unavailable.
+
+## After installation
+
+- See [OpenSSH configuration import](openssh-import.md) to migrate existing
+  aliases without changing your SSH files.
+- See [proxies and jump hosts](proxies-and-jump-hosts.md) for route setup and
+  ProxyCommand approval behavior.
+- See [diagnostics](diagnostics.md) before exporting a support bundle.
+
 ## Source Builds
 
 The workspace is pinned to Rust 1.96.1. Build and launch the app with:

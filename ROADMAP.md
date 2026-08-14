@@ -29,6 +29,17 @@ foundations and the work that remains before a stable release.
 - SFTP tree navigation, text editing, recursive transfers, progress,
   cancellation, concurrency, and bandwidth limits.
 
+### Connectivity, Localization, and Diagnostics
+
+- English and Simplified Chinese interfaces with system-language detection,
+  English fallback, and immediate runtime switching.
+- Read-only OpenSSH configuration import with includes, host and match rules,
+  dependency-aware ProxyJump previews, and conflict-safe re-imports.
+- HTTP CONNECT, SOCKS5, ProxyCommand, and ordered multi-hop SSH routes with
+  independent host-key checks and authentication at every hop.
+- Redacted structured diagnostics, seven-day log retention, runtime debug
+  filtering, and anonymized ZIP support bundles.
+
 ### Distribution
 
 - Automated macOS, Windows, and Linux package artifacts.
@@ -38,13 +49,6 @@ foundations and the work that remains before a stable release.
 
 The beta channel focuses on installation validation, compatibility fixes, and
 feedback from real SSH and SFTP workloads across macOS, Windows, and Linux.
-
-## Planned Capabilities
-
-- Internationalization and localized user interfaces.
-- Importing connection profiles from OpenSSH `~/.ssh/config` files.
-- Structured diagnostics and user-accessible logs with credential redaction.
-- SSH proxy and jump-host support.
 
 ## Before Stable
 

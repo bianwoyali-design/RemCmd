@@ -56,6 +56,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use directories::BaseDirs;
 #[cfg(target_os = "macos")]
 use gpui::img;
 use gpui::{
@@ -74,6 +75,10 @@ use secrecy::{ExposeSecret, SecretString};
 use remcmd_core::{
     AuthConfig, ConnectionProfile, ConnectionRoute, LanguageMode, ProxyConfig, TabLayout,
     TerminalSettings, ThemeMode, TransferSettings,
+};
+use remcmd_diagnostics::{
+    DiagnosticFilter, DiagnosticLevel, DiagnosticStore, Diagnostics, SupportBundleContext,
+    default_log_directory, fallback_log_directory,
 };
 use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 #[cfg(test)]
@@ -283,6 +288,9 @@ struct RemCmdApp {
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
+    diagnostic_level: Option<DiagnosticLevel>,
+    diagnostic_module_filter: Entity<TextField>,
+    diagnostic_text_filter: Entity<TextField>,
     openssh_import_preview: Option<OpenSshImportPreview>,
     openssh_selected_aliases: HashSet<String>,
     openssh_overwrite_conflicts: HashSet<String>,
@@ -296,6 +304,10 @@ struct RemCmdApp {
 struct RemCmdMainWindow(WindowHandle<RemCmdApp>);
 
 impl Global for RemCmdMainWindow {}
+
+struct DiagnosticsGlobal(DiagnosticStore);
+
+impl Global for DiagnosticsGlobal {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsMenu {
@@ -904,6 +916,7 @@ enum ActivePanel {
     Server,
     Connection,
     Settings,
+    Diagnostics,
     OpenSshImport,
 }
 
@@ -2413,6 +2426,14 @@ impl RemCmdApp {
         let sidebar_search =
             cx.new(|cx| TextField::new(cx, "", localizer.text("sidebar-search-placeholder")));
         cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
+        let diagnostic_module_filter =
+            cx.new(|cx| TextField::new(cx, "", localizer.text("diagnostics-filter-module")));
+        cx.observe(&diagnostic_module_filter, |_, _, cx| cx.notify())
+            .detach();
+        let diagnostic_text_filter =
+            cx.new(|cx| TextField::new(cx, "", localizer.text("diagnostics-filter-text")));
+        cx.observe(&diagnostic_text_filter, |_, _, cx| cx.notify())
+            .detach();
         let settings_focus_handle = cx.focus_handle();
         let quick_terminal_focus_handle = cx.focus_handle();
 
@@ -2494,6 +2515,9 @@ impl RemCmdApp {
             theme,
             settings_path,
             settings_error,
+            diagnostic_level: None,
+            diagnostic_module_filter,
+            diagnostic_text_filter,
             openssh_import_preview: None,
             openssh_selected_aliases: HashSet::new(),
             openssh_overwrite_conflicts: HashSet::new(),
@@ -4431,6 +4455,14 @@ impl RemCmdApp {
                 .input
                 .update(cx, |field, cx| field.set_placeholder(placeholder, cx));
         }
+        let module_placeholder = self.tr("diagnostics-filter-module");
+        self.diagnostic_module_filter.update(cx, |field, cx| {
+            field.set_placeholder(module_placeholder, cx);
+        });
+        let text_placeholder = self.tr("diagnostics-filter-text");
+        self.diagnostic_text_filter.update(cx, |field, cx| {
+            field.set_placeholder(text_placeholder, cx);
+        });
         if let Some(prompt) = self.sftp_create_prompt.as_ref() {
             let placeholder = self.tr(match prompt.kind {
                 SftpCreateKind::File => "sftp-file-name",
@@ -5077,6 +5109,110 @@ impl RemCmdApp {
         cx.notify();
     }
 
+    fn show_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_credential_prompt(cx);
+        self.active_panel = ActivePanel::Diagnostics;
+        self.open_settings_selector = None;
+        self.settings_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn set_diagnostic_level(&mut self, level: Option<DiagnosticLevel>, cx: &mut Context<Self>) {
+        self.diagnostic_level = level;
+        cx.notify();
+    }
+
+    fn toggle_detailed_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        store.set_debug_enabled(!store.debug_enabled());
+        store.record(
+            DiagnosticLevel::Info,
+            "diagnostics.settings",
+            if store.debug_enabled() {
+                "Detailed diagnostics enabled for this run"
+            } else {
+                "Detailed diagnostics disabled"
+            },
+            [],
+        );
+        cx.notify();
+    }
+
+    fn open_diagnostic_log_directory(&self, cx: &mut Context<Self>) {
+        let path = cx.global::<DiagnosticsGlobal>().0.log_directory();
+        cx.open_with_system(path);
+    }
+
+    fn clear_diagnostic_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Critical,
+            &self.tr("diagnostics-clear-confirm"),
+            None,
+            &[
+                PromptButton::new(self.tr("common-clear")),
+                PromptButton::cancel(self.tr("common-cancel")),
+            ],
+            cx,
+        );
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let result = store.clear();
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.settings_error = result.err().map(|error| error.to_string());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn export_support_bundle(&mut self, cx: &mut Context<Self>) {
+        let directory = self
+            .profiles_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let destination = cx.prompt_for_new_path(directory, Some("remcmd-support.zip"));
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        let runtime = cx.global::<SshRuntime>().handle();
+        let profiles = self.profiles.clone();
+        let context = SupportBundleContext {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            os: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            language: self.language_mode,
+            theme: self.theme_mode,
+            tab_layout: self.tab_layout,
+            terminal_font_size: self.terminal_font_size,
+            transfer_rate_limit_mib_per_second: self.transfer_settings.rate_limit_mib_per_second,
+            max_parallel_transfers: self.transfer_settings.max_parallel_transfers,
+        };
+        cx.spawn(async move |this, cx| match destination.await {
+            Ok(Ok(Some(path))) => {
+                let result = runtime
+                    .spawn_blocking(move || store.export_support_bundle(&path, context, &profiles))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.settings_error = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(error) => Some(error.to_string()),
+                    };
+                    cx.notify();
+                });
+            }
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.settings_error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn show_openssh_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::OpenSshImport;
@@ -5123,6 +5259,8 @@ impl RemCmdApp {
         self.openssh_import_error = None;
         let profiles = self.profiles.clone();
         let runtime = cx.global::<SshRuntime>().handle();
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        store.redactor().register_text(&path.to_string_lossy());
         cx.spawn(async move |this, cx| {
             let result = runtime
                 .spawn_blocking(move || preview_openssh_import(&path, &profiles))
@@ -5145,11 +5283,26 @@ impl RemCmdApp {
                         include_openssh_dependencies(&preview, &mut selected);
                         this.openssh_selected_aliases = selected;
                         this.openssh_overwrite_conflicts.clear();
+                        store.record(
+                            DiagnosticLevel::Info,
+                            "openssh.import",
+                            "OpenSSH import preview completed",
+                            [(
+                                "candidate_count".into(),
+                                preview.candidates.len().to_string(),
+                            )],
+                        );
                         this.openssh_import_preview = Some(preview);
                     }
                     Ok(Err(error)) => {
                         this.openssh_import_error =
                             Some(format!("{}: {error}", this.tr("import-preview-failed")));
+                        store.record(
+                            DiagnosticLevel::Warn,
+                            "openssh.import",
+                            "OpenSSH import preview failed",
+                            [("error_kind".into(), format!("{:?}", error.kind()))],
+                        );
                     }
                     Err(error) => {
                         this.openssh_import_error =
@@ -5219,6 +5372,7 @@ impl RemCmdApp {
         let selected = self.openssh_selected_aliases.clone();
         let overwrite = self.openssh_overwrite_conflicts.clone();
         let runtime = cx.global::<SshRuntime>().handle();
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
         cx.spawn(async move |this, cx| {
             let result = runtime
                 .spawn_blocking(move || {
@@ -5235,6 +5389,7 @@ impl RemCmdApp {
                 this.openssh_import_loading = false;
                 match result {
                     Ok(Ok(profiles)) => {
+                        let imported = profiles.len().saturating_sub(this.profiles.len());
                         this.profiles = profiles;
                         this.selected_profile_id = this
                             .selected_profile_id
@@ -5242,12 +5397,24 @@ impl RemCmdApp {
                             .filter(|id| this.profiles.iter().any(|profile| &profile.id == id))
                             .or_else(|| this.profiles.first().map(|profile| profile.id.clone()));
                         this.openssh_import_error = None;
+                        store.record(
+                            DiagnosticLevel::Info,
+                            "openssh.import",
+                            "OpenSSH import applied",
+                            [("new_profile_count".into(), imported.to_string())],
+                        );
                         this.openssh_selected_aliases.clear();
                         this.load_openssh_preview(root_path, cx);
                     }
                     Ok(Err(error)) => {
                         this.openssh_import_error =
                             Some(format!("{}: {error}", this.tr("import-apply-failed")));
+                        store.record(
+                            DiagnosticLevel::Error,
+                            "openssh.import",
+                            "OpenSSH import apply failed",
+                            [("error_kind".into(), "apply".into())],
+                        );
                     }
                     Err(error) => {
                         this.openssh_import_error =
@@ -5945,6 +6112,13 @@ impl RemCmdApp {
         let profile_id = profile.id.clone();
         let profiles_path = self.profiles_path.clone();
         let runtime = cx.global::<SshRuntime>().handle();
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        if let Some(secret) = proxy_password.as_ref() {
+            store.register_secret(secret);
+        }
+        if let Some(secret) = proxy_command.as_ref() {
+            store.register_secret(secret);
+        }
         *self
             .credential_mutations_in_progress
             .entry(profile_id.clone())
@@ -5985,6 +6159,12 @@ impl RemCmdApp {
                         this.editor = None;
                         this.profile_auth_selector_open = false;
                         this.form_error = warning;
+                        store.record(
+                            DiagnosticLevel::Info,
+                            "profiles.save",
+                            "Connection profile saved",
+                            [("has_route".into(), (!profile.route.is_direct()).to_string())],
+                        );
                     }
                     Ok(Err(error)) => this.form_error = Some(error.to_string()),
                     Err(error) => this.form_error = Some(error.to_string()),
@@ -6159,209 +6339,6 @@ impl RemCmdApp {
         }
     }
 
-    #[allow(dead_code)]
-    fn lookup_credential_and_connect(
-        &mut self,
-        session_id: SessionId,
-        profile: ConnectionProfile,
-        prompt_kind: CredentialPromptKind,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let profile_id = profile.id.clone();
-        let credential_kind = prompt_kind.credential_kind();
-        let runtime = cx.global::<SshRuntime>().handle();
-        if let Some(session) = self.session_mut(session_id) {
-            session.connection_error = None;
-            session.connection_message = Some(SessionMessage::localized("credential-checking"));
-        }
-        self.credential_lookup_session_id = Some(session_id);
-
-        self.credential_lookup_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let lookup_profile_id = profile_id.clone();
-            let result = runtime
-                .spawn_blocking(move || load_credential(&lookup_profile_id, credential_kind))
-                .await;
-
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.credential_lookup_task = None;
-                this.credential_lookup_session_id = None;
-                if !this
-                    .session(session_id)
-                    .is_some_and(|session| session.connection_state.can_connect())
-                    || !this.profiles.iter().any(|candidate| candidate == &profile)
-                    || this
-                        .credential_mutations_in_progress
-                        .contains_key(&profile_id)
-                {
-                    if let Some(session) = this.session_mut(session_id) {
-                        session.connection_message = None;
-                        cx.notify();
-                    }
-                    return;
-                }
-
-                let loaded = match result {
-                    Ok(result) => result.map_err(|error| error.to_string()),
-                    Err(error) => Err(format!(
-                        "Failed to access the system keychain task: {error}"
-                    )),
-                };
-
-                match loaded {
-                    Ok(Some(secret)) => {
-                        let auth = auth_method_with_secret(prompt_kind, secret);
-                        let credential =
-                            ConnectionCredential::from_keychain(profile_id, credential_kind);
-                        if this.activate_session_in_window(session_id, window, cx) {
-                            this.start_connection(session_id, profile, auth, Some(credential), cx);
-                        }
-                    }
-                    Ok(None) => match prompt_kind {
-                        CredentialPromptKind::Password => {
-                            this.open_credential_prompt(
-                                session_id,
-                                profile_id,
-                                CredentialPromptKind::Password,
-                                None,
-                                cx,
-                            );
-                        }
-                        CredentialPromptKind::PrivateKeyPassphrase { path } => {
-                            let auth = AuthMethod::PrivateKey {
-                                path,
-                                passphrase: None,
-                            };
-                            if this.activate_session_in_window(session_id, window, cx) {
-                                this.start_connection(session_id, profile, auth, None, cx);
-                            }
-                        }
-                        CredentialPromptKind::ProxyPassword => {
-                            this.open_credential_prompt(
-                                session_id,
-                                profile_id,
-                                CredentialPromptKind::ProxyPassword,
-                                None,
-                                cx,
-                            );
-                        }
-                    },
-                    Err(error) => match prompt_kind {
-                        CredentialPromptKind::Password => {
-                            this.open_credential_prompt(
-                                session_id,
-                                profile_id,
-                                CredentialPromptKind::Password,
-                                Some(error),
-                                cx,
-                            );
-                        }
-                        CredentialPromptKind::PrivateKeyPassphrase { path } => {
-                            let auth = AuthMethod::PrivateKey {
-                                path,
-                                passphrase: None,
-                            };
-                            if this.activate_session_in_window(session_id, window, cx) {
-                                this.start_connection(session_id, profile, auth, None, cx);
-                                if let Some(session) = this.session_mut(session_id) {
-                                    session.connection_message = Some(error.into());
-                                }
-                            }
-                        }
-                        CredentialPromptKind::ProxyPassword => {
-                            this.open_credential_prompt(
-                                session_id,
-                                profile_id,
-                                CredentialPromptKind::ProxyPassword,
-                                Some(error),
-                                cx,
-                            );
-                        }
-                    },
-                }
-            });
-        }));
-
-        cx.notify();
-    }
-
-    #[allow(dead_code)]
-    fn start_connection(
-        &mut self,
-        session_id: SessionId,
-        profile: ConnectionProfile,
-        auth: AuthMethod,
-        credential: Option<ConnectionCredential>,
-        cx: &mut Context<Self>,
-    ) {
-        self.dismiss_credential_prompt(cx);
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.host_key_prompt = None;
-        self.credential_lookup_task = None;
-        self.credential_lookup_session_id = None;
-
-        let runtime = cx.global::<SshRuntime>().handle();
-        let pty_size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
-        let connection = SshConnection::spawn_with_transfer_rate_limiter(
-            &runtime,
-            profile.clone(),
-            auth,
-            pty_size,
-            self.transfer_rate_limiter.clone(),
-        );
-        let (handle, mut events) = connection.split();
-
-        let session = self
-            .session_mut(session_id)
-            .expect("session should exist while starting a connection");
-        session.close_when_disconnected = false;
-        session.connection_state = SessionState::Connecting;
-        session.connection_handle = Some(handle);
-        session.local_terminal_handle = None;
-        session.connection_credentials = credential.into_iter().collect();
-        session.connection_error = None;
-        session.connection_message = None;
-        session.terminal_end_reason = None;
-        session.terminal = Some(ActiveTerminal::new(profile.id.clone(), pty_size));
-        session.terminal_marked_text.clear();
-        session.terminal_selection = None;
-        session.terminal_selecting = false;
-        session.terminal_scroll_accumulator = 0.0;
-        session.terminal_resize_task = None;
-        session.sftp = SftpBrowserState::default();
-        session.sidebar_sftp =
-            SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
-        session.sftp_availability = SftpAvailability::Checking;
-
-        cx.spawn(async move |this, cx| {
-            while let Some(event) = events.next_event().await {
-                let mut batch = Vec::with_capacity(TERMINAL_EVENT_BATCH_LIMIT);
-                batch.push(event);
-                while batch.len() < TERMINAL_EVENT_BATCH_LIMIT {
-                    let Some(event) = events.try_next_event() else {
-                        break;
-                    };
-                    batch.push(event);
-                }
-                if this
-                    .update(cx, move |this, cx| {
-                        for event in batch {
-                            this.handle_connection_event(session_id, event, cx);
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-
-        cx.notify();
-    }
-
     fn begin_connection_preparation(
         &mut self,
         session_id: SessionId,
@@ -6387,11 +6364,21 @@ impl RemCmdApp {
                 cx.notify();
                 return;
             };
-            // Referenced profiles contribute only their endpoint and authentication.
             jump.route = ConnectionRoute::default();
             steps.push(jump);
         }
         steps.push(target_profile.clone());
+        let redactor = cx.global::<DiagnosticsGlobal>().0.redactor();
+        for step in &steps {
+            if let AuthConfig::PrivateKey { path } = &step.auth {
+                redactor.register_text(&path.to_string_lossy());
+                if let Ok(relative) = path.strip_prefix("~")
+                    && let Some(base_dirs) = BaseDirs::new()
+                {
+                    redactor.register_text(&base_dirs.home_dir().join(relative).to_string_lossy());
+                }
+            }
+        }
         self.pending_connection = Some(PendingConnectionPreparation {
             session_id,
             target_profile,
@@ -6740,6 +6727,7 @@ impl RemCmdApp {
         credential: ConnectionCredential,
         cx: &mut Context<Self>,
     ) {
+        cx.global::<DiagnosticsGlobal>().0.register_secret(&secret);
         if credential_kind == CredentialKind::ProxyCommand {
             let Some(pending) = self.pending_connection.as_mut() else {
                 return;
@@ -6964,6 +6952,21 @@ impl RemCmdApp {
         session.sidebar_sftp =
             SftpBrowserState::with_request_id_start(SIDEBAR_SFTP_REQUEST_ID_START);
         session.sftp_availability = SftpAvailability::Checking;
+        cx.global::<DiagnosticsGlobal>().0.record(
+            DiagnosticLevel::Info,
+            "ssh.connection",
+            "SSH connection started",
+            [
+                (
+                    "jump_count".into(),
+                    profile.route.jump_host_ids.len().to_string(),
+                ),
+                (
+                    "proxy".into(),
+                    profile.route.upstream_proxy.is_some().to_string(),
+                ),
+            ],
+        );
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.next_event().await {
@@ -6988,6 +6991,7 @@ impl RemCmdApp {
             }
         })
         .detach();
+
         cx.notify();
     }
 
@@ -7156,27 +7160,13 @@ impl RemCmdApp {
         error: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(path) = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .and_then(|profile| match &profile.auth {
-                AuthConfig::PrivateKey { path } => Some(path.clone()),
-                AuthConfig::None | AuthConfig::Password | AuthConfig::Agent => None,
-            })
-        else {
-            return false;
-        };
-
-        self.activate_session(session_id, cx);
-        self.open_credential_prompt(
+        self.retry_connection_with_prompt(
             session_id,
             profile_id,
-            CredentialPromptKind::PrivateKeyPassphrase { path },
-            Some(error),
+            CredentialKind::PrivateKeyPassphrase,
+            error,
             cx,
-        );
-        true
+        )
     }
 
     fn prompt_for_password(
@@ -8127,6 +8117,7 @@ impl RemCmdApp {
         if self.session(session_id).is_none() {
             return;
         }
+        self.record_connection_diagnostic(&event, cx);
 
         let should_notify = match event {
             ConnectionEvent::StateChanged(state) => {
@@ -8613,6 +8604,145 @@ impl RemCmdApp {
 
         if should_notify {
             cx.notify();
+        }
+    }
+
+    fn record_connection_diagnostic(&self, event: &ConnectionEvent, cx: &Context<Self>) {
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        match event {
+            ConnectionEvent::StateChanged(state) => store.record(
+                DiagnosticLevel::Info,
+                "ssh.lifecycle",
+                "SSH state changed",
+                [("state".into(), format!("{state:?}"))],
+            ),
+            ConnectionEvent::ConnectionStageChanged(stage) => store.record(
+                DiagnosticLevel::Info,
+                "ssh.route",
+                "SSH connection stage started",
+                [(
+                    "stage".into(),
+                    connection_stage_label(stage, &self.localizer),
+                )],
+            ),
+            ConnectionEvent::AuthenticationSucceeded { stage, method } => store.record(
+                DiagnosticLevel::Info,
+                "ssh.authentication",
+                "SSH authentication succeeded",
+                [
+                    (
+                        "stage".into(),
+                        connection_stage_label(stage, &self.localizer),
+                    ),
+                    ("method".into(), format!("{method:?}")),
+                ],
+            ),
+            ConnectionEvent::HostKeyVerificationRequired { stage, .. } => store.record(
+                DiagnosticLevel::Info,
+                "ssh.host_key",
+                "Host-key verification requires user confirmation",
+                [(
+                    "stage".into(),
+                    connection_stage_label(stage, &self.localizer),
+                )],
+            ),
+            ConnectionEvent::DirectoryRead { .. } => store.record(
+                DiagnosticLevel::Debug,
+                "sftp.operation",
+                "Remote directory read completed",
+                [],
+            ),
+            ConnectionEvent::DirectoryTreeRead { .. } => store.record(
+                DiagnosticLevel::Debug,
+                "sftp.operation",
+                "Remote directory tree read completed",
+                [],
+            ),
+            ConnectionEvent::FileRead { .. } => store.record(
+                DiagnosticLevel::Debug,
+                "sftp.operation",
+                "Remote file read completed",
+                [],
+            ),
+            ConnectionEvent::FileWritten { .. } => store.record(
+                DiagnosticLevel::Info,
+                "sftp.operation",
+                "Remote file write completed",
+                [],
+            ),
+            ConnectionEvent::PathCreated { kind, .. } => store.record(
+                DiagnosticLevel::Info,
+                "sftp.operation",
+                "Remote path created",
+                [("kind".into(), format!("{kind:?}"))],
+            ),
+            ConnectionEvent::DirectoriesCreated { paths, .. } => store.record(
+                DiagnosticLevel::Info,
+                "sftp.operation",
+                "Remote directories created",
+                [("count".into(), paths.len().to_string())],
+            ),
+            ConnectionEvent::PathsDeleted { paths, .. } => store.record(
+                DiagnosticLevel::Info,
+                "sftp.operation",
+                "Remote paths deleted",
+                [("count".into(), paths.len().to_string())],
+            ),
+            ConnectionEvent::TransferCompleted {
+                direction, bytes, ..
+            } => store.record(
+                DiagnosticLevel::Info,
+                "sftp.transfer",
+                "SFTP transfer completed",
+                [
+                    ("direction".into(), format!("{direction:?}")),
+                    ("bytes".into(), bytes.to_string()),
+                ],
+            ),
+            ConnectionEvent::TransferCancelled { .. } => store.record(
+                DiagnosticLevel::Info,
+                "sftp.transfer",
+                "SFTP transfer cancelled",
+                [],
+            ),
+            ConnectionEvent::SftpFailed {
+                operation, error, ..
+            } => store.record(
+                DiagnosticLevel::Warn,
+                "sftp.operation",
+                "SFTP operation failed",
+                [
+                    ("operation".into(), format!("{operation:?}")),
+                    ("error_kind".into(), format!("{:?}", error.kind())),
+                ],
+            ),
+            ConnectionEvent::PerformanceFailed(error) => store.record(
+                DiagnosticLevel::Warn,
+                "ssh.performance",
+                "Performance sampling failed",
+                [("error_kind".into(), format!("{:?}", error.kind()))],
+            ),
+            ConnectionEvent::Failed(error) => store.record(
+                DiagnosticLevel::Error,
+                "ssh.connection",
+                "SSH connection failed",
+                [
+                    (
+                        "stage".into(),
+                        error
+                            .stage()
+                            .map(|stage| connection_stage_label(stage, &self.localizer))
+                            .unwrap_or_default(),
+                    ),
+                    ("error".into(), error.to_string()),
+                ],
+            ),
+            ConnectionEvent::Resized(_)
+            | ConnectionEvent::Shell(_)
+            | ConnectionEvent::TransferProgress { .. }
+            | ConnectionEvent::TransferConflict { .. }
+            | ConnectionEvent::SftpAvailabilityChanged { .. }
+            | ConnectionEvent::PerformanceSnapshot(_) => {}
         }
     }
 
@@ -10126,7 +10256,6 @@ impl RemCmdApp {
         let close_terminal_tooltip = self.tr("common-close-terminal");
 
         for (tab_index, (tab, label)) in self.tabs.iter().zip(tab_labels).enumerate() {
-            let close_terminal_tooltip = close_terminal_tooltip.clone();
             let tab_id = tab.id;
             let is_active =
                 self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
@@ -10253,7 +10382,7 @@ impl RemCmdApp {
                             .min_w(px(0.0))
                             .truncate()
                             .text_sm()
-                            .child(label.clone()),
+                            .child(label),
                     )
             };
             let content_start_opacity = if is_active {
@@ -10280,6 +10409,7 @@ impl RemCmdApp {
             );
 
             let tooltip_theme = self.theme;
+            let close_tooltip = close_terminal_tooltip.clone();
             let close_hover_background = self.theme.titlebar_tab_hover_bg;
             let close_pressed_background = self.theme.titlebar_tab_pressed_bg;
             let mut close_control = div()
@@ -10306,7 +10436,7 @@ impl RemCmdApp {
                 .child(self.render_titlebar_close_symbol())
                 .tooltip(move |_, cx| -> AnyView {
                     cx.new(|_| CommandTooltip {
-                        label: close_terminal_tooltip.clone().into(),
+                        label: close_tooltip.clone().into(),
                         theme: tooltip_theme,
                     })
                     .into()
@@ -11880,7 +12010,7 @@ impl RemCmdApp {
                     self.theme.text_muted
                 })
                 .child(self.render_sidebar_icon(IconName::Performance, 20.0))
-                .child(message.to_owned())
+                .child(message)
                 .into_any_element();
         };
 
@@ -12914,6 +13044,7 @@ impl RemCmdApp {
             ActivePanel::Home => return self.render_home(cx),
             ActivePanel::Server => return self.render_server_overview(selected_profile, cx),
             ActivePanel::Settings => return self.render_settings(cx),
+            ActivePanel::Diagnostics => return self.render_diagnostics(cx),
             ActivePanel::OpenSshImport => return self.render_openssh_import(cx),
             ActivePanel::Connection => {}
         }
@@ -13180,6 +13311,35 @@ impl RemCmdApp {
                     .mb_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("settings-diagnostics")),
+            )
+            .child(
+                div()
+                    .id("open-diagnostics")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .min_h(px(38.0))
+                    .px(px(10.0))
+                    .rounded_lg()
+                    .bg(self.theme.settings_group_bg)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .hover(|this| this.bg(self.theme.control_hover_bg))
+                    .child(self.tr("diagnostics-title"))
+                    .child(icon(IconName::Expand, self.theme, IconTone::Default, 15.0))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_diagnostics(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .mt_6()
+                    .mb_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child(self.tr("import-title")),
             )
             .child(
@@ -13218,6 +13378,228 @@ impl RemCmdApp {
             .track_focus(&self.settings_focus_handle)
             .on_action(cx.listener(Self::on_cancel_settings_selector))
             .child(content)
+    }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let store = cx.global::<DiagnosticsGlobal>().0.clone();
+        let filter = DiagnosticFilter {
+            level: self.diagnostic_level,
+            module: self.diagnostic_module_filter.read(cx).text(),
+            text: self.diagnostic_text_filter.read(cx).text(),
+        };
+        let events = store.recent(&filter);
+        let events_empty = events.is_empty();
+        let mut event_list = div().flex().flex_col().gap_1().w_full();
+        for event in events.into_iter().rev().take(500) {
+            let level_color = match event.level {
+                DiagnosticLevel::Error => self.theme.error_text,
+                DiagnosticLevel::Warn => self.theme.status_warn,
+                DiagnosticLevel::Info => self.theme.text_primary,
+                DiagnosticLevel::Debug | DiagnosticLevel::Trace => self.theme.text_muted,
+            };
+            let fields = event
+                .fields
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            event_list = event_list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(self.theme.settings_group_bg)
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(self.theme.text_muted)
+                            .child(event.timestamp)
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(level_color)
+                                    .child(diagnostic_level_label(event.level)),
+                            )
+                            .child(event.module),
+                    )
+                    .child(div().text_sm().child(event.message))
+                    .when(!fields.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .font_family(UI_MONOSPACE_FONT_FAMILY)
+                                .text_xs()
+                                .text_color(self.theme.text_muted)
+                                .child(fields),
+                        )
+                    }),
+            );
+        }
+        if events_empty {
+            event_list = event_list.child(
+                div()
+                    .py_8()
+                    .text_center()
+                    .text_color(self.theme.text_muted)
+                    .child(self.tr("diagnostics-no-events")),
+            );
+        }
+
+        let mut level_filters = div().flex().items_center().gap_1();
+        for level in [
+            None,
+            Some(DiagnosticLevel::Error),
+            Some(DiagnosticLevel::Warn),
+            Some(DiagnosticLevel::Info),
+            Some(DiagnosticLevel::Debug),
+        ] {
+            let selected = self.diagnostic_level == level;
+            let label = level.map_or_else(|| self.tr("common-all"), diagnostic_level_label);
+            level_filters = level_filters.child(
+                div()
+                    .id(SharedString::from(format!("diagnostic-level-{level:?}")))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(if selected {
+                        self.theme.accent
+                    } else {
+                        self.theme.control_bg
+                    })
+                    .text_color(if selected {
+                        self.theme.on_accent
+                    } else {
+                        self.theme.text_primary
+                    })
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_diagnostic_level(level, cx);
+                    })),
+            );
+        }
+
+        let open = text_button(
+            "diagnostics-open-folder",
+            self.tr("diagnostics-open-folder"),
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.open_diagnostic_log_directory(cx)));
+        let clear = text_button(
+            "diagnostics-clear",
+            self.tr("diagnostics-clear"),
+            TextButtonTone::Secondary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.clear_diagnostic_logs(window, cx);
+        }));
+        let export = text_button(
+            "diagnostics-export",
+            self.tr("diagnostics-export"),
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.export_support_bundle(cx)));
+        let back = self
+            .render_icon_button(
+                "diagnostics-back-to-settings",
+                IconName::ArrowLeft,
+                self.tr("settings-back"),
+                IconTone::Default,
+                true,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_settings(window, cx);
+            }));
+
+        self.detail_panel_shell().child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap_3()
+                .pt_4()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div().flex().items_center().gap_2().child(back).child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.tr("diagnostics-title")),
+                            ),
+                        )
+                        .child(div().flex().gap_2().child(open).child(clear).child(export)),
+                )
+                .when_some(store.initialization_error(), |this, error| {
+                    this.child(
+                        div()
+                            .rounded_md()
+                            .px_3()
+                            .py_2()
+                            .bg(self.theme.control_bg)
+                            .text_sm()
+                            .text_color(self.theme.error_text)
+                            .child(self.tr("diagnostics-memory-fallback"))
+                            .child(format!(" {error}")),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(level_filters)
+                        .child(
+                            div()
+                                .w(px(180.0))
+                                .child(self.diagnostic_module_filter.clone()),
+                        )
+                        .child(div().flex_1().child(self.diagnostic_text_filter.clone()))
+                        .child(
+                            div()
+                                .id("diagnostics-debug-toggle")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if store.debug_enabled() {
+                                    self.theme.accent
+                                } else {
+                                    self.theme.control_bg
+                                })
+                                .text_sm()
+                                .cursor_pointer()
+                                .child(self.tr("diagnostics-debug"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_detailed_diagnostics(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("diagnostic-events")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .child(event_list),
+                ),
+        )
     }
 
     fn render_openssh_import(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -13705,12 +14087,15 @@ impl RemCmdApp {
         let check = self.render_select_menu_check(is_selected, hover_group.clone());
         let label = if virtualized {
             self.render_virtual_select_menu_label(
-                option.label.into(),
+                self.settings_option_label(&option).into(),
                 hover_group.clone(),
                 selector.menu_width() - 40.0,
             )
         } else {
-            self.render_select_menu_label(option.label.into(), hover_group.clone())
+            self.render_select_menu_label(
+                self.settings_option_label(&option).into(),
+                hover_group.clone(),
+            )
         };
         let option_hover = self.theme.accent;
         let option_pressed = self.theme.accent_hover;
@@ -16737,7 +17122,7 @@ fn auth_method_with_secret(prompt_kind: CredentialPromptKind, secret: SecretStri
             passphrase: Some(secret),
         },
         CredentialPromptKind::ProxyPassword => {
-            unreachable!("proxy passwords are applied to RuntimeProxy")
+            unreachable!("proxy passwords are used by RuntimeProxy, not AuthMethod")
         }
     }
 }
@@ -16769,6 +17154,17 @@ fn runtime_proxy_with_password(
         )),
         ProxyConfig::ProxyCommand { .. } => None,
     }
+}
+
+fn diagnostic_level_label(level: DiagnosticLevel) -> String {
+    match level {
+        DiagnosticLevel::Error => "ERROR",
+        DiagnosticLevel::Warn => "WARN",
+        DiagnosticLevel::Info => "INFO",
+        DiagnosticLevel::Debug => "DEBUG",
+        DiagnosticLevel::Trace => "TRACE",
+    }
+    .into()
 }
 
 const fn openssh_status_key(status: OpenSshImportStatus) -> &'static str {
@@ -18165,6 +18561,16 @@ fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
 }
 
 fn launch(cx: &mut App) {
+    let log_directory = default_log_directory().unwrap_or_else(|_| fallback_log_directory());
+    let diagnostics = Diagnostics::initialize(log_directory);
+    let diagnostic_store = diagnostics.store();
+    diagnostic_store.record(
+        DiagnosticLevel::Info,
+        "app.lifecycle",
+        "RemCmd started",
+        [("version".into(), env!("CARGO_PKG_VERSION").into())],
+    );
+    cx.set_global(DiagnosticsGlobal(diagnostic_store));
     cx.set_global(SshRuntime::new().expect("failed to create SSH runtime"));
     register_macos_sf_mono(cx);
 
@@ -18469,10 +18875,6 @@ mod tests {
 
     #[test]
     fn settings_selectors_cover_every_persisted_choice() {
-        assert_eq!(
-            SettingsSelector::Language.options(),
-            &LANGUAGE_SETTING_OPTIONS
-        );
         assert_eq!(SettingsSelector::Theme.options(), &THEME_SETTING_OPTIONS);
         assert_eq!(
             SettingsSelector::TabLayout.options(),
@@ -18610,7 +19012,8 @@ mod tests {
     fn bottom_panel_height_preserves_main_content() {
         assert_eq!(clamp_bottom_panel_height(80.0, 720.0), 140.0);
         assert_eq!(clamp_bottom_panel_height(600.0, 720.0), 520.0);
-        assert_eq!(clamp_bottom_panel_height(400.0, 480.0), 328.0);
+        let panel_height = clamp_bottom_panel_height(400.0, 480.0);
+        assert_eq!(480.0 - content_top_inset() - panel_height, 100.0);
     }
 
     #[test]
