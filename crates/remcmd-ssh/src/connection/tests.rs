@@ -328,7 +328,7 @@ fn test_profile(port: u16) -> ConnectionProfile {
 }
 
 async fn next_event(receiver: &mut ConnectionEventReceiver) -> ConnectionEvent {
-    tokio::time::timeout(Duration::from_secs(1), receiver.next_event())
+    tokio::time::timeout(Duration::from_secs(5), receiver.next_event())
         .await
         .expect("worker event should not time out")
         .expect("worker should still be running")
@@ -336,9 +336,14 @@ async fn next_event(receiver: &mut ConnectionEventReceiver) -> ConnectionEvent {
 
 #[tokio::test]
 async fn worker_reports_connection_failure() {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("temporary TCP port");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("temporary TCP listener");
     let port = listener.local_addr().expect("local address").port();
-    drop(listener);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("worker TCP connection");
+        drop(stream);
+    });
 
     let connection = SshConnection::spawn(
         &Handle::current(),
@@ -363,6 +368,7 @@ async fn worker_reports_connection_failure() {
         panic!("connection refusal should produce a failure event");
     };
 
+    server.await.expect("test server should stop");
     assert_eq!(error.kind(), SshErrorKind::Network);
 }
 

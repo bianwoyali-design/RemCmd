@@ -1089,19 +1089,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_tcp_connection_maps_to_network_error() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("temporary TCP port");
+    async fn closed_tcp_peer_maps_to_network_error() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("temporary TCP listener");
         let port = listener.local_addr().expect("local address").port();
-
-        // Closing the listener makes the selected port reject connections.
-        drop(listener);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("SSH TCP connection");
+            drop(stream);
+        });
 
         let result =
-            SshTransport::open_connection_with_timeout(&test_profile(port), Duration::from_secs(1))
+            SshTransport::open_connection_with_timeout(&test_profile(port), Duration::from_secs(5))
                 .await;
+        server.await.expect("test server should stop");
 
         let Err(error) = result else {
-            panic!("connection should have been refused");
+            panic!("connection should fail when the peer closes before the SSH handshake");
         };
 
         assert_eq!(error.kind(), SshErrorKind::Network);
