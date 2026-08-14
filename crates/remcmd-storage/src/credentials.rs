@@ -88,10 +88,10 @@ pub fn delete_profile_auth_credentials(profile_id: &str) -> Result<(), Credentia
         CredentialKind::Password,
         CredentialKind::PrivateKeyPassphrase,
     ] {
-        if let Err(error) = delete_with(&SystemCredentialBackend, profile_id, kind)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = delete_with(&SystemCredentialBackend, profile_id, kind) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
     }
     match first_error {
@@ -151,10 +151,10 @@ fn delete_profile_with(
         CredentialKind::ProxyPassword,
         CredentialKind::ProxyCommand,
     ] {
-        if let Err(error) = delete_with(backend, profile_id, kind)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = delete_with(backend, profile_id, kind) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
     }
 
