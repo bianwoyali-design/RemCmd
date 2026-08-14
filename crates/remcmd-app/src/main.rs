@@ -78,7 +78,7 @@ use remcmd_core::{
 };
 use remcmd_diagnostics::{
     DiagnosticFilter, DiagnosticLevel, DiagnosticStore, Diagnostics, SupportBundleContext,
-    default_log_directory,
+    default_log_directory, fallback_log_directory,
 };
 use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 #[cfg(test)]
@@ -13390,6 +13390,7 @@ impl RemCmdApp {
             text: self.diagnostic_text_filter.read(cx).text(),
         };
         let events = store.recent(&filter);
+        let events_empty = events.is_empty();
         let mut event_list = div().flex().flex_col().gap_1().w_full();
         for event in events.into_iter().rev().take(500) {
             let level_color = match event.level {
@@ -13440,7 +13441,7 @@ impl RemCmdApp {
                     }),
             );
         }
-        if store.recent(&filter).is_empty() {
+        if events_empty {
             event_list = event_list.child(
                 div()
                     .py_8()
@@ -18562,8 +18563,7 @@ fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
 }
 
 fn launch(cx: &mut App) {
-    let log_directory =
-        default_log_directory().unwrap_or_else(|_| std::env::temp_dir().join("remcmd-diagnostics"));
+    let log_directory = default_log_directory().unwrap_or_else(|_| fallback_log_directory());
     let diagnostics = Diagnostics::initialize(log_directory);
     let diagnostic_store = diagnostics.store();
     diagnostic_store.record(

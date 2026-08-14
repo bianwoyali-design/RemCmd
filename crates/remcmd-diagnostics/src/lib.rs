@@ -2,12 +2,14 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fmt, fs,
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
+    process,
     sync::{
         Arc, LazyLock, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{Duration, NaiveDate, SecondsFormat, Utc};
@@ -22,7 +24,12 @@ use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const DEFAULT_EVENT_CAPACITY: usize = 2_000;
 const LOG_RETENTION_DAYS: i64 = 7;
+const LOG_BUFFER_CAPACITY: usize = 16 * 1_024;
+const LOG_FLUSH_EVENT_INTERVAL: usize = 32;
+const LOG_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const REDACTED: &str = "[REDACTED]";
+
+static FALLBACK_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 static URI_USERINFO: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)([^/@\s]+)@").expect("URI redaction pattern is valid")
@@ -207,7 +214,9 @@ struct DiagnosticInner {
 
 struct FileState {
     date: Option<NaiveDate>,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
+    pending_lines: usize,
+    last_flush: Instant,
     error: Option<String>,
 }
 
@@ -219,7 +228,7 @@ impl DiagnosticStore {
     pub fn with_capacity(log_dir: impl Into<PathBuf>, capacity: usize) -> Self {
         let log_dir = log_dir.into();
         let mut error = None;
-        if let Err(failure) = fs::create_dir_all(&log_dir) {
+        if let Err(failure) = create_private_log_directory(&log_dir) {
             error = Some(format!("Failed to initialize diagnostic logs: {failure}"));
         } else if let Err(failure) = cleanup_old_logs(&log_dir, Utc::now().date_naive()) {
             error = Some(format!("Failed to clean old diagnostic logs: {failure}"));
@@ -232,6 +241,8 @@ impl DiagnosticStore {
                 file: Mutex::new(FileState {
                     date: None,
                     file: None,
+                    pending_lines: 0,
+                    last_flush: Instant::now(),
                     error,
                 }),
                 redactor: Redactor::default(),
@@ -310,6 +321,20 @@ impl DiagnosticStore {
             .collect()
     }
 
+    pub fn flush(&self) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .file
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(file) = state.file.as_mut() {
+            file.flush()?;
+        }
+        state.pending_lines = 0;
+        state.last_flush = Instant::now();
+        Ok(())
+    }
+
     pub fn clear(&self) -> io::Result<()> {
         self.inner
             .events
@@ -323,6 +348,8 @@ impl DiagnosticStore {
             .unwrap_or_else(|error| error.into_inner());
         state.file = None;
         state.date = None;
+        state.pending_lines = 0;
+        state.last_flush = Instant::now();
         let mut first_error = None;
         if let Ok(entries) = fs::read_dir(&self.inner.log_dir) {
             for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
@@ -382,6 +409,7 @@ impl DiagnosticStore {
                 self.inner.redactor.register_text(alias);
             }
         }
+        self.flush()?;
         let parent = destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -437,9 +465,10 @@ impl DiagnosticStore {
                     archive
                         .start_file(format!("logs/{file_name}"), options)
                         .map_err(io::Error::other)?;
-                    let content = fs::read_to_string(&path)?;
-                    for line in content.lines() {
-                        let Ok(event) = serde_json::from_str::<DiagnosticEvent>(line) else {
+                    let file = File::open(&path)?;
+                    for line in BufReader::new(file).lines() {
+                        let line = line?;
+                        let Ok(event) = serde_json::from_str::<DiagnosticEvent>(&line) else {
                             continue;
                         };
                         let event = self.redact_event(event);
@@ -518,17 +547,39 @@ impl DiagnosticStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if state.date != Some(today) || state.file.is_none() {
-            fs::create_dir_all(&self.inner.log_dir)?;
+            if let Some(file) = state.file.as_mut() {
+                file.flush()?;
+            }
+            create_private_log_directory(&self.inner.log_dir)?;
             cleanup_old_logs(&self.inner.log_dir, today)?;
             let path = self.inner.log_dir.join(format!("remcmd-{today}.jsonl"));
-            state.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
+            state.file = Some(BufWriter::with_capacity(
+                LOG_BUFFER_CAPACITY,
+                open_private_log_file(&path)?,
+            ));
             state.date = Some(today);
+            state.pending_lines = 0;
+            state.last_flush = Instant::now();
             state.error = None;
         }
-        let file = state.file.as_mut().expect("daily log file was opened");
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()
+        {
+            let file = state.file.as_mut().expect("daily log file was opened");
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        state.pending_lines += 1;
+        if state.pending_lines >= LOG_FLUSH_EVENT_INTERVAL
+            || state.last_flush.elapsed() >= LOG_FLUSH_INTERVAL
+        {
+            state
+                .file
+                .as_mut()
+                .expect("daily log file was opened")
+                .flush()?;
+            state.pending_lines = 0;
+            state.last_flush = Instant::now();
+        }
+        Ok(())
     }
 
     fn set_file_error(&self, message: String) {
@@ -538,6 +589,7 @@ impl DiagnosticStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.file = None;
+        state.pending_lines = 0;
         state.error = Some(message);
     }
 }
@@ -634,6 +686,45 @@ pub fn default_log_directory() -> io::Result<PathBuf> {
     let project_dirs = ProjectDirs::from("", "", "RemCmd")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "app data directory not found"))?;
     Ok(project_dirs.data_dir().join("logs"))
+}
+
+pub fn fallback_log_directory() -> PathBuf {
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = FALLBACK_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "remcmd-diagnostics-{}-{started_at:x}-{sequence:x}",
+        process::id(),
+    ))
+}
+
+fn create_private_log_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn open_private_log_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn anonymous_profile(profile: &ConnectionProfile) -> AnonymousProfile {
@@ -774,6 +865,42 @@ mod tests {
     }
 
     #[test]
+    fn fallback_log_directories_are_unique_and_private() {
+        let first = fallback_log_directory();
+        let second = fallback_log_directory();
+        assert_ne!(first, second);
+
+        let store = DiagnosticStore::new(&first);
+        assert_eq!(store.log_directory(), first);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&first).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+
+        drop(store);
+        fs::remove_dir_all(first).unwrap();
+    }
+
+    #[test]
+    fn buffered_logs_can_be_flushed_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DiagnosticStore::new(directory.path());
+        store.record(DiagnosticLevel::Info, "test", "buffered event", []);
+
+        store.flush().unwrap();
+
+        let contents = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect::<String>();
+        assert!(contents.contains("buffered event"));
+    }
+
+    #[test]
     fn support_bundle_redacts_disk_memory_and_excludes_sensitive_profile_fields() {
         let directory = tempfile::tempdir().unwrap();
         let store = DiagnosticStore::new(directory.path().join("logs"));
@@ -796,6 +923,7 @@ mod tests {
             "field-token",
         ];
         let memory = serde_json::to_string(&store.recent(&DiagnosticFilter::default())).unwrap();
+        store.flush().unwrap();
         let disk = fs::read_dir(directory.path().join("logs"))
             .unwrap()
             .filter_map(Result::ok)
