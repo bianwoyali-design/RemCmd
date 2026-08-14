@@ -575,6 +575,14 @@ fn build_candidate(
             }
         }
         Some(RouteDirective::Command(command)) if command != "none" => {
+            if let Err(message) = validate_proxy_command_tokens(command) {
+                warnings.push(OpenSshImportWarning {
+                    path: effective.location.path.clone(),
+                    line: effective.location.line,
+                    message,
+                });
+                return invalid_candidate(display_alias, warnings);
+            }
             let command_digest = digest_bytes(command.as_bytes());
             profile.route.upstream_proxy = Some(ProxyConfig::ProxyCommand {
                 command_digest,
@@ -895,7 +903,7 @@ fn resolve_host(alias: &str, rules: &[Rule], home_dir: &Path, local_user: &str) 
         match rule.keyword.as_str() {
             "hostname" if effective.host_name.is_none() => {
                 if let Some(value) = split_words(&rule.arguments).first() {
-                    effective.host_name = Some(value.replace("%%", "%").replace("%h", alias));
+                    effective.host_name = Some(expand_host_name_tokens(value, alias));
                 }
             }
             "user" if !effective.user_was_set => {
@@ -1211,6 +1219,46 @@ fn expand_connection_tokens(value: &str, alias: &str, effective: &EffectiveHost)
         }
     }
     output
+}
+
+fn expand_host_name_tokens(value: &str, alias: &str) -> String {
+    let mut output = String::new();
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('%') => output.push('%'),
+            Some('h') => output.push_str(alias),
+            Some(token) => {
+                output.push('%');
+                output.push(token);
+            }
+            None => output.push('%'),
+        }
+    }
+    output
+}
+
+fn validate_proxy_command_tokens(command: &str) -> Result<(), String> {
+    let mut characters = command.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            continue;
+        }
+        match characters.next() {
+            Some('%' | 'h' | 'n' | 'p' | 'r') => {}
+            Some(token) => {
+                return Err(format!(
+                    "ProxyCommand contains unsupported token %{token}; supported tokens are %% %h %n %p %r"
+                ));
+            }
+            None => return Err("ProxyCommand ends with an incomplete % token".into()),
+        }
+    }
+    Ok(())
 }
 
 fn split_proxy_jump(value: &str) -> Vec<String> {
@@ -1547,6 +1595,46 @@ mod tests {
             candidate.profile.as_ref().unwrap().route.upstream_proxy,
             Some(ProxyConfig::ProxyCommand { .. })
         ));
+    }
+
+    #[test]
+    fn host_name_token_expansion_preserves_escaped_percent_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_config(
+            directory.path(),
+            "Host escaped\n  HostName %%h.%h.example\n",
+        );
+
+        let preview = preview_with_context(&path, &[], directory.path(), "local").unwrap();
+        let profile = preview.candidates[0].profile.as_ref().unwrap();
+
+        assert_eq!(profile.host, "%h.escaped.example");
+    }
+
+    #[test]
+    fn proxy_command_invalid_tokens_are_reported_during_preview() {
+        for (command, expected_warning) in [
+            ("nc %x", "unsupported token %x"),
+            ("nc %", "incomplete % token"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = write_config(
+                directory.path(),
+                &format!("Host proxied\n  ProxyCommand {command}\n"),
+            );
+
+            let preview = preview_with_context(&path, &[], directory.path(), "local").unwrap();
+            let candidate = &preview.candidates[0];
+
+            assert_eq!(candidate.status, OpenSshImportStatus::Invalid);
+            assert!(candidate.profile.is_none());
+            assert!(
+                candidate
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.message.contains(expected_warning))
+            );
+        }
     }
 
     #[test]
