@@ -8133,10 +8133,8 @@ impl RemCmdApp {
                         _ => false,
                     };
 
-                if !prompted_for_credential {
-                    if let Some(session) = self.session_mut(session_id) {
-                        session.connection_error = Some(SessionMessage::connection_error(&error));
-                    }
+                if !prompted_for_credential && let Some(session) = self.session_mut(session_id) {
+                    session.connection_error = Some(SessionMessage::connection_error(&error));
                 }
                 true
             }
