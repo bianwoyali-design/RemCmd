@@ -782,7 +782,7 @@ impl SshTransport {
     pub async fn disconnect(&self) -> Result<(), SshError> {
         let mut first_error = self.disconnect_current().await.err();
         for handle in self.upstream_handles.iter().rev() {
-            if let Err(error) = handle
+            match handle
                 .disconnect(
                     russh::Disconnect::ByApplication,
                     "Disconnected by user",
@@ -791,9 +791,8 @@ impl SshTransport {
                 .await
                 .map_err(SshError::from)
             {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Ok(()) | Err(_) => {}
             }
         }
         match first_error {
