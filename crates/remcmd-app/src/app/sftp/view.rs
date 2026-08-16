@@ -260,6 +260,14 @@ impl RemCmdApp {
                         message.clone(),
                     );
                 }
+                SftpAvailability::ScpOnly(message) => {
+                    return self.render_scp_upload_fallback(
+                        session_id,
+                        placement,
+                        message.clone(),
+                        cx,
+                    );
+                }
                 SftpAvailability::Available => {}
             }
         }
@@ -515,6 +523,87 @@ impl RemCmdApp {
                     .text_color(self.theme.text_muted)
                     .child(message.into()),
             )
+            .into_any_element()
+    }
+
+    fn render_scp_upload_fallback(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        technical_message: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let destination = self
+            .session(session_id)
+            .and_then(|session| session.terminal.as_ref())
+            .and_then(|terminal| terminal.remote_cwd.clone())
+            .unwrap_or_else(|| ".".into());
+        let mut destination_args = fluent_bundle::FluentArgs::new();
+        destination_args.set("path", destination);
+        let destination_text = self.tr_with("scp-upload-destination", &destination_args);
+        let upload = text_button(
+            SharedString::from(format!(
+                "scp-upload-fallback-{}-{}",
+                placement.element_suffix(),
+                session_id.0
+            )),
+            self.tr("sftp-upload-files"),
+            TextButtonTone::Primary,
+            true,
+            &self.theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.choose_sftp_uploads(session_id, placement, cx);
+        }));
+
+        div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .px_4()
+                    .text_center()
+                    .child(self.render_sidebar_icon(IconName::Upload, 22.0))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(self.tr("scp-upload-fallback")),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(420.0))
+                            .text_sm()
+                            .text_color(self.theme.text_muted)
+                            .child(self.tr("scp-upload-fallback-detail")),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(420.0))
+                            .text_xs()
+                            .font_family(UI_MONOSPACE_FONT_FAMILY)
+                            .text_color(self.theme.text_faint)
+                            .child(destination_text),
+                    )
+                    .child(upload)
+                    .child(
+                        div()
+                            .max_w(px(420.0))
+                            .text_xs()
+                            .text_color(self.theme.text_faint)
+                            .child(technical_message),
+                    ),
+            )
+            .child(self.render_sftp_transfer_queue(session_id, placement, cx))
             .into_any_element()
     }
 
@@ -797,11 +886,15 @@ impl RemCmdApp {
         let (tasks, batch_progress) = self
             .session(session_id)
             .map(|session| {
+                let direction = session.transfers.latest_batch_direction();
                 (
                     session.transfers.tasks.clone(),
-                    session
-                        .transfers
-                        .latest_batch_progress(SftpTransferDirection::Download),
+                    direction.and_then(|direction| {
+                        session
+                            .transfers
+                            .latest_batch_progress(direction)
+                            .map(|progress| (direction, progress))
+                    }),
                 )
             })
             .unwrap_or_default();
@@ -853,21 +946,30 @@ impl RemCmdApp {
                     .child(clear_button),
             );
 
-        if let Some(progress) = batch_progress {
+        if let Some((direction, progress)) = batch_progress {
             let percentage = (progress.fraction * 100.0).round() as u32;
-            let title = if progress.settled_count < progress.task_count {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("count", progress.task_count);
-                self.tr_with("sftp-downloading-files", &args)
-            } else if progress.failed_count == 0 {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("count", progress.task_count);
-                self.tr_with("sftp-downloaded-files", &args)
-            } else {
-                let mut args = fluent_bundle::FluentArgs::new();
-                args.set("count", progress.failed_count);
-                self.tr_with("sftp-downloaded-errors", &args)
+            let title_key = match (
+                direction,
+                progress.settled_count < progress.task_count,
+                progress.failed_count == 0,
+            ) {
+                (SftpTransferDirection::Upload, true, _) => "sftp-uploading-files",
+                (SftpTransferDirection::Upload, false, true) => "sftp-uploaded-files",
+                (SftpTransferDirection::Upload, false, false) => "sftp-uploaded-errors",
+                (SftpTransferDirection::Download, true, _) => "sftp-downloading-files",
+                (SftpTransferDirection::Download, false, true) => "sftp-downloaded-files",
+                (SftpTransferDirection::Download, false, false) => "sftp-downloaded-errors",
             };
+            let mut title_args = fluent_bundle::FluentArgs::new();
+            title_args.set(
+                "count",
+                if progress.settled_count < progress.task_count || progress.failed_count == 0 {
+                    progress.task_count
+                } else {
+                    progress.failed_count
+                },
+            );
+            let title = self.tr_with(title_key, &title_args);
             let status = progress.total.map_or_else(
                 || {
                     let mut args = fluent_bundle::FluentArgs::new();

@@ -41,9 +41,10 @@ const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
 const SFTP_AVAILABILITY_COMMAND: &str = r#"if command -v sftp-server >/dev/null 2>&1 || [ -x /usr/libexec/openssh/sftp-server ] || [ -x /usr/libexec/sftp-server ] || [ -x /usr/lib/openssh/sftp-server ] || [ -x /usr/lib/ssh/sftp-server ] || [ -x /usr/lib64/ssh/sftp-server ]; then printf 'available\n'; elif grep -Eqs '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+internal-sftp([[:space:]]|$)' /etc/ssh/sshd_config 2>/dev/null || grep -ERqs '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+internal-sftp([[:space:]]|$)' /etc/ssh/sshd_config.d 2>/dev/null; then printf 'available\n'; else printf 'unavailable\n'; fi"#;
+const SCP_AVAILABILITY_COMMAND: &str = "if command -v scp >/dev/null 2>&1; then printf 'available\\n'; else printf 'unavailable\\n'; fi";
 
 /// Receives asynchronous events from one russh client connection.
-struct ClientHandler {
+pub(crate) struct ClientHandler {
     host: String,
     port: u16,
     known_hosts_path: Option<PathBuf>,
@@ -66,7 +67,7 @@ impl ClientHandler {
 
     /// Tests inject an isolated known_hosts file.
     #[cfg(test)]
-    fn with_known_hosts_path(host: impl Into<String>, port: u16, path: PathBuf) -> Self {
+    pub(crate) fn with_known_hosts_path(host: impl Into<String>, port: u16, path: PathBuf) -> Self {
         Self {
             host: host.into(),
             port,
@@ -195,6 +196,14 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
+    #[cfg(test)]
+    pub(crate) fn from_test_handle(handle: client::Handle<ClientHandler>) -> Self {
+        Self {
+            handle,
+            upstream_handles: Vec::new(),
+        }
+    }
+
     /// Opens TCP and completes the SSH handshake without authenticating.
     #[cfg(test)]
     async fn open_connection_with_timeout(
@@ -706,7 +715,32 @@ impl SshTransport {
 
     pub(crate) async fn check_sftp_availability(&self) -> Result<bool, SshError> {
         let output = self.execute(SFTP_AVAILABILITY_COMMAND).await?;
-        parse_sftp_availability(&output)
+        parse_transfer_availability(&output, "SFTP")
+    }
+
+    pub(crate) async fn check_scp_availability(&self) -> Result<bool, SshError> {
+        let output = self.execute(SCP_AVAILABILITY_COMMAND).await?;
+        parse_transfer_availability(&output, "SCP")
+    }
+
+    pub(crate) async fn open_exec_channel(
+        &self,
+        command: &str,
+    ) -> Result<russh::Channel<client::Msg>, SshError> {
+        tokio::time::timeout(EXEC_TIMEOUT, async {
+            let channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(SshError::from)?;
+            channel
+                .exec(true, command.as_bytes())
+                .await
+                .map_err(SshError::from)?;
+            Ok(channel)
+        })
+        .await
+        .map_err(|_| SshError::new(SshErrorKind::Timeout, "opening remote command timed out"))?
     }
 
     pub(crate) async fn execute(&self, command: &str) -> Result<Vec<u8>, SshError> {
@@ -904,13 +938,13 @@ fn append_command_output(output: &mut Vec<u8>, data: &[u8]) -> Result<(), SshErr
     Ok(())
 }
 
-fn parse_sftp_availability(output: &[u8]) -> Result<bool, SshError> {
+fn parse_transfer_availability(output: &[u8], protocol: &str) -> Result<bool, SshError> {
     match output {
         b"available\n" => Ok(true),
         b"unavailable\n" => Ok(false),
         _ => Err(SshError::new(
             SshErrorKind::Protocol,
-            "remote server returned an invalid SFTP availability response",
+            format!("remote server returned an invalid {protocol} availability response"),
         )),
     }
 }
@@ -1163,11 +1197,17 @@ mod tests {
 
     #[test]
     fn parses_sftp_availability_probe_responses() {
-        assert!(parse_sftp_availability(b"available\n").unwrap());
-        assert!(!parse_sftp_availability(b"unavailable\n").unwrap());
+        assert!(parse_transfer_availability(b"available\n", "SFTP").unwrap());
+        assert!(!parse_transfer_availability(b"unavailable\n", "SFTP").unwrap());
 
-        let error = parse_sftp_availability(b"unexpected\n").unwrap_err();
+        let error = parse_transfer_availability(b"unexpected\n", "SFTP").unwrap_err();
         assert_eq!(error.kind(), SshErrorKind::Protocol);
+    }
+
+    #[test]
+    fn scp_probe_uses_the_remote_path() {
+        assert!(SCP_AVAILABILITY_COMMAND.contains("command -v scp"));
+        assert!(parse_transfer_availability(b"available\n", "SCP").unwrap());
     }
 
     #[test]

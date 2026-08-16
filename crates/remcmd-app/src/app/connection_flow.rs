@@ -1578,7 +1578,11 @@ impl RemCmdApp {
                 self.start_queued_sftp_transfers(cx);
                 true
             }
-            ConnectionEvent::SftpAvailabilityChanged { available, message } => {
+            ConnectionEvent::SftpAvailabilityChanged {
+                available,
+                scp_available,
+                message,
+            } => {
                 let unavailable_message = message.map_or_else(
                     || self.tr("sftp-server-unavailable"),
                     |details| {
@@ -1592,6 +1596,8 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     session.sftp_availability = if available {
                         SftpAvailability::Available
+                    } else if scp_available {
+                        SftpAvailability::ScpOnly(unavailable_message)
                     } else {
                         SftpAvailability::Unavailable(unavailable_message)
                     };

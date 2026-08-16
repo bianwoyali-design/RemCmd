@@ -24,6 +24,7 @@ pub(super) enum SftpAvailability {
     #[default]
     Checking,
     Available,
+    ScpOnly(String),
     Unavailable(String),
 }
 
@@ -716,6 +717,13 @@ impl SftpTransferQueue {
         })
     }
 
+    pub(super) fn latest_batch_direction(&self) -> Option<SftpTransferDirection> {
+        self.tasks
+            .iter()
+            .max_by_key(|task| task.batch_id)
+            .map(|task| task.direction)
+    }
+
     pub(super) fn mark_conflict(&mut self, id: u64) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
@@ -933,7 +941,7 @@ pub(super) fn remote_join_path(directory: &str, name: &str) -> String {
 
 pub(super) struct LocalUploadPlan {
     pub(super) directories: Vec<String>,
-    pub(super) files: Vec<(PathBuf, String)>,
+    pub(super) files: Vec<(PathBuf, String, u64)>,
 }
 
 pub(super) fn build_local_upload_plan(
@@ -954,7 +962,7 @@ pub(super) fn build_local_upload_plan(
             directories.push(remote_path.clone());
             pending.push((path.clone(), remote_path));
         } else if metadata.is_file() {
-            files.push((path.clone(), remote_path));
+            files.push((path.clone(), remote_path, metadata.len()));
         }
     }
 
@@ -975,7 +983,7 @@ pub(super) fn build_local_upload_plan(
                 directories.push(remote_path.clone());
                 pending.push((local_path, remote_path));
             } else if metadata.is_file() {
-                files.push((local_path, remote_path));
+                files.push((local_path, remote_path, metadata.len()));
             }
         }
     }
@@ -1279,6 +1287,7 @@ mod tests {
             vec![(
                 project.join("src/main.rs"),
                 "/home/test/project/src/main.rs".into(),
+                13,
             )]
         );
     }
@@ -1444,6 +1453,48 @@ mod tests {
                 transferred: 150,
                 total: Some(250),
                 fraction: 0.6,
+            })
+        );
+    }
+
+    #[test]
+    fn multi_file_upload_reports_total_batch_byte_progress() {
+        let mut queue = SftpTransferQueue::default();
+        let batch = queue.begin_batch();
+        let first = queue.enqueue_in_batch(
+            batch,
+            SftpTransferDirection::Upload,
+            PathBuf::from("/tmp/first.bin"),
+            "/remote/first.bin".into(),
+            false,
+            Some(100),
+        );
+        let second = queue.enqueue_in_batch(
+            batch,
+            SftpTransferDirection::Upload,
+            PathBuf::from("/tmp/second.bin"),
+            "/remote/second.bin".into(),
+            false,
+            Some(300),
+        );
+
+        assert_eq!(
+            queue.latest_batch_direction(),
+            Some(SftpTransferDirection::Upload)
+        );
+        assert_eq!(queue.start_next().map(|task| task.id), Some(first));
+        assert_eq!(queue.start_next().map(|task| task.id), Some(second));
+        assert!(queue.mark_completed(first, 100));
+        assert!(queue.mark_progress(second, 100, Some(300)));
+        assert_eq!(
+            queue.latest_batch_progress(SftpTransferDirection::Upload),
+            Some(SftpTransferBatchProgress {
+                task_count: 2,
+                settled_count: 1,
+                failed_count: 0,
+                transferred: 200,
+                total: Some(400),
+                fraction: 0.5,
             })
         );
     }

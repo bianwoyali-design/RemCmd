@@ -21,6 +21,7 @@ use crate::{
     SshTransport, TransferRateLimiter,
     host_key::HostKeyDecision,
     performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
+    scp::ScpWorkerHandle,
     sftp::SftpWorkerHandle,
     transport::TransportOpen,
 };
@@ -183,9 +184,10 @@ pub enum ConnectionEvent {
         error: SshError,
     },
 
-    /// Reports whether the server exposes an SFTP subsystem before the UI uses it.
+    /// Reports the available remote-file protocols before the UI uses them.
     SftpAvailabilityChanged {
         available: bool,
+        scp_available: bool,
         message: Option<String>,
     },
 
@@ -911,9 +913,16 @@ async fn run_connection_plan(
     let transport = Arc::new(transport);
     let mut pending_command = None;
     let mut sftp_worker = None;
+    let mut scp_worker = None;
     let mut sftp_available = None;
-    let mut sftp_probe_pending = true;
-    let mut sftp_probe = Box::pin(transport.check_sftp_availability());
+    let mut scp_available = None;
+    let mut transfer_probe_pending = true;
+    let mut transfer_probe = Box::pin(async {
+        tokio::join!(
+            transport.check_sftp_availability(),
+            transport.check_scp_availability()
+        )
+    });
     let mut shell_probe_pending = true;
     let mut shell_probe = Box::pin(transport.detect_shell());
     let mut detected_shell = None;
@@ -927,23 +936,40 @@ async fn run_connection_plan(
         } else {
             tokio::select! {
                 command = commands.recv() => command,
-                availability = &mut sftp_probe, if sftp_probe_pending => {
-                    sftp_probe_pending = false;
-                    let (available, message) = match availability {
-                        Ok(true) => (true, None),
-                        Ok(false) => (
-                            false,
-                            Some("SFTP is not installed or configured on this server".into()),
-                        ),
-                        Err(error) => (
-                            false,
-                            Some(format!("Could not verify SFTP availability: {error}")),
-                        ),
+                availability = &mut transfer_probe, if transfer_probe_pending => {
+                    transfer_probe_pending = false;
+                    let (sftp_result, scp_result) = availability;
+                    let available = sftp_result.as_ref().copied().unwrap_or(false);
+                    let fallback_available = scp_result.as_ref().copied().unwrap_or(false);
+                    let message = if available {
+                        None
+                    } else {
+                        Some(match (sftp_result, scp_result) {
+                            (Ok(false), Ok(true)) =>
+                                "SFTP is unavailable; SCP upload fallback is available".into(),
+                            (Ok(false), Ok(false)) =>
+                                "SFTP and SCP are unavailable on this server".into(),
+                            (Err(error), Ok(true)) => format!(
+                                "Could not verify SFTP availability: {error}; SCP upload fallback is available"
+                            ),
+                            (Err(error), Ok(false)) => format!(
+                                "Could not verify SFTP availability: {error}; SCP is unavailable"
+                            ),
+                            (Ok(false), Err(error)) => format!(
+                                "SFTP is unavailable and SCP availability could not be verified: {error}"
+                            ),
+                            (Err(sftp_error), Err(scp_error)) => format!(
+                                "Could not verify SFTP availability: {sftp_error}; could not verify SCP availability: {scp_error}"
+                            ),
+                            (Ok(true), _) => unreachable!("available SFTP has no fallback message"),
+                        })
                     };
                     sftp_available = Some(available);
+                    scp_available = Some(fallback_available);
                     if events
                         .send(ConnectionEvent::SftpAvailabilityChanged {
                             available,
+                            scp_available: fallback_available,
                             message,
                         })
                         .await
@@ -1053,7 +1079,7 @@ async fn run_connection_plan(
                 if sftp_available != Some(true) {
                     let error = SshError::new(
                         SshErrorKind::Sftp,
-                        if sftp_probe_pending {
+                        if transfer_probe_pending {
                             "SFTP availability is still being checked"
                         } else {
                             "SFTP is unavailable on this server"
@@ -1306,7 +1332,7 @@ async fn run_connection_plan(
             }
             Some(ConnectionCommand::CreateDirectories { request_id, paths }) => {
                 let error_path = paths.first().cloned().unwrap_or_default();
-                if sftp_worker.is_none() {
+                if sftp_available == Some(true) && sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(session) => {
                             sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
@@ -1316,26 +1342,64 @@ async fn run_connection_plan(
                             ));
                         }
                         Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path: error_path,
-                                    operation: SftpOperation::CreateDirectory,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
+                            sftp_available = Some(false);
+                            if scp_available == Some(true) {
+                                if events
+                                    .send(ConnectionEvent::SftpAvailabilityChanged {
+                                        available: false,
+                                        scp_available: true,
+                                        message: Some(format!(
+                                            "Opening SFTP failed: {error}; using SCP upload fallback"
+                                        )),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    close_resources(&transport, Some(&writer)).await;
+                                    return;
+                                }
+                            } else {
+                                if events
+                                    .send(ConnectionEvent::SftpFailed {
+                                        request_id,
+                                        path: error_path,
+                                        operation: SftpOperation::CreateDirectory,
+                                        error,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    close_resources(&transport, Some(&writer)).await;
+                                    return;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
 
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.create_directories(request_id, paths)
+                let result = if let Some(worker) = sftp_worker.as_ref() {
+                    worker.create_directories(request_id, paths)
+                } else if scp_available == Some(true) {
+                    let worker = scp_worker.get_or_insert_with(|| {
+                        ScpWorkerHandle::spawn(
+                            transport.clone(),
+                            events.clone(),
+                            transfer_rate_limiter.clone(),
+                        )
+                    });
+                    worker.create_directories(request_id, paths)
+                } else {
+                    Err(SshError::new(
+                        SshErrorKind::Sftp,
+                        if transfer_probe_pending {
+                            "File-transfer availability is still being checked"
+                        } else {
+                            "SFTP and SCP are unavailable on this server"
+                        },
+                    ))
+                };
+                if let Err(error) = result
                     && events
                         .send(ConnectionEvent::SftpFailed {
                             request_id,
@@ -1402,7 +1466,7 @@ async fn run_connection_plan(
                 remote_path,
                 overwrite,
             }) => {
-                if sftp_worker.is_none() {
+                if sftp_available == Some(true) && sftp_worker.is_none() {
                     match transport.open_sftp().await {
                         Ok(sftp_session) => {
                             sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
@@ -1412,27 +1476,64 @@ async fn run_connection_plan(
                             ));
                         }
                         Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id: transfer_id,
-                                    path: remote_path,
-                                    operation: SftpOperation::UploadFile,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
+                            sftp_available = Some(false);
+                            if scp_available == Some(true) {
+                                if events
+                                    .send(ConnectionEvent::SftpAvailabilityChanged {
+                                        available: false,
+                                        scp_available: true,
+                                        message: Some(format!(
+                                            "Opening SFTP failed: {error}; using SCP upload fallback"
+                                        )),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    close_resources(&transport, Some(&writer)).await;
+                                    return;
+                                }
+                            } else {
+                                if events
+                                    .send(ConnectionEvent::SftpFailed {
+                                        request_id: transfer_id,
+                                        path: remote_path,
+                                        operation: SftpOperation::UploadFile,
+                                        error,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    close_resources(&transport, Some(&writer)).await;
+                                    return;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
 
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) =
-                        worker.upload_file(transfer_id, local_path, remote_path.clone(), overwrite)
+                let result = if let Some(worker) = sftp_worker.as_ref() {
+                    worker.upload_file(transfer_id, local_path, remote_path.clone(), overwrite)
+                } else if scp_available == Some(true) {
+                    let worker = scp_worker.get_or_insert_with(|| {
+                        ScpWorkerHandle::spawn(
+                            transport.clone(),
+                            events.clone(),
+                            transfer_rate_limiter.clone(),
+                        )
+                    });
+                    worker.upload_file(transfer_id, local_path, remote_path.clone(), overwrite)
+                } else {
+                    Err(SshError::new(
+                        SshErrorKind::Sftp,
+                        if transfer_probe_pending {
+                            "File-transfer availability is still being checked"
+                        } else {
+                            "SFTP and SCP are unavailable on this server"
+                        },
+                    ))
+                };
+                if let Err(error) = result
                     && events
                         .send(ConnectionEvent::SftpFailed {
                             request_id: transfer_id,
@@ -1503,8 +1604,18 @@ async fn run_connection_plan(
                 }
             }
             Some(ConnectionCommand::CancelTransfer { transfer_id }) => {
+                let mut cancellation_error = None;
                 if let Some(worker) = sftp_worker.as_ref()
                     && let Err(error) = worker.cancel_transfer(transfer_id)
+                {
+                    cancellation_error = Some(error);
+                }
+                if let Some(worker) = scp_worker.as_ref()
+                    && let Err(error) = worker.cancel_transfer(transfer_id)
+                {
+                    cancellation_error.get_or_insert(error);
+                }
+                if let Some(error) = cancellation_error
                     && events
                         .send(ConnectionEvent::SftpFailed {
                             request_id: transfer_id,
