@@ -3,12 +3,14 @@ use super::{
     CancelQuickCommand, CancelSettingsSelector, CancelSftpCreate, DiagnosticLevel, Diagnostics,
     DiagnosticsGlobal, KeyBinding, LanguageMode, Localizer, RemCmdApp, RemCmdAssets,
     RemCmdMainWindow, SaveProfileEditor, SshRuntime, SubmitCredential, SubmitQuickCommand,
-    SubmitSftpCreate, TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, bind_file_editor_keys,
-    bind_text_field_keys, configure_application_menu, default_log_directory,
-    fallback_log_directory, point, px, size,
+    SubmitSftpCreate, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowOptions, bind_file_editor_keys, bind_text_field_keys, configure_application_menu,
+    default_log_directory, fallback_log_directory, px, size,
 };
+#[cfg(target_os = "macos")]
+use super::{TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y, point};
 use gpui::prelude::*;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 #[cfg(target_os = "macos")]

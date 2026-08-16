@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use super::img;
 use super::{
     Animation, AnyElement, AnyView, App, Bounds, BoxShadow, ConnectionProfile, Context,
     CursorStyle, FontWeight, Hsla, IconName, IconTone, IntoElement, LOCAL_PROFILE_ID, Localizer,
@@ -6,7 +8,7 @@ use super::{
     SharedString, SplitAxis, TabLayout, TerminalSession, TerminalTab, TerminalTabView,
     TextButtonTone, Theme, Timer, TitlebarOptions, WINDOWS_CHROME_HEIGHT, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, app_icon, clamp_bottom_panel_height,
-    div, ease_in_out, ease_out_quint, format_remote_size, icon, icon_button, icon_with_color, img,
+    div, ease_in_out, ease_out_quint, format_remote_size, icon, icon_button, icon_with_color,
     point, profile_auth_label, px, size, text_button, wordmark,
 };
 use gpui::AnimationExt;

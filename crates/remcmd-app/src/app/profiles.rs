@@ -1,3 +1,5 @@
+#[cfg(not(target_os = "macos"))]
+use super::PathPromptOptions;
 use super::{
     ActivePanel, AnyElement, AuthConfig, ConnectionProfile, ConnectionRoute, Context,
     CredentialKind, DiagnosticLevel, DiagnosticsGlobal, Entity, FontWeight, IconName, IconTone,
