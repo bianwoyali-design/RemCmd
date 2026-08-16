@@ -52,9 +52,11 @@ use sftp_state::{
 use shell::{
     AboutWindow, ActivePanel, BottomPanelResize, CommandTooltip, MOTION_INSTANT_DURATION,
     MOTION_STANDARD_DURATION, RIGHT_SIDEBAR_DEFAULT_WIDTH, RightSidebarView, SIDEBAR_DEFAULT_WIDTH,
-    ServerPerformanceState, SidebarResize, TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y,
-    content_top_inset, platform_chrome_height, session_state_key,
+    ServerPerformanceState, SidebarResize, content_top_inset, platform_chrome_height,
+    session_state_key,
 };
+#[cfg(target_os = "macos")]
+use shell::{TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y};
 use terminal_session::{
     ActiveTerminal, LOCAL_PROFILE_ID, SessionMessage, SessionMessageArg, TERMINAL_COLUMNS,
     TERMINAL_EVENT_BATCH_LIMIT, TERMINAL_REDRAW_INTERVAL, TERMINAL_ROWS, TerminalContextMenu,

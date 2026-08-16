@@ -2218,6 +2218,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn command_c_is_the_terminal_copy_shortcut_on_macos() {
         assert!(is_terminal_copy_shortcut(

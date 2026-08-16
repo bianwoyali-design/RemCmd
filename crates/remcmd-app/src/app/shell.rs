@@ -3257,8 +3257,10 @@ pub(super) const TITLEBAR_ACTIVE_TAB_GROWTH: f32 = 36.0;
 
 pub(super) const TITLEBAR_CLOSE_SYMBOL_SIZE: f32 = 12.0;
 
+#[cfg(target_os = "macos")]
 pub(super) const TRAFFIC_LIGHT_INSET_X: f32 = 20.0;
 
+#[cfg(target_os = "macos")]
 pub(super) const TRAFFIC_LIGHT_INSET_Y: f32 = 18.0;
 
 pub(super) const fn platform_chrome_height() -> f32 {
