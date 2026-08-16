@@ -17,6 +17,8 @@ All notable changes to RemCmd are documented in this file.
   monitoring.
 - Redacted JSONL diagnostics with an in-memory fallback, seven-day retention,
   runtime debug mode, filtering, clearing, and anonymized ZIP support bundles.
+- Automatic SCP upload fallback when a server has no SFTP subsystem, plus
+  aggregate byte progress for multi-file upload batches.
 - macOS, Windows, and Ubuntu workspace-test jobs in CI.
 
 ### Changed

@@ -490,9 +490,16 @@ impl RemCmdApp {
         placement: SftpBrowserPlacement,
         cx: &mut Context<Self>,
     ) {
-        let Some(remote_directory) = self
-            .session(session_id)
-            .map(|session| session.sftp_browser(placement).path.clone())
+        let Some(remote_directory) =
+            self.session(session_id)
+                .map(|session| match &session.sftp_availability {
+                    SftpAvailability::ScpOnly(_) => session
+                        .terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.remote_cwd.clone())
+                        .unwrap_or_else(|| ".".into()),
+                    _ => session.sftp_browser(placement).path.clone(),
+                })
         else {
             return;
         };
@@ -554,7 +561,7 @@ impl RemCmdApp {
                     else {
                         return;
                     };
-                    for (local_path, remote_path) in plan.files {
+                    for (local_path, remote_path, size) in plan.files {
                         this.enqueue_sftp_transfer(
                             session_id,
                             SftpTransferSpec {
@@ -563,7 +570,7 @@ impl RemCmdApp {
                                 local_path,
                                 remote_path,
                                 overwrite: false,
-                                expected_total: None,
+                                expected_total: Some(size),
                             },
                             cx,
                         );

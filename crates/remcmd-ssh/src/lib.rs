@@ -5,6 +5,7 @@ mod host_key;
 mod performance;
 mod plan;
 mod proxy;
+mod scp;
 mod session;
 mod sftp;
 mod shell;

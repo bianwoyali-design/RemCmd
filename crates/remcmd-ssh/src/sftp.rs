@@ -536,19 +536,19 @@ impl SftpWorkerHandle {
     }
 }
 
-const TRANSFER_CHUNK_BYTES: usize = 128 * 1024;
+pub(crate) const TRANSFER_CHUNK_BYTES: usize = 128 * 1024;
 const DOWNLOAD_PIPELINE_STREAMS: usize = 4;
 const MIN_DOWNLOAD_SEGMENT_BYTES: u64 = 1024 * 1024;
 static NEXT_TRANSFER_TEMPORARY_ID: AtomicU64 = AtomicU64::new(1);
 
-enum TransferResult {
+pub(crate) enum TransferResult {
     Completed(u64),
     Conflict,
     Cancelled,
 }
 
 #[derive(Clone)]
-struct TransferContext {
+pub(crate) struct TransferContext {
     transfer_id: u64,
     cancellation: Arc<AtomicBool>,
     events: mpsc::Sender<ConnectionEvent>,
@@ -556,7 +556,7 @@ struct TransferContext {
 }
 
 impl TransferContext {
-    fn new(
+    pub(crate) fn new(
         transfer_id: u64,
         cancellation: Arc<AtomicBool>,
         events: mpsc::Sender<ConnectionEvent>,
@@ -570,15 +570,23 @@ impl TransferContext {
         }
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation.load(Ordering::Acquire)
     }
 
-    async fn acquire_rate_budget(&self, bytes: usize) {
+    pub(crate) const fn transfer_id(&self) -> u64 {
+        self.transfer_id
+    }
+
+    pub(crate) async fn acquire_rate_budget(&self, bytes: usize) {
         self.rate_limiter.acquire(bytes).await;
     }
 
-    async fn report_progress(&self, transferred: u64, total: Option<u64>) -> Result<(), SshError> {
+    pub(crate) async fn report_progress(
+        &self,
+        transferred: u64,
+        total: Option<u64>,
+    ) -> Result<(), SshError> {
         self.events
             .send(ConnectionEvent::TransferProgress {
                 transfer_id: self.transfer_id,
@@ -595,7 +603,7 @@ impl TransferContext {
     }
 }
 
-fn transfer_result_event(
+pub(crate) fn transfer_result_event(
     transfer_id: u64,
     path: String,
     direction: SftpTransferDirection,
@@ -1080,7 +1088,7 @@ fn download_segment_ranges(total: u64) -> Vec<Range<u64>> {
         .collect()
 }
 
-fn transfer_temporary_suffix(transfer_id: u64) -> String {
+pub(crate) fn transfer_temporary_suffix(transfer_id: u64) -> String {
     let sequence = NEXT_TRANSFER_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1092,7 +1100,7 @@ fn transfer_temporary_suffix(transfer_id: u64) -> String {
     )
 }
 
-fn remote_transfer_temporary_path(path: &str, suffix: &str) -> String {
+pub(crate) fn remote_transfer_temporary_path(path: &str, suffix: &str) -> String {
     format!("{path}.remcmd-{suffix}.part")
 }
 
@@ -1104,7 +1112,7 @@ fn local_transfer_temporary_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!(".{file_name}.remcmd-{suffix}.part"))
 }
 
-fn transfer_io_error(action: &str, error: std::io::Error) -> SshError {
+pub(crate) fn transfer_io_error(action: &str, error: std::io::Error) -> SshError {
     SshError::new(SshErrorKind::Sftp, format!("{action}: {error}"))
 }
 
