@@ -253,6 +253,8 @@ struct RemCmdApp {
     about_window: Option<WindowHandle<AboutWindow>>,
     exit_task: Option<Task<()>>,
     _appearance_subscription: Subscription,
+    #[cfg(target_os = "macos")]
+    _platform_preferences_task: Task<()>,
 }
 
 /// Keeps menu-bar actions independent from the currently focused GPUI element.
@@ -311,6 +313,23 @@ impl RemCmdApp {
         ));
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
+        window.set_background_appearance(if theme.reduce_transparency {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            WindowBackgroundAppearance::Blurred
+        });
+        #[cfg(target_os = "macos")]
+        let platform_preferences_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                Timer::after(std::time::Duration::from_secs(1)).await;
+                if this
+                    .update_in(cx, |this, window, cx| this.refresh_system_theme(window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
@@ -422,6 +441,8 @@ impl RemCmdApp {
             about_window: None,
             exit_task: None,
             _appearance_subscription: appearance_subscription,
+            #[cfg(target_os = "macos")]
+            _platform_preferences_task: platform_preferences_task,
         };
 
         cx.on_focus(&quick_terminal_focus_handle, window, |this, _, cx| {
@@ -536,7 +557,7 @@ impl Render for RemCmdApp {
                     Animation::new(if left_transition_id == 0 {
                         MOTION_INSTANT_DURATION
                     } else {
-                        MOTION_STANDARD_DURATION
+                        self.theme.motion_duration(MOTION_STANDARD_DURATION)
                     })
                     .with_easing(ease_in_out),
                     move |this, delta| {
@@ -571,7 +592,7 @@ impl Render for RemCmdApp {
                 Animation::new(if right_transition_id == 0 {
                     MOTION_INSTANT_DURATION
                 } else {
-                    MOTION_STANDARD_DURATION
+                    self.theme.motion_duration(MOTION_STANDARD_DURATION)
                 })
                 .with_easing(ease_in_out),
                 move |this, delta| {

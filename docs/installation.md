@@ -80,3 +80,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## macOS appearance and accessibility preferences
+
+The interface follows the system accent color and responds to Reduce Motion,
+Reduce Transparency, and Increase Contrast, including when a light or dark
+appearance is selected inside RemCmd. Preference changes apply while the app is
+running; accent colors are adjusted when needed to keep small labels readable.

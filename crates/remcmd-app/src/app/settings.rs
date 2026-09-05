@@ -93,12 +93,27 @@ impl RemCmdApp {
     }
 
     pub(super) fn refresh_system_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.theme_mode != ThemeMode::System {
+        let theme = Theme::resolve(self.theme_mode, window);
+        if theme == self.theme {
             return;
         }
-
-        self.theme = Theme::resolve(self.theme_mode, window);
-        set_global_theme(self.theme, cx);
+        self.theme = theme;
+        window.set_background_appearance(if theme.reduce_transparency {
+            gpui::WindowBackgroundAppearance::Opaque
+        } else {
+            gpui::WindowBackgroundAppearance::Blurred
+        });
+        set_global_theme(theme, cx);
+        if let Some(about) = self.about_window {
+            let _ = about.update(cx, |_, window, cx| {
+                window.set_background_appearance(if theme.reduce_transparency {
+                    gpui::WindowBackgroundAppearance::Opaque
+                } else {
+                    gpui::WindowBackgroundAppearance::Blurred
+                });
+                cx.notify();
+            });
+        }
         cx.notify();
     }
 
