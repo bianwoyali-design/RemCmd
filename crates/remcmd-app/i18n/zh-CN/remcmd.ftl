@@ -403,3 +403,13 @@ diagnostics-debug = 本次运行启用详细日志
 diagnostics-export = 导出支持包…
 diagnostics-memory-fallback = 文件日志不可用；事件将保留在内存中。
 diagnostics-no-events = 没有匹配的诊断事件
+
+exit-unsaved-title = 关闭前保存更改？
+exit-unsaved-detail = 远程文件有未保存的更改。如果保存失败，RemCmd 将保持打开。
+exit-save-all = 全部保存
+exit-discard = 不保存
+exit-save-failed = RemCmd 已保持打开
+exit-save-failed-detail = 部分文件无法保存、仍在保存，或保存后又被修改。请检查文件错误后重试。
+exit-transfers-title = 停止文件传输并关闭？
+exit-transfers-detail = 排队和正在进行的传输将停止。未完成的传输可能需要重新开始。
+exit-stop-transfers = 停止并关闭

@@ -1,6 +1,6 @@
 use super::{
     AnyElement, AnyView, App, CancelProfileEditor, CloseActivePane, CloseActiveTab, CloseWindow,
-    CommandTooltip, ConnectSelectedProfile, Context, DisconnectActiveSession, IconName,
+    CommandTooltip, ConnectSelectedProfile, Context, DisconnectActiveSession, ExitTarget, IconName,
     IntoElement, KeyBinding, Localizer, Menu, MenuItem, MinimizeWindow, NewConnection,
     NewLocalTerminal, NewRemoteTerminal, Quit, RemCmdApp, RemCmdMainWindow, ResetActiveTerminal,
     RightSidebarView, SaveProfileEditor, SharedString, ShowAbout, ShowFilesView, ShowHome,
@@ -349,10 +349,10 @@ impl RemCmdApp {
             WindowsMenuCommand::MinimizeWindow => window.minimize_window(),
             WindowsMenuCommand::ZoomWindow => window.zoom_window(),
             WindowsMenuCommand::ToggleFullscreen => window.toggle_fullscreen(),
-            WindowsMenuCommand::CloseWindow => window.remove_window(),
+            WindowsMenuCommand::CloseWindow => self.request_exit(ExitTarget::Window, window, cx),
             WindowsMenuCommand::ShowSettings => self.show_settings(window, cx),
             WindowsMenuCommand::ShowAbout => self.show_about(cx),
-            WindowsMenuCommand::Quit => cx.quit(),
+            WindowsMenuCommand::Quit => self.request_exit(ExitTarget::Application, window, cx),
         }
         cx.notify();
     }
@@ -490,19 +490,22 @@ impl RemCmdApp {
             );
         let close_hover = self.theme.danger;
         let close_pressed = self.theme.danger_hover;
-        let close = div()
-            .id("close_window")
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
-            .h_full()
-            .cursor_pointer()
-            .hover(move |this| this.bg(close_hover))
-            .active(move |this| this.bg(close_pressed))
-            .child(icon_with_color(IconName::Cancel, glyph, 11.0))
-            .on_click(cx.listener(|_, _, window, _| window.remove_window()));
+        let close =
+            div()
+                .id("close_window")
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .w(px(WINDOWS_TITLEBAR_BUTTON_WIDTH))
+                .h_full()
+                .cursor_pointer()
+                .hover(move |this| this.bg(close_hover))
+                .active(move |this| this.bg(close_pressed))
+                .child(icon_with_color(IconName::Cancel, glyph, 11.0))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.request_exit(ExitTarget::Window, window, cx)
+                }));
 
         div()
             .flex()
@@ -1073,9 +1076,24 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
         dispatch_main_window_action(cx, |_, window, _| window.toggle_fullscreen());
     });
     cx.on_action(|_: &CloseWindow, cx| {
-        dispatch_main_window_action(cx, |_, window, _| window.remove_window());
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.request_exit(ExitTarget::Window, window, cx)
+        });
     });
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        if cx
+            .try_global::<RemCmdMainWindow>()
+            .is_some_and(|main| main.0.read(cx).is_ok())
+        {
+            dispatch_main_window_action(cx, |this, window, cx| {
+                this.request_exit(ExitTarget::Application, window, cx)
+            });
+        } else {
+            #[cfg(target_os = "macos")]
+            crate::macos_lifecycle::approve_termination();
+            cx.quit();
+        }
+    });
     cx.set_menus(application_menus(localizer));
 }
 
