@@ -2,3 +2,5 @@
 .DS_Store
 *.log
 AGENTS.md
+
+__pycache__/

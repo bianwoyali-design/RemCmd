@@ -6,27 +6,28 @@ builds and `v*` tags publish unsigned Windows artifacts.
 
 ## MSI Versioning
 
-WiX requires a numeric `major.minor.patch.build` version, whereas the
-user-facing Cargo version may use SemVer prerelease labels. The WiX-only
-`packaging/wix/windows.toml` therefore owns the MSI version. Its name avoids
-`cargo-packager`'s automatic `Packager.toml` discovery, so the WiX-only version
-cannot create an extra macOS or Linux package.
+Windows Installer compares only the first three numeric fields of `ProductVersion`;
+a fourth field is ignored. The release validator enforces the following increasing
+versions for the initial `0.1.0` release series:
 
-For `v0.1.0-beta.1`, the Cargo version is `0.1.0-beta.1`, while the WiX
-configuration uses `0.0.1+1`, which produces MSI `ProductVersion` `0.0.1.1`.
-This keeps the beta installer newer than alpha installers and older than the
-future `0.1.0` final installer. Before publishing another prerelease, update
-the Windows version monotonically: `alpha.N` uses `0.0.0.N`, `beta.N` uses
-`0.0.1.N`, and `rc.N` uses `0.0.2.N`. Replace it with `0.1.0` for the final
-`v0.1.0` release.
+| Cargo version | MSI ProductVersion |
+|---|---|
+| `0.1.0-alpha.N` | `0.0.N` |
+| `0.1.0-beta.N` | `0.0.(10000 + N)` |
+| `0.1.0-rc.N` | `0.0.(20000 + N)` |
+| `0.1.0` | `0.1.0` |
 
-The generated installer is renamed after packaging for release distribution,
-so its filename remains user-facing SemVer, for example
-`RemCmd-v0.1.0-beta.1-windows-x86_64.msi`. Only the internal MSI
-`ProductVersion` needs the numeric value.
+`N` must be 1–9999. For example, beta.2 uses `0.0.10002` and rc.1 uses
+`0.0.20001`. Published alpha.1 and beta.1 used legacy four-field versions;
+new beta/RC packages compare newer than both. Do not rebuild or move their tags.
+Define and test a new mapping before publishing another prerelease series.
+Stable releases use their three-part Cargo version directly, within MSI limits.
 
-Do not use `0.1.0.1` for a prerelease of `0.1.0`: Windows Installer considers
-it newer than the eventual `0.1.0` release.
+The WiX-only `packaging/wix/windows.toml` owns the numeric version and avoids
+`cargo-packager` auto-discovery. Filenames still carry the Cargo SemVer version.
+Validate with `python3 scripts/release_metadata.py`; this also checks Cargo.lock.
+
+See Microsoft's [ProductVersion rules](https://learn.microsoft.com/en-us/windows/win32/msi/productversion).
 
 ## Future SignPath Configuration
 
