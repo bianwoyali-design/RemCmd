@@ -279,7 +279,12 @@ pub fn icon_button(
         .child(icon);
 
     if enabled {
+        let focus_color = theme.accent;
         el = el
+            .tab_index(0)
+            .border_1()
+            .border_color(theme.transparent)
+            .focus(move |style| style.border_color(focus_color))
             .cursor_pointer()
             .hover(move |this| this.bg(theme.control_hover_bg))
             .active(move |this| this.bg(theme.control_pressed_bg));
@@ -330,7 +335,12 @@ pub fn text_button(
         .child(label);
 
     if enabled {
+        let focus_color = theme.accent;
         el = el
+            .tab_index(0)
+            .border_1()
+            .border_color(theme.transparent)
+            .focus(move |style| style.border_color(focus_color))
             .cursor_pointer()
             .active(move |this| this.bg(pressed_background));
     } else {

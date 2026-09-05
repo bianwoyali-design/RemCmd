@@ -236,7 +236,7 @@ impl RemCmdApp {
     pub(super) fn toggle_settings_selector(
         &mut self,
         selector: SettingsSelector,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.open_settings_selector == Some(selector) {
@@ -261,6 +261,7 @@ impl RemCmdApp {
                     selector.options().len(),
                 )
             };
+            self.settings_menu_cursor = selected_index.unwrap_or(0);
             if let Some(selected_index) = selected_index {
                 if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
                     self.settings_virtual_selector_scroll_handle
@@ -274,8 +275,68 @@ impl RemCmdApp {
             }
             self.open_settings_selector = Some(selector);
         }
-        self.settings_focus_handle.focus(window);
         cx.notify();
+    }
+
+    pub(super) fn navigate_settings_menu(
+        &mut self,
+        selector: SettingsSelector,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.modified() || !matches!(key, "up" | "down" | "home" | "end") {
+            return;
+        }
+        if self.open_settings_selector != Some(selector) {
+            self.toggle_settings_selector(selector, window, cx);
+        } else {
+            let count = if selector == SettingsSelector::TerminalFont {
+                self.terminal_font_families.len()
+            } else {
+                selector.options().len()
+            };
+            self.settings_menu_cursor =
+                super::keyboard::menu_index(self.settings_menu_cursor, count, key);
+            if count > SELECT_MENU_MAX_VISIBLE_ROWS {
+                self.settings_virtual_selector_scroll_handle
+                    .scroll_to_item_strict(self.settings_menu_cursor, gpui::ScrollStrategy::Center);
+            } else {
+                self.settings_selector_scroll_handle.set_offset(point(
+                    px(0.0),
+                    px(-select_menu_scroll_offset(self.settings_menu_cursor, count)),
+                ));
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn activate_settings_picker(
+        &mut self,
+        selector: SettingsSelector,
+        event: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, gpui::ClickEvent::Keyboard(_))
+            && self.open_settings_selector == Some(selector)
+        {
+            if selector == SettingsSelector::TerminalFont {
+                if let Some(family) = self
+                    .terminal_font_families
+                    .get(self.settings_menu_cursor)
+                    .cloned()
+                {
+                    self.set_terminal_font_family(family, cx);
+                }
+            } else if let Some(option) = selector.options().get(self.settings_menu_cursor) {
+                self.apply_settings_value(option.value, window, cx);
+            }
+        } else {
+            self.toggle_settings_selector(selector, window, cx);
+        }
     }
 
     pub(super) fn dismiss_settings_selector(&mut self, cx: &mut Context<Self>) {
@@ -459,6 +520,8 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("open-diagnostics")
+                    .tab_index(0)
+                    .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -488,6 +551,8 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("open-openssh-import")
+                    .tab_index(0)
+                    .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -642,6 +707,13 @@ impl RemCmdApp {
             .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id(selector.element_id())
+            .tab_index(0)
+            .border_1()
+            .border_color(self.theme.transparent)
+            .focus(|style| style.border_color(self.theme.accent))
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.navigate_settings_menu(selector, event, window, cx)
+            }))
             .group(control_group)
             .flex()
             .flex_none()
@@ -671,8 +743,8 @@ impl RemCmdApp {
                     .child(current_label),
             )
             .child(picker)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_settings_selector(selector, window, cx);
+            .on_click(cx.listener(move |this, event, window, cx| {
+                this.activate_settings_picker(selector, event, window, cx);
             }));
 
         div()
@@ -718,6 +790,9 @@ impl RemCmdApp {
                 selector.element_id()
             )))
             .group(hover_group)
+            .when(index == self.settings_menu_cursor, |this| {
+                this.bg(self.theme.list_selected_bg)
+            })
             .flex()
             .flex_none()
             .w_full()
@@ -824,6 +899,13 @@ impl RemCmdApp {
             .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id(selector.element_id())
+            .tab_index(0)
+            .border_1()
+            .border_color(self.theme.transparent)
+            .focus(|style| style.border_color(self.theme.accent))
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.navigate_settings_menu(selector, event, window, cx)
+            }))
             .group(control_group)
             .flex()
             .flex_none()
@@ -853,8 +935,8 @@ impl RemCmdApp {
                     .child(self.terminal_font_family.clone()),
             )
             .child(picker)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_settings_selector(selector, window, cx);
+            .on_click(cx.listener(move |this, event, window, cx| {
+                this.activate_settings_picker(selector, event, window, cx);
             }));
 
         div()
@@ -898,6 +980,9 @@ impl RemCmdApp {
                 selector.element_id()
             )))
             .group(hover_group)
+            .when(index == self.settings_menu_cursor, |this| {
+                this.bg(self.theme.list_selected_bg)
+            })
             .flex()
             .flex_none()
             .w_full()

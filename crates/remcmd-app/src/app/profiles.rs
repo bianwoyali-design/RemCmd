@@ -377,7 +377,38 @@ impl RemCmdApp {
         }
     }
 
+    pub(super) fn navigate_profile_auth(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if !event.keystroke.modifiers.modified() && matches!(key, "up" | "down" | "home" | "end") {
+            if !self.profile_auth_selector_open {
+                self.toggle_profile_auth_selector(cx);
+            } else {
+                self.profile_auth_cursor = super::keyboard::menu_index(
+                    self.profile_auth_cursor,
+                    ProfileAuthKind::OPTIONS.len(),
+                    key,
+                );
+            }
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     pub(super) fn toggle_profile_auth_selector(&mut self, cx: &mut Context<Self>) {
+        self.profile_auth_cursor = self
+            .editor
+            .as_ref()
+            .and_then(|editor| {
+                ProfileAuthKind::OPTIONS
+                    .iter()
+                    .position(|(auth, _)| *auth == editor.auth_kind)
+            })
+            .unwrap_or(0);
         self.profile_auth_selector_open = !self.profile_auth_selector_open;
         cx.notify();
     }
@@ -719,6 +750,11 @@ impl RemCmdApp {
     }
 
     pub(super) fn cancel_editor(&mut self, cx: &mut Context<Self>) {
+        if self.profile_auth_selector_open {
+            self.profile_auth_selector_open = false;
+            cx.notify();
+            return;
+        }
         self.editor = None;
         self.profile_auth_selector_open = false;
         self.form_error = None;
@@ -881,6 +917,9 @@ impl RemCmdApp {
         div()
             .id("profile_editor_overlay")
             .key_context("ProfileEditor")
+            .track_focus(&self.modal_focus_handle)
+            .tab_group()
+            .tab_stop(false)
             .absolute()
             .top_0()
             .right_0()
@@ -1083,6 +1122,11 @@ impl RemCmdApp {
             .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id("profile-auth-selector")
+            .tab_index(0)
+            .border_1()
+            .border_color(self.theme.transparent)
+            .focus(|style| style.border_color(self.theme.accent))
+            .on_key_down(cx.listener(Self::navigate_profile_auth))
             .group(control_group)
             .flex()
             .flex_none()
@@ -1111,8 +1155,14 @@ impl RemCmdApp {
                     .child(self.tr(profile_auth_kind_key(selected))),
             )
             .child(picker)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.toggle_profile_auth_selector(cx);
+            .on_click(cx.listener(|this, event, window, cx| {
+                if matches!(event, gpui::ClickEvent::Keyboard(_)) && this.profile_auth_selector_open
+                {
+                    let auth = ProfileAuthKind::OPTIONS[this.profile_auth_cursor].0;
+                    this.select_auth_method(auth, window, cx);
+                } else {
+                    this.toggle_profile_auth_selector(cx);
+                }
             }));
 
         let mut selector = div().relative().flex().flex_none().child(button);
@@ -1140,6 +1190,9 @@ impl RemCmdApp {
                     div()
                         .id(SharedString::from(format!("profile-auth-option-{index}")))
                         .group(hover_group.clone())
+                        .when(index == self.profile_auth_cursor, |this| {
+                            this.bg(self.theme.list_selected_bg)
+                        })
                         .flex()
                         .flex_none()
                         .items_center()
