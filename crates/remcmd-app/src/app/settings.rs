@@ -400,7 +400,13 @@ impl RemCmdApp {
         self.dismiss_settings_selector(cx);
     }
 
-    pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let panel_width = (f32::from(window.viewport_size().width)
+            - self.effective_sidebar_width(window)
+            - self.effective_right_sidebar_width(window))
+        .max(0.0);
+        let padding = ((panel_width - 680.0) / 2.0).max(16.0);
+        let content_width = (panel_width - padding * 2.0).max(80.0);
         let appearance_group = div()
             .flex()
             .flex_col()
@@ -412,6 +418,7 @@ impl RemCmdApp {
                 self.tr("settings-language").into(),
                 SettingsSelector::Language,
                 true,
+                content_width,
                 cx,
             ))
             .child(self.render_settings_row(
@@ -419,6 +426,7 @@ impl RemCmdApp {
                 self.tr("settings-theme").into(),
                 SettingsSelector::Theme,
                 true,
+                content_width,
                 cx,
             ))
             .child(self.render_settings_row(
@@ -426,6 +434,7 @@ impl RemCmdApp {
                 self.tr("settings-tab-layout").into(),
                 SettingsSelector::TabLayout,
                 false,
+                content_width,
                 cx,
             ));
         let terminal_group = div()
@@ -439,6 +448,7 @@ impl RemCmdApp {
                 self.tr("settings-font").into(),
                 SettingsSelector::TerminalFont,
                 true,
+                content_width,
                 cx,
             ))
             .child(self.render_settings_row(
@@ -446,6 +456,7 @@ impl RemCmdApp {
                 self.tr("settings-font-size").into(),
                 SettingsSelector::TerminalFontSize,
                 false,
+                content_width,
                 cx,
             ));
         let transfer_group = div()
@@ -459,6 +470,7 @@ impl RemCmdApp {
                 self.tr("settings-speed-limit").into(),
                 SettingsSelector::TransferRate,
                 true,
+                content_width,
                 cx,
             ))
             .child(self.render_settings_row(
@@ -466,6 +478,7 @@ impl RemCmdApp {
                 self.tr("settings-parallel-files").into(),
                 SettingsSelector::ParallelTransfers,
                 false,
+                content_width,
                 cx,
             ));
 
@@ -477,7 +490,8 @@ impl RemCmdApp {
             .min_h(px(0.0))
             .overflow_x_hidden()
             .overflow_y_scroll()
-            .px(px(100.0))
+            .px(px(padding))
+            .pb_6()
             .child(
                 div()
                     .w_full()
@@ -594,6 +608,7 @@ impl RemCmdApp {
         label: SharedString,
         selector: SettingsSelector,
         divided: bool,
+        available_width: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         div()
@@ -614,7 +629,10 @@ impl RemCmdApp {
                     .font_weight(FontWeight::MEDIUM)
                     .child(label),
             )
-            .child(self.render_settings_selector(selector, cx))
+            .when(available_width < 440.0, |this| {
+                this.flex_col().items_start().gap_1().py_2()
+            })
+            .child(self.render_settings_selector(selector, (available_width - 20.0).max(60.0), cx))
             .when(divided, |this| {
                 this.child(
                     div()
@@ -631,14 +649,15 @@ impl RemCmdApp {
     pub(super) fn render_settings_selector(
         &self,
         selector: SettingsSelector,
+        available_width: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         if selector == SettingsSelector::TerminalFont {
-            return self.render_terminal_font_selector(cx);
+            return self.render_terminal_font_selector(available_width, cx);
         }
 
         let is_open = self.open_settings_selector == Some(selector);
-        let max_control_width = selector.control_width();
+        let max_control_width = selector.control_width().min(available_width);
         let menu_width = selector.menu_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let option_count = selector.options().len();
@@ -830,10 +849,14 @@ impl RemCmdApp {
             .collect()
     }
 
-    pub(super) fn render_terminal_font_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn render_terminal_font_selector(
+        &self,
+        available_width: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let selector = SettingsSelector::TerminalFont;
         let is_open = self.open_settings_selector == Some(selector);
-        let max_control_width = selector.control_width();
+        let max_control_width = selector.control_width().min(available_width);
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let option_count = self.terminal_font_families.len();
         let menu_height = select_menu_height(option_count);

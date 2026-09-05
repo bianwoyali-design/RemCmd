@@ -4,6 +4,9 @@ use gpui::{
 
 use remcmd_core::ThemeMode;
 
+pub const CONTROL_RADIUS: f32 = 6.0;
+pub const CONTROL_HEIGHT: f32 = 30.0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThemeAppearance {
     Light,
@@ -324,9 +327,9 @@ pub fn text_button(
         .flex_none()
         .items_center()
         .justify_center()
-        .min_h(px(32.0))
+        .min_h(px(CONTROL_HEIGHT))
         .px_3()
-        .rounded_lg()
+        .rounded(px(CONTROL_RADIUS))
         .bg(background)
         .text_color(text)
         .text_sm()

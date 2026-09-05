@@ -413,3 +413,5 @@ exit-save-failed-detail = Some files could not be saved, are still saving, or we
 exit-transfers-title = Stop file transfers and close?
 exit-transfers-detail = Queued and running transfers will stop. Incomplete transfers may need to be restarted.
 exit-stop-transfers = Stop and Close
+
+profile-advanced = Advanced Connection

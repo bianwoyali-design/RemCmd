@@ -1804,7 +1804,7 @@ impl RemCmdApp {
         };
 
         let mut modal = self
-            .glass_floating_surface()
+            .dialog_surface()
             .w_full()
             .max_w(px(420.0))
             .mx_4()
@@ -1948,7 +1948,7 @@ impl RemCmdApp {
             .expect("ProxyCommand approval prompt should exist before rendering");
         let command = prompt.expanded_command.expose_secret().to_owned();
         let modal = self
-            .glass_floating_surface()
+            .dialog_surface()
             .w_full()
             .max_w(px(620.0))
             .mx_4()
@@ -2044,7 +2044,7 @@ impl RemCmdApp {
             .expect("host-key prompt should exist before rendering");
 
         let modal = self
-            .glass_floating_surface()
+            .dialog_surface()
             .w_full()
             .max_w(px(500.0))
             .mx_4()

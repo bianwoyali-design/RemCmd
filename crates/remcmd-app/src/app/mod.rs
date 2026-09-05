@@ -315,8 +315,8 @@ impl RemCmdApp {
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
         });
-        let sidebar_search =
-            cx.new(|cx| TextField::new(cx, "", localizer.text("sidebar-search-placeholder")));
+        let sidebar_search = cx
+            .new(|cx| TextField::new_search(cx, "", localizer.text("sidebar-search-placeholder")));
         cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
         let diagnostic_module_filter =
             cx.new(|cx| TextField::new(cx, "", localizer.text("diagnostics-filter-module")));
@@ -546,7 +546,7 @@ impl Render for RemCmdApp {
                     },
                 ),
         );
-        root = root.child(self.render_detail_panel(selected_profile, cx));
+        root = root.child(self.render_detail_panel(selected_profile, window, cx));
         let right_sidebar_open = self.right_sidebar_open;
         let right_transition_id = self.right_sidebar_transition_id;
         let right_start_width = if right_transition_id == 0 || right_sidebar_open {
@@ -740,7 +740,7 @@ impl Render for RemCmdApp {
         } else if self.sftp_create_prompt.is_some() {
             root = root.child(self.render_sftp_create_prompt(cx));
         } else if self.editor.is_some() {
-            root = root.child(self.render_profile_editor_overlay(cx));
+            root = root.child(self.render_profile_editor_overlay(window, cx));
             if self.profile_auth_selector_open {
                 root = root.child(
                     div()

@@ -1789,6 +1789,20 @@ impl RemCmdApp {
         }
     }
 
+    pub(super) fn dialog_surface(&self) -> gpui::Div {
+        div()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.panel_bg)
+            .shadow(vec![BoxShadow {
+                color: self.theme.shadow,
+                offset: point(px(0.0), px(8.0)),
+                blur_radius: px(24.0),
+                spread_radius: px(-4.0),
+            }])
+    }
+
     pub(super) fn glass_floating_surface(&self) -> gpui::Div {
         div()
             .rounded_lg()
@@ -2824,12 +2838,13 @@ impl RemCmdApp {
     pub(super) fn render_detail_panel(
         &self,
         selected_profile: Option<ConnectionProfile>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         match self.active_panel {
             ActivePanel::Home => return self.render_home(cx),
             ActivePanel::Server => return self.render_server_overview(selected_profile, cx),
-            ActivePanel::Settings => return self.render_settings(cx),
+            ActivePanel::Settings => return self.render_settings(window, cx),
             ActivePanel::Diagnostics => return self.render_diagnostics(cx),
             ActivePanel::OpenSshImport => return self.render_openssh_import(cx),
             ActivePanel::Connection => {}
@@ -3225,7 +3240,7 @@ pub(super) const MOTION_STANDARD_DURATION: Duration = Duration::from_millis(180)
 
 pub(super) const MOTION_EMPHASIZED_DURATION: Duration = Duration::from_millis(240);
 
-pub(super) const SIDEBAR_DEFAULT_WIDTH: f32 = 300.0;
+pub(super) const SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
 
 pub(super) const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 
