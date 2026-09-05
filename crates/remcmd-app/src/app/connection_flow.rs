@@ -1920,6 +1920,9 @@ impl RemCmdApp {
         div()
             .id("credential_prompt")
             .key_context("CredentialPrompt")
+            .track_focus(&self.modal_focus_handle)
+            .tab_group()
+            .tab_stop(false)
             .on_action(cx.listener(Self::on_submit_credential))
             .on_action(cx.listener(Self::on_cancel_credential))
             .absolute()
@@ -2010,6 +2013,15 @@ impl RemCmdApp {
             );
         div()
             .id("proxy-command-approval-prompt")
+            .track_focus(&self.modal_focus_handle)
+            .tab_group()
+            .tab_stop(false)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.cancel_proxy_command_approval(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .absolute()
             .top_0()
             .right_0()
@@ -2122,6 +2134,9 @@ impl RemCmdApp {
         div()
             .id("host_key_prompt")
             .key_context("HostKeyPrompt")
+            .track_focus(&self.modal_focus_handle)
+            .tab_group()
+            .tab_stop(false)
             .on_action(cx.listener(Self::on_cancel_host_key_verification))
             .absolute()
             .top_0()

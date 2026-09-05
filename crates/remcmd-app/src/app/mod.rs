@@ -17,6 +17,7 @@ use crate::theme::{IconTone, TextButtonTone, Theme, icon_button, set_global_them
 mod bootstrap;
 mod connection_flow;
 mod diagnostics;
+mod keyboard;
 mod lifecycle;
 mod menus;
 mod openssh_import;
@@ -83,13 +84,13 @@ use gpui::img;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Application, Bounds, BoxShadow,
     ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, FontWeight, Global, Hsla, IntoElement, KeyBinding, KeyDownEvent,
-    Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, Subscription, Task, Timer, TitlebarOptions, UTF16Selection,
-    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowHandle, WindowOptions, canvas, deferred, div, ease_in_out, ease_out_quint, point,
-    prelude::*, px, rgb, size, uniform_list,
+    FocusHandle, FontWeight, Global, Hsla, IntoElement, KeyBinding, KeyDownEvent, Keystroke, Menu,
+    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    PromptButton, PromptLevel, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
+    Task, Timer, TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowOptions,
+    canvas, deferred, div, ease_in_out, ease_out_quint, point, prelude::*, px, rgb, size,
+    uniform_list,
 };
 use secrecy::SecretString;
 
@@ -234,6 +235,10 @@ struct RemCmdApp {
     settings_selector_scroll_handle: ScrollHandle,
     settings_virtual_selector_scroll_handle: UniformListScrollHandle,
     settings_focus_handle: FocusHandle,
+    modal_focus_handle: FocusHandle,
+    modal_initial_focus: Option<FocusHandle>,
+    settings_menu_cursor: usize,
+    profile_auth_cursor: usize,
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
@@ -399,6 +404,10 @@ impl RemCmdApp {
             settings_selector_scroll_handle: ScrollHandle::new(),
             settings_virtual_selector_scroll_handle: UniformListScrollHandle::new(),
             settings_focus_handle,
+            modal_focus_handle: cx.focus_handle(),
+            modal_initial_focus: None,
+            settings_menu_cursor: 0,
+            profile_auth_cursor: 0,
             theme,
             settings_path,
             settings_error,
@@ -464,6 +473,7 @@ impl RemCmdApp {
 // Root rendering entry point and drawing helpers.
 impl Render for RemCmdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.focus_new_modal(window, cx);
         self.ensure_quick_command_prompt(cx);
         self.sync_default_quick_command_targets();
         let selected_profile = self.selected_profile().cloned();
@@ -479,6 +489,10 @@ impl Render for RemCmdApp {
 
         let mut root = div()
             .id("remcmd_root")
+            .key_context("RemCmd")
+            .tab_group()
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_previous))
             .relative()
             .flex()
             .size_full()
@@ -721,18 +735,9 @@ impl Render for RemCmdApp {
             .is_some_and(|session| session.host_key_prompt.is_some())
         {
             root = root.child(self.render_host_key_prompt(cx));
-        } else if let Some(prompt) = self.credential_prompt.as_ref() {
-            let focus_handle = prompt.input.focus_handle(cx);
-            if !focus_handle.is_focused(window) {
-                window.focus(&focus_handle);
-            }
-
+        } else if self.credential_prompt.is_some() {
             root = root.child(self.render_credential_prompt(cx));
-        } else if let Some(prompt) = self.sftp_create_prompt.as_ref() {
-            let focus_handle = prompt.input.focus_handle(cx);
-            if !focus_handle.is_focused(window) {
-                window.focus(&focus_handle);
-            }
+        } else if self.sftp_create_prompt.is_some() {
             root = root.child(self.render_sftp_create_prompt(cx));
         } else if self.editor.is_some() {
             root = root.child(self.render_profile_editor_overlay(cx));
@@ -758,7 +763,7 @@ impl Render for RemCmdApp {
             }
         } else if should_focus_terminal
             && let Some(focus_handle) = self.active_pane().map(|pane| pane.focus_handle.clone())
-            && !focus_handle.is_focused(window)
+            && window.focused(cx).is_none()
         {
             window.focus(&focus_handle);
         }

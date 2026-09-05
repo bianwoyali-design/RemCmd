@@ -108,7 +108,11 @@ pub(super) fn open_main_window(cx: &mut App) -> WindowHandle<RemCmdApp> {
 
 pub(super) fn bind_credential_prompt_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("enter", SubmitCredential, Some("CredentialPrompt")),
+        KeyBinding::new(
+            "enter",
+            SubmitCredential,
+            Some("CredentialPrompt && TextField"),
+        ),
         KeyBinding::new("escape", CancelCredential, Some("CredentialPrompt")),
     ]);
 }
@@ -131,14 +135,22 @@ pub(super) fn bind_settings_selector_keys(cx: &mut App) {
 
 pub(super) fn bind_sftp_create_prompt_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("enter", SubmitSftpCreate, Some("SftpCreatePrompt")),
+        KeyBinding::new(
+            "enter",
+            SubmitSftpCreate,
+            Some("SftpCreatePrompt && TextField"),
+        ),
         KeyBinding::new("escape", CancelSftpCreate, Some("SftpCreatePrompt")),
     ]);
 }
 
 pub(super) fn bind_quick_command_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("enter", SubmitQuickCommand, Some("QuickCommandPrompt")),
+        KeyBinding::new(
+            "enter",
+            SubmitQuickCommand,
+            Some("QuickCommandPrompt && TextField"),
+        ),
         KeyBinding::new("escape", CancelQuickCommand, Some("QuickCommandPrompt")),
     ]);
 }
@@ -171,6 +183,7 @@ pub(super) fn launch(cx: &mut App) {
     register_macos_sf_mono(cx);
 
     bind_text_field_keys(cx);
+    super::keyboard::bind_navigation_keys(cx);
     bind_file_editor_keys(cx);
     bind_credential_prompt_keys(cx);
     bind_host_key_prompt_keys(cx);
