@@ -17,6 +17,7 @@ use crate::theme::{IconTone, TextButtonTone, Theme, icon_button, set_global_them
 mod bootstrap;
 mod connection_flow;
 mod diagnostics;
+mod lifecycle;
 mod menus;
 mod openssh_import;
 mod profiles;
@@ -37,6 +38,9 @@ use connection_flow::{
     ConnectionCredential, CredentialPrompt, CredentialPromptKind, PendingConnectionPreparation,
     ProxyCommandApprovalPrompt, connection_stage_label, localized_connection_error_parts,
 };
+use lifecycle::ExitTarget;
+#[cfg(target_os = "macos")]
+pub(crate) use lifecycle::request_application_exit;
 use menus::{WINDOWS_CHROME_HEIGHT, WindowsMenu, application_menus, configure_application_menu};
 use profiles::{ProfileAuthKind, ProfileContextMenu, ProfileEditor, profile_auth_label};
 use quick_commands::{BOTTOM_PANEL_DEFAULT_HEIGHT, QuickCommandPrompt, clamp_bottom_panel_height};
@@ -242,6 +246,7 @@ struct RemCmdApp {
     openssh_import_loading: bool,
     openssh_import_error: Option<String>,
     about_window: Option<WindowHandle<AboutWindow>>,
+    exit_task: Option<Task<()>>,
     _appearance_subscription: Subscription,
 }
 
@@ -406,6 +411,7 @@ impl RemCmdApp {
             openssh_import_loading: false,
             openssh_import_error: None,
             about_window: None,
+            exit_task: None,
             _appearance_subscription: appearance_subscription,
         };
 
