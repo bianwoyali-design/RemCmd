@@ -1370,6 +1370,8 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("show_home")
+                    .tab_index(0)
+                    .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -1390,6 +1392,8 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("open_local_terminal")
+                    .tab_index(0)
+                    .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -1420,6 +1424,8 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("add_connection")
+                    .tab_index(0)
+                    .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -1443,6 +1449,8 @@ impl RemCmdApp {
         connection_tree = connection_tree.child(
             div()
                 .id("toggle_connections")
+                .tab_index(0)
+                .focus(|style| style.bg(self.theme.list_selected_bg))
                 .flex()
                 .flex_none()
                 .items_center()

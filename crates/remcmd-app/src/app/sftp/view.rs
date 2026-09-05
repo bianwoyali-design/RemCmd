@@ -200,6 +200,9 @@ impl RemCmdApp {
             .bg(self.theme.overlay_bg)
             .occlude()
             .key_context("SftpCreatePrompt")
+            .track_focus(&self.modal_focus_handle)
+            .tab_group()
+            .tab_stop(false)
             .on_action(cx.listener(|this, _: &SubmitSftpCreate, _, cx| this.submit_sftp_create(cx)))
             .on_action(cx.listener(|this, _: &CancelSftpCreate, _, cx| {
                 this.sftp_create_prompt = None;

@@ -85,7 +85,7 @@ impl TextField {
         let cursor = content.len();
 
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             content,
             placeholder,
             is_secure,
@@ -713,6 +713,10 @@ impl Render for TextField {
             .flex()
             .key_context("TextField")
             .track_focus(&self.focus_handle(cx))
+            .tab_index(0)
+            .border_1()
+            .border_color(theme.transparent)
+            .focus(move |style| style.border_color(theme.accent))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -776,7 +780,9 @@ pub fn bind_text_field_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, Some("TextField")),
         KeyBinding::new("cmd-x", Cut, Some("TextField")),
         KeyBinding::new("home", Home, Some("TextField")),
+        KeyBinding::new("cmd-left", Home, Some("TextField")),
         KeyBinding::new("end", End, Some("TextField")),
+        KeyBinding::new("cmd-right", End, Some("TextField")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextField")),
     ]);
     #[cfg(target_os = "windows")]
