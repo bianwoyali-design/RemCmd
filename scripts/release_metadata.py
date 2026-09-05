@@ -22,6 +22,17 @@ def msi_version(version):
     return f"{major}.{minor}.{patch}"
 
 
+def validate_checks(checks):
+    latest = {}
+    for check in checks["check_runs"]:
+        if check["id"] > latest.get(check["name"], {}).get("id", -1):
+            latest[check["name"]] = check
+    required = ["rust", "Tests (macOS)", "Tests (Windows)", "Tests (Ubuntu)", "release-metadata"]
+    missing = [name for name in required if latest.get(name, {}).get("conclusion") != "success"]
+    if missing:
+        raise ValueError("Wait for successful CI on this commit before packaging: " + ", ".join(missing))
+
+
 def validate(root, expected_tag=""):
     root = Path(root)
     cargo = tomllib.loads((root / "Cargo.toml").read_text())
@@ -51,8 +62,11 @@ if __name__ == "__main__":
     parser.add_argument("--root", default=".")
     parser.add_argument("--expected-tag", default="")
     parser.add_argument("--github-output")
+    parser.add_argument("--checks-file")
     args = parser.parse_args()
     metadata = validate(args.root, args.expected_tag)
+    if args.checks_file:
+        validate_checks(json.loads(Path(args.checks_file).read_text()))
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as output:
             for key, value in metadata.items():

@@ -63,5 +63,7 @@ prereleases.
 If packaging succeeds but release creation fails, rerun the workflow manually
 with `release_tag` set to the existing tag. This recovery path resolves and builds the exact tagged commit, validates that
 the tag and Cargo/MSI versions agree, and creates the release without moving the
-tag. All package jobs run formatting, Clippy and workspace tests on that commit.
+tag. Packaging reuses successful CI results for that exact commit, including formatting,
+Clippy and the three-platform workspace tests, instead of rerunning the suite in
+every packaging job. Wait for CI to complete before starting the Release workflow.
 Published releases include `SHA256SUMS` and `BUILD-METADATA.json` for verification.

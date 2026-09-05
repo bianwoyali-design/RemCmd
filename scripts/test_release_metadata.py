@@ -2,7 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
-from release_metadata import msi_version, validate
+from release_metadata import msi_version, validate, validate_checks
 
 
 class ReleaseVersionTests(unittest.TestCase):
@@ -19,6 +19,18 @@ class ReleaseVersionTests(unittest.TestCase):
         for invalid in ["v0.1.0", "0.1.0-beta.0", "0.1.0-beta.10000", "0.2.0-rc.1", "256.0.0", "0.0.65536", "0.1.0+1"]:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 msi_version(invalid)
+
+
+class ExistingCiTests(unittest.TestCase):
+    def test_existing_ci_must_pass_and_latest_rerun_wins(self):
+        checks = [{"name": name, "id": index, "conclusion": "success"} for index, name in enumerate(
+            ["rust", "Tests (macOS)", "Tests (Windows)", "Tests (Ubuntu)", "release-metadata"])]
+        validate_checks({"check_runs": checks})
+        with self.assertRaisesRegex(ValueError, "Wait for successful CI"):
+            validate_checks({"check_runs": []})
+        checks.append({"name": "rust", "id": 100, "conclusion": "failure"})
+        with self.assertRaisesRegex(ValueError, "rust"):
+            validate_checks({"check_runs": checks})
 
 
 class SourceIdentityTests(unittest.TestCase):
