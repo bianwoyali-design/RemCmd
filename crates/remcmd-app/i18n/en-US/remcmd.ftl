@@ -403,3 +403,13 @@ diagnostics-debug = Detailed logs for this run
 diagnostics-export = Export Support Bundle…
 diagnostics-memory-fallback = File logging is unavailable; events are being kept in memory.
 diagnostics-no-events = No matching diagnostic events
+
+exit-unsaved-title = Save changes before closing?
+exit-unsaved-detail = Remote files have unsaved changes. RemCmd will stay open if saving fails.
+exit-save-all = Save All
+exit-discard = Don't Save
+exit-save-failed = RemCmd stayed open
+exit-save-failed-detail = Some files could not be saved, are still saving, or were edited again. Review the file errors and try again.
+exit-transfers-title = Stop file transfers and close?
+exit-transfers-detail = Queued and running transfers will stop. Incomplete transfers may need to be restarted.
+exit-stop-transfers = Stop and Close

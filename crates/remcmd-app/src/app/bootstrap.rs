@@ -93,7 +93,15 @@ pub(super) fn open_main_window(cx: &mut App) -> WindowHandle<RemCmdApp> {
     let options = main_window_options(cx);
 
     cx.open_window(options, |window, cx| {
-        cx.new(|cx| RemCmdApp::load(window, cx))
+        let app = cx.new(|cx| RemCmdApp::load(window, cx));
+        let weak = app.downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.request_exit(super::ExitTarget::Window, window, cx)
+            });
+            false
+        });
+        app
     })
     .expect("failed to open main window")
 }
@@ -176,10 +184,19 @@ pub(super) fn launch(cx: &mut App) {
         .unwrap_or(LanguageMode::System);
     cx.set_global(RemCmdMainWindow(main_window));
     configure_application_menu(cx, &Localizer::new(language_mode));
+    #[cfg(target_os = "macos")]
+    crate::macos_lifecycle::install(cx);
     cx.activate(true);
 }
 
 pub(super) fn reopen_main_window(cx: &mut App) {
+    if let Some(main) = cx.try_global::<RemCmdMainWindow>().map(|main| main.0)
+        && main
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        return;
+    }
     let main_window = open_main_window(cx);
     cx.set_global(RemCmdMainWindow(main_window));
     cx.activate(true);

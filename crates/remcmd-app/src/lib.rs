@@ -3,6 +3,8 @@ mod file_editor;
 mod i18n;
 mod icons;
 #[cfg(target_os = "macos")]
+mod macos_lifecycle;
+#[cfg(target_os = "macos")]
 mod macos_symbols;
 mod pane_layout;
 #[cfg(target_os = "macos")]
