@@ -3705,7 +3705,7 @@ pub(super) fn titlebar_active_tab_basis(
 }
 
 pub(super) fn about_window_options(cx: &App, _localizer: &Localizer) -> WindowOptions {
-    let window_size = size(px(440.0), px(380.0));
+    let window_size = size(px(440.0), px(440.0));
     let titlebar = {
         #[cfg(target_os = "macos")]
         {

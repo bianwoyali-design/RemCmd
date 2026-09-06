@@ -36,8 +36,8 @@ The app checks on startup when due and checks again while it stays open, at most
 once per day. Manual checks are always available. Attempts are recorded so an
 unavailable network does not cause a request loop.
 
-Requests go to GitHub's public release API and include the RemCmd version in the
-User-Agent. No connection profiles, host addresses or credentials are sent.
+Requests follow the operating system proxy configuration and go to GitHub's
+public release API, including the RemCmd version in the User-Agent. No connection profiles, host addresses or credentials are sent.
 Download redirects are restricted to GitHub's HTTPS release hosts. Verification
 failures leave the current installation unchanged.
 
