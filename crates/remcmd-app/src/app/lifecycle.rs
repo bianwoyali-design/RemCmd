@@ -116,7 +116,7 @@ impl RemCmdApp {
                                             PromptLevel::Warning,
                                             &this.tr("exit-save-failed"),
                                             Some(&this.tr("exit-save-failed-detail")),
-                                            &[PromptButton::new(this.tr("common-ok"))],
+                                            &[PromptButton::new(this.tr("common-close"))],
                                             cx,
                                         )
                                     });

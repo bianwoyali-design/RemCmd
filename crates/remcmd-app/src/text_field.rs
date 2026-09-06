@@ -55,6 +55,7 @@ pub struct TextField {
     content: String,
     placeholder: SharedString,
     is_secure: bool,
+    search_style: bool,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -70,6 +71,16 @@ impl TextField {
         placeholder: impl Into<SharedString>,
     ) -> Self {
         Self::with_mode(cx, value.into(), placeholder.into(), false)
+    }
+
+    pub fn new_search(
+        cx: &mut Context<Self>,
+        value: impl Into<String>,
+        placeholder: impl Into<SharedString>,
+    ) -> Self {
+        let mut field = Self::new(cx, value, placeholder);
+        field.search_style = true;
+        field
     }
 
     pub fn new_secure(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
@@ -89,6 +100,7 @@ impl TextField {
             content,
             placeholder,
             is_secure,
+            search_style: false,
             selected_range: cursor..cursor,
             selection_reversed: false,
             marked_range: None,
@@ -739,7 +751,11 @@ impl Render for TextField {
             .text_size(px(14.0))
             .text_color(theme.input_text)
             .w_full()
-            .rounded_full()
+            .rounded(px(if self.search_style {
+                14.0
+            } else {
+                crate::theme::CONTROL_RADIUS
+            }))
             .bg(theme.input_bg)
             .overflow_hidden()
             .child(

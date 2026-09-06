@@ -209,7 +209,7 @@ impl RemCmdApp {
                 cx.notify();
             }))
             .child(
-                self.glass_floating_surface()
+                self.dialog_surface()
                     .w(px(360.0))
                     .flex()
                     .flex_col()

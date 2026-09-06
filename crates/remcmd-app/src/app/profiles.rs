@@ -67,7 +67,7 @@ impl RemCmdApp {
             ProfileProxyKind::Direct => None,
         };
         let jump_search =
-            cx.new(|cx| TextField::new(cx, "", self.tr("sidebar-search-placeholder")));
+            cx.new(|cx| TextField::new_search(cx, "", self.tr("sidebar-search-placeholder")));
         cx.observe(&jump_search, |_, _, cx| cx.notify()).detach();
 
         self.editor = Some(ProfileEditor {
@@ -90,6 +90,8 @@ impl RemCmdApp {
             jump_search,
             jump_host_ids: profile.route.jump_host_ids.clone(),
             proxy_secret_loaded: proxy_secret_kind.is_none(),
+            advanced_expanded: proxy_kind != ProfileProxyKind::Direct
+                || !profile.route.jump_host_ids.is_empty(),
         });
 
         if let Some(kind) = proxy_secret_kind {
@@ -143,7 +145,7 @@ impl RemCmdApp {
     pub(super) fn open_new_profile_editor(&mut self, cx: &mut Context<Self>) {
         let number = self.next_profile_number;
         let jump_search =
-            cx.new(|cx| TextField::new(cx, "", self.tr("sidebar-search-placeholder")));
+            cx.new(|cx| TextField::new_search(cx, "", self.tr("sidebar-search-placeholder")));
         cx.observe(&jump_search, |_, _, cx| cx.notify()).detach();
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Create,
@@ -163,6 +165,7 @@ impl RemCmdApp {
             jump_search,
             jump_host_ids: Vec::new(),
             proxy_secret_loaded: true,
+            advanced_expanded: false,
         });
         self.profile_auth_selector_open = false;
         self.form_error = None;
@@ -852,7 +855,11 @@ impl RemCmdApp {
             .into_any_element()
     }
 
-    pub(super) fn render_profile_editor_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_profile_editor_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(editor) = self.editor.as_ref() else {
             return div().into_any_element();
         };
@@ -887,6 +894,7 @@ impl RemCmdApp {
             .overflow_y_scroll()
             .px_4()
             .py_3()
+            .text_sm()
             .child(self.render_form_row(self.tr("field-name").into(), editor.name.clone()))
             .child(self.render_form_row(self.tr("field-host").into(), editor.host.clone()))
             .child(self.render_form_row(self.tr("field-port").into(), editor.port.clone()))
@@ -903,7 +911,42 @@ impl RemCmdApp {
                     ),
                 |this| this.child(self.render_saved_credential_row(cx)),
             )
-            .child(self.render_route_editor(editor, cx))
+            .child(
+                div()
+                    .id("profile-advanced-toggle")
+                    .tab_index(0)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mt_4()
+                    .py_2()
+                    .rounded_md()
+                    .text_sm()
+                    .text_color(self.theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(self.theme.control_hover_bg))
+                    .focus(|style| style.bg(self.theme.list_selected_bg))
+                    .child(icon(
+                        if editor.advanced_expanded {
+                            IconName::Collapse
+                        } else {
+                            IconName::Expand
+                        },
+                        self.theme,
+                        IconTone::Default,
+                        14.0,
+                    ))
+                    .child(self.tr("profile-advanced"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(editor) = this.editor.as_mut() {
+                            editor.advanced_expanded = !editor.advanced_expanded;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(editor.advanced_expanded, |this| {
+                this.child(self.render_route_editor(editor, cx))
+            })
             .when_some(self.form_error.as_ref(), |this, error| {
                 this.child(
                     div()
@@ -932,11 +975,13 @@ impl RemCmdApp {
             .bg(self.theme.overlay_bg)
             .occlude()
             .child(
-                self.glass_floating_surface()
+                self.dialog_surface()
                     .flex()
                     .w_full()
                     .max_w(px(620.0))
-                    .max_h(px(640.0))
+                    .max_h(px(
+                        (f32::from(window.viewport_size().height) - 48.0).clamp(200.0, 640.0)
+                    ))
                     .flex_col()
                     .overflow_hidden()
                     .child(
@@ -957,7 +1002,8 @@ impl RemCmdApp {
                             .flex()
                             .flex_none()
                             .items_center()
-                            .justify_between()
+                            .justify_end()
+                            .gap_2()
                             .h(px(54.0))
                             .px_4()
                             .border_t_1()
@@ -1331,6 +1377,8 @@ impl RemCmdApp {
             proxy_options = proxy_options.child(
                 div()
                     .id(SharedString::from(format!("profile-proxy-{proxy_kind:?}")))
+                    .tab_index(0)
+                    .focus(|style| style.bg(self.theme.control_pressed_bg))
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -1465,6 +1513,8 @@ impl RemCmdApp {
                     .child(
                         div()
                             .id(SharedString::from(format!("jump-toggle-{id}")))
+                            .tab_index(0)
+                            .focus(|style| style.border_color(self.theme.accent))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1581,6 +1631,7 @@ pub(super) struct ProfileEditor {
     pub(super) jump_search: Entity<TextField>,
     pub(super) jump_host_ids: Vec<String>,
     pub(super) proxy_secret_loaded: bool,
+    pub(super) advanced_expanded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

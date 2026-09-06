@@ -413,3 +413,5 @@ exit-save-failed-detail = 部分文件无法保存、仍在保存，或保存后
 exit-transfers-title = 停止文件传输并关闭？
 exit-transfers-detail = 排队和正在进行的传输将停止。未完成的传输可能需要重新开始。
 exit-stop-transfers = 停止并关闭
+
+profile-advanced = 高级连接
