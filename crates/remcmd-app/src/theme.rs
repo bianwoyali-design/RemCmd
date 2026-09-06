@@ -22,6 +22,8 @@ pub enum ThemeAppearance {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     pub appearance: ThemeAppearance,
+    pub reduce_motion: bool,
+    pub reduce_transparency: bool,
     pub text_primary: Hsla,
     pub text_muted: Hsla,
     pub text_faint: Hsla,
@@ -85,6 +87,8 @@ impl Theme {
     pub fn dark() -> Self {
         Self {
             appearance: ThemeAppearance::Dark,
+            reduce_motion: false,
+            reduce_transparency: false,
             text_primary: opaque(0xf4f4f5),
             text_muted: opaque(0xa1a1aa),
             text_faint: opaque(0x71717a),
@@ -146,6 +150,8 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             appearance: ThemeAppearance::Light,
+            reduce_motion: false,
+            reduce_transparency: false,
             text_primary: opaque(0x1a1a1a),
             text_muted: opaque(0x5f5f66),
             text_faint: opaque(0x8b8b92),
@@ -206,11 +212,13 @@ impl Theme {
 
     /// Resolves the palette for a mode against the window's current appearance.
     pub fn resolve(mode: ThemeMode, window: &Window) -> Self {
-        match mode {
+        let mut theme = match mode {
             ThemeMode::Light => Self::light(),
             ThemeMode::Dark => Self::dark(),
             ThemeMode::System => Self::for_appearance(window.appearance()),
-        }
+        };
+        theme.apply_preferences(crate::platform_preferences::PlatformPreferences::read());
+        theme
     }
 
     pub fn for_appearance(appearance: WindowAppearance) -> Self {
@@ -220,9 +228,89 @@ impl Theme {
         }
     }
 
+    pub fn motion_duration(self, duration: std::time::Duration) -> std::time::Duration {
+        if self.reduce_motion {
+            std::time::Duration::from_millis(1)
+        } else {
+            duration
+        }
+    }
+
+    fn apply_preferences(&mut self, preferences: crate::platform_preferences::PlatformPreferences) {
+        self.reduce_motion = preferences.reduce_motion;
+        self.reduce_transparency = preferences.reduce_transparency;
+        if let Some(mut accent) = preferences.accent {
+            // Preserve the system hue while keeping small accent labels readable.
+            for _ in 0..50 {
+                if contrast_ratio(accent, self.panel_bg) >= 4.5 {
+                    break;
+                }
+                accent.l = (accent.l + if self.is_light() { -0.02 } else { 0.02 }).clamp(0.0, 1.0);
+            }
+            self.accent = accent;
+            self.accent_hover = accent;
+            self.accent_hover.l =
+                (accent.l + if self.is_light() { -0.06 } else { 0.06 }).clamp(0.0, 1.0);
+            self.button_primary_bg = accent;
+            self.button_primary_pressed_bg = self.accent_hover;
+            self.on_accent = if contrast_ratio(accent, opaque(0xffffff))
+                >= contrast_ratio(accent, opaque(0x000000))
+            {
+                opaque(0xffffff)
+            } else {
+                opaque(0x000000)
+            };
+            self.selection_bg = accent;
+            self.selection_bg.a = 0.28;
+        }
+        if preferences.reduce_transparency {
+            self.sidebar_bg.a = 1.0;
+            self.floating_glass_bg.a = 1.0;
+            self.titlebar_tab_selected_bg = if self.is_light() {
+                opaque(0xffffff)
+            } else {
+                opaque(0x454545)
+            };
+            self.titlebar_tab_selected_hover_bg = if self.is_light() {
+                opaque(0xf4f4f4)
+            } else {
+                opaque(0x515151)
+            };
+        }
+        if preferences.increase_contrast {
+            self.text_faint = self.text_muted;
+            self.input_placeholder = self.text_muted;
+            self.border = if self.is_light() {
+                opaque(0x767676)
+            } else {
+                opaque(0x909090)
+            };
+            self.border_strong = self.border;
+            self.settings_separator = self.border;
+            self.titlebar_tab_border = self.border;
+        }
+    }
+
     pub const fn is_light(self) -> bool {
         matches!(self.appearance, ThemeAppearance::Light)
     }
+}
+
+fn contrast_ratio(left: Hsla, right: Hsla) -> f32 {
+    fn luminance(color: Hsla) -> f32 {
+        let color: gpui::Rgba = color.into();
+        let linear = |channel: f32| {
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+    let a = luminance(left);
+    let b = luminance(right);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 fn opaque(value: u32) -> Hsla {
@@ -356,6 +444,31 @@ pub fn text_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accessibility_preferences_keep_accent_labels_readable_and_surfaces_opaque() {
+        use crate::platform_preferences::PlatformPreferences;
+        for mut theme in [Theme::light(), Theme::dark()] {
+            for color in [0xffff00, 0x777777, 0xff00ff] {
+                theme.apply_preferences(PlatformPreferences {
+                    reduce_motion: true,
+                    reduce_transparency: true,
+                    increase_contrast: true,
+                    accent: Some(opaque(color)),
+                });
+                assert!(contrast_ratio(theme.accent, theme.panel_bg) >= 4.5);
+                assert!(contrast_ratio(theme.accent, theme.on_accent) >= 4.5);
+                assert_eq!(theme.sidebar_bg.a, 1.0);
+                assert_eq!(theme.floating_glass_bg.a, 1.0);
+                assert_eq!(theme.titlebar_tab_selected_bg.a, 1.0);
+                assert_eq!(theme.titlebar_tab_selected_hover_bg.a, 1.0);
+                assert_eq!(
+                    theme.motion_duration(std::time::Duration::from_millis(180)),
+                    std::time::Duration::from_millis(1)
+                );
+            }
+        }
+    }
 
     #[test]
     fn system_appearance_resolves_to_the_matching_palette() {

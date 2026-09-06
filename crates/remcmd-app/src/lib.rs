@@ -7,6 +7,7 @@ mod macos_lifecycle;
 #[cfg(target_os = "macos")]
 mod macos_symbols;
 mod pane_layout;
+mod platform_preferences;
 #[cfg(target_os = "macos")]
 mod private_key_picker;
 mod ssh_runtime;

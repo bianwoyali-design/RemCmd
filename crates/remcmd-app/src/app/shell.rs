@@ -220,7 +220,12 @@ impl RemCmdApp {
             }
         } else {
             self.right_sidebar_animation_task = Some(cx.spawn(async move |this, cx| {
-                Timer::after(MOTION_STANDARD_DURATION).await;
+                let Ok(duration) = this.update(cx, |this, _| {
+                    this.theme.motion_duration(MOTION_STANDARD_DURATION)
+                }) else {
+                    return;
+                };
+                Timer::after(duration).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.right_sidebar_transition_id == transition_id && !this.right_sidebar_open
                     {
@@ -714,7 +719,7 @@ impl RemCmdApp {
                 Animation::new(if self.right_sidebar_transition_id == 0 {
                     MOTION_INSTANT_DURATION
                 } else {
-                    MOTION_STANDARD_DURATION
+                    self.theme.motion_duration(MOTION_STANDARD_DURATION)
                 })
                 .with_easing(ease_in_out),
                 move |this, delta| {
@@ -785,7 +790,7 @@ impl RemCmdApp {
                 Animation::new(if transition_id == 0 {
                     MOTION_INSTANT_DURATION
                 } else {
-                    MOTION_STANDARD_DURATION
+                    self.theme.motion_duration(MOTION_STANDARD_DURATION)
                 })
                 .with_easing(ease_in_out),
                 move |this, delta| this.w(px(start_width + (end_width - start_width) * delta)),
@@ -872,7 +877,7 @@ impl RemCmdApp {
                     Animation::new(if leading_transition_id == 0 {
                         MOTION_INSTANT_DURATION
                     } else {
-                        MOTION_STANDARD_DURATION
+                        self.theme.motion_duration(MOTION_STANDARD_DURATION)
                     })
                     .with_easing(ease_in_out),
                     move |this, delta| {
@@ -891,7 +896,7 @@ impl RemCmdApp {
                 Animation::new(if leading_transition_id == 0 {
                     MOTION_INSTANT_DURATION
                 } else {
-                    MOTION_STANDARD_DURATION
+                    self.theme.motion_duration(MOTION_STANDARD_DURATION)
                 })
                 .with_easing(ease_in_out),
                 move |this, delta| {
@@ -1078,7 +1083,8 @@ impl RemCmdApp {
                 )
                 .with_animation(
                     SharedString::from(format!("titlebar-tab-terminal-{}-{show_close}", tab_id.0)),
-                    Animation::new(MOTION_FAST_DURATION).with_easing(ease_out_quint()),
+                    Animation::new(self.theme.motion_duration(MOTION_FAST_DURATION))
+                        .with_easing(ease_out_quint()),
                     move |this, delta| this.opacity(if show_close { 1.0 - delta } else { delta }),
                 );
             let tab_content = if is_active {
@@ -1133,7 +1139,8 @@ impl RemCmdApp {
             };
             let tab_content = tab_content.with_animation(
                 SharedString::from(content_animation_id),
-                Animation::new(MOTION_EMPHASIZED_DURATION).with_easing(ease_in_out),
+                Animation::new(self.theme.motion_duration(MOTION_EMPHASIZED_DURATION))
+                    .with_easing(ease_in_out),
                 move |this, delta| {
                     this.opacity(content_start_opacity + (1.0 - content_start_opacity) * delta)
                 },
@@ -1187,7 +1194,8 @@ impl RemCmdApp {
             }
             let close_control = close_control.with_animation(
                 SharedString::from(format!("titlebar-tab-close-{}-{show_close}", tab_id.0)),
-                Animation::new(MOTION_FAST_DURATION).with_easing(ease_out_quint()),
+                Animation::new(self.theme.motion_duration(MOTION_FAST_DURATION))
+                    .with_easing(ease_out_quint()),
                 move |this, delta| this.opacity(if show_close { delta } else { 1.0 - delta }),
             );
 
@@ -1225,7 +1233,10 @@ impl RemCmdApp {
                             }])
                             .with_animation(
                                 SharedString::from(format!("titlebar-tab-selection-{}", tab_id.0)),
-                                Animation::new(MOTION_EMPHASIZED_DURATION).with_easing(ease_in_out),
+                                Animation::new(
+                                    self.theme.motion_duration(MOTION_EMPHASIZED_DURATION),
+                                )
+                                .with_easing(ease_in_out),
                                 |this, delta| this.opacity(0.72 + 0.28 * delta),
                             ),
                     )
@@ -1247,7 +1258,8 @@ impl RemCmdApp {
 
             let tab_element = tab_element.with_animation(
                 SharedString::from(format!("titlebar-tab-entry-{}", tab_id.0)),
-                Animation::new(MOTION_STANDARD_DURATION).with_easing(ease_out_quint()),
+                Animation::new(self.theme.motion_duration(MOTION_STANDARD_DURATION))
+                    .with_easing(ease_out_quint()),
                 |this, delta| {
                     this.left(px((1.0 - delta) * 10.0))
                         .opacity(0.72 + 0.28 * delta)
@@ -1269,7 +1281,8 @@ impl RemCmdApp {
                 .child(tab_element)
                 .with_animation(
                     SharedString::from(layout_animation_id),
-                    Animation::new(MOTION_EMPHASIZED_DURATION).with_easing(ease_in_out),
+                    Animation::new(self.theme.motion_duration(MOTION_EMPHASIZED_DURATION))
+                        .with_easing(ease_in_out),
                     move |this, delta| {
                         let basis = start_tab_basis + (end_tab_basis - start_tab_basis) * delta;
                         let min_width =
@@ -1293,18 +1306,21 @@ impl RemCmdApp {
                 let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
                 let scroll_start = self.titlebar_tabs_scroll_start;
                 let transition_id = self.titlebar_tabs_scroll_transition_id;
-                controls = controls.child(tabs.with_animation(
-                    SharedString::from(format!("titlebar-tabs-scroll-{transition_id}")),
-                    Animation::new(MOTION_STANDARD_DURATION).with_easing(ease_out_quint()),
-                    move |this, delta| {
-                        let target_x = -scroll_handle.max_offset().width;
-                        scroll_handle.set_offset(point(
-                            scroll_start.x + (target_x - scroll_start.x) * delta,
-                            scroll_start.y,
-                        ));
-                        this
-                    },
-                ));
+                controls = controls.child(
+                    tabs.with_animation(
+                        SharedString::from(format!("titlebar-tabs-scroll-{transition_id}")),
+                        Animation::new(self.theme.motion_duration(MOTION_STANDARD_DURATION))
+                            .with_easing(ease_out_quint()),
+                        move |this, delta| {
+                            let target_x = -scroll_handle.max_offset().width;
+                            scroll_handle.set_offset(point(
+                                scroll_start.x + (target_x - scroll_start.x) * delta,
+                                scroll_start.y,
+                            ));
+                            this
+                        },
+                    ),
+                );
             } else {
                 controls = controls.child(tabs);
             }
@@ -1863,7 +1879,7 @@ impl RemCmdApp {
             Animation::new(if transition_id == 0 {
                 MOTION_INSTANT_DURATION
             } else {
-                MOTION_STANDARD_DURATION
+                self.theme.motion_duration(MOTION_STANDARD_DURATION)
             })
             .with_easing(ease_in_out),
             move |this, delta| {
@@ -1923,7 +1939,7 @@ impl RemCmdApp {
             Animation::new(if transition_id == 0 {
                 MOTION_INSTANT_DURATION
             } else {
-                MOTION_STANDARD_DURATION
+                self.theme.motion_duration(MOTION_STANDARD_DURATION)
             })
             .with_easing(ease_in_out),
             move |this, delta| {
