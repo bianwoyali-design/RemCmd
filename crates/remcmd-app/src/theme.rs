@@ -271,6 +271,11 @@ impl Theme {
             } else {
                 opaque(0x454545)
             };
+            self.titlebar_tab_selected_hover_bg = if self.is_light() {
+                opaque(0xf4f4f4)
+            } else {
+                opaque(0x515151)
+            };
         }
         if preferences.increase_contrast {
             self.text_faint = self.text_muted;
@@ -455,6 +460,8 @@ mod tests {
                 assert!(contrast_ratio(theme.accent, theme.on_accent) >= 4.5);
                 assert_eq!(theme.sidebar_bg.a, 1.0);
                 assert_eq!(theme.floating_glass_bg.a, 1.0);
+                assert_eq!(theme.titlebar_tab_selected_bg.a, 1.0);
+                assert_eq!(theme.titlebar_tab_selected_hover_bg.a, 1.0);
                 assert_eq!(
                     theme.motion_duration(std::time::Duration::from_millis(180)),
                     std::time::Duration::from_millis(1)
