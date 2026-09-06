@@ -12,10 +12,44 @@ on:
 
 permissions:
     actions: read
+    checks: read
     contents: write
 
+concurrency:
+    group: release-${{ inputs.release_tag || github.ref_name }}
+    cancel-in-progress: false
+
 jobs:
+    validate:
+        runs-on: ubuntu-latest
+        outputs:
+            commit: ${{ steps.metadata.outputs.commit }}
+            version: ${{ steps.metadata.outputs.version }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  path: workflow
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ inputs.release_tag || github.ref }}
+                  path: source
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: '3.12'
+            - name: Read existing CI results for the source commit
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  commit="$(git -C source rev-parse HEAD)"
+                  gh api "repos/$GITHUB_REPOSITORY/commits/$commit/check-runs?per_page=100" > checks.json
+            - name: Validate source and package versions
+              id: metadata
+              env:
+                  RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+              run: python workflow/scripts/release_metadata.py --root source --expected-tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT" --checks-file checks.json
+
     package:
+        needs: validate
         name: ${{ matrix.name }}
         runs-on: ${{ matrix.os }}
         strategy:
@@ -41,8 +75,10 @@ jobs:
                           target/release/*.AppImage
 
         steps:
-            - name: Checkout repository
+            - name: Checkout validated commit
               uses: actions/checkout@v4
+              with:
+                  ref: ${{ needs.validate.outputs.commit }}
 
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
@@ -82,11 +118,11 @@ jobs:
               shell: pwsh
               run: |
                   $version = ((cargo pkgid -p remcmd-app) -split '#')[-1]
-                  $installer = Get-ChildItem target/release -Filter '*.msi' | Select-Object -First 1
-                  if ($null -eq $installer) {
-                    throw 'cargo-packager did not produce an MSI.'
+                  $installers = @(Get-ChildItem target/release -Filter '*.msi')
+                  if ($installers.Count -ne 1) {
+                    throw 'Expected exactly one MSI installer.'
                   }
-                  Rename-Item $installer.FullName "RemCmd-v$version-windows-x86_64.msi"
+                  Rename-Item $installers[0].FullName "RemCmd-v$version-windows-x86_64.msi"
 
             - name: Name macOS installer for the release
               if: runner.os == 'macOS'
@@ -140,7 +176,7 @@ jobs:
 
     release:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
-        needs: package
+        needs: [validate, package]
         runs-on: ubuntu-latest
 
         steps:
@@ -149,6 +185,15 @@ jobs:
               with:
                   path: release-artifacts
                   merge-multiple: true
+
+            - name: Add package checksums and source identity
+              env:
+                  SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+                  RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+              run: |
+                  cd release-artifacts
+                  sha256sum RemCmd-* > SHA256SUMS
+                  jq -n --arg commit "$SOURCE_COMMIT" --arg version "$RELEASE_VERSION" '{commit: $commit, version: $version}' > BUILD-METADATA.json
 
             - name: Create GitHub Release
               shell: bash
