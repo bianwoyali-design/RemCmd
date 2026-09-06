@@ -32,7 +32,9 @@ mod sftp_state;
 mod sftp_view;
 mod shell;
 mod terminal_session;
+mod updates;
 mod workspace;
+use updates::UpdateState;
 
 pub use bootstrap::run;
 use connection_flow::{
@@ -133,6 +135,7 @@ gpui::actions!(
         ShowHome,
         ShowAbout,
         ShowSettings,
+        CheckForUpdates,
         NewConnection,
         NewLocalTerminal,
         NewRemoteTerminal,
@@ -242,6 +245,7 @@ struct RemCmdApp {
     theme: Theme,
     settings_path: PathBuf,
     settings_error: Option<String>,
+    updates: UpdateState,
     diagnostic_level: Option<DiagnosticLevel>,
     diagnostic_module_filter: Entity<TextField>,
     diagnostic_text_filter: Entity<TextField>,
@@ -430,6 +434,7 @@ impl RemCmdApp {
             theme,
             settings_path,
             settings_error,
+            updates: UpdateState::new(settings.updates),
             diagnostic_level: None,
             diagnostic_module_filter,
             diagnostic_text_filter,

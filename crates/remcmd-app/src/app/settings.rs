@@ -389,6 +389,7 @@ impl RemCmdApp {
                 font_family: Some(self.terminal_font_family.to_string()),
                 font_size: self.terminal_font_size,
             },
+            updates: self.updates.settings,
         };
         self.settings_error = save_settings(&self.settings_path, &settings)
             .err()
@@ -517,6 +518,7 @@ impl RemCmdApp {
                     .child(self.tr("settings-appearance")),
             )
             .child(appearance_group)
+            .child(self.render_update_entry(cx))
             .child(
                 div()
                     .w_full()

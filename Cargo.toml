@@ -7,6 +7,7 @@ members = [
     "crates/remcmd-ssh",
     "crates/remcmd-storage",
     "crates/remcmd-terminal",
+    "crates/remcmd-update",
 ]
 resolver = "2"
 
@@ -70,3 +71,5 @@ remcmd-local = { path = "crates/remcmd-local" }
 remcmd-ssh = { path = "crates/remcmd-ssh" }
 remcmd-storage = { path = "crates/remcmd-storage" }
 remcmd-terminal = { path = "crates/remcmd-terminal" }
+
+remcmd-update = { path = "crates/remcmd-update" }

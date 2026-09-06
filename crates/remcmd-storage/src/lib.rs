@@ -7,6 +7,7 @@ use std::{
 use directories::ProjectDirs;
 use remcmd_core::{
     ConnectionProfile, LanguageMode, TabLayout, TerminalSettings, ThemeMode, TransferSettings,
+    UpdateSettings,
 };
 use secrecy::SecretString;
 
@@ -48,6 +49,8 @@ pub struct AppSettings {
     pub transfers: TransferSettings,
     #[serde(default)]
     pub terminal: TerminalSettings,
+    #[serde(default)]
+    pub updates: UpdateSettings,
 }
 
 pub fn ensure_profiles_file(path: &Path) -> io::Result<()> {
@@ -198,6 +201,7 @@ mod tests {
                 font_family: Some("Menlo".into()),
                 font_size: 16,
             },
+            updates: UpdateSettings::default(),
         };
 
         save_settings(&path, &settings).unwrap();
