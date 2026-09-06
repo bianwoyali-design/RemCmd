@@ -2,11 +2,11 @@
 # user-facing Cargo prerelease version; see docs/windows-code-signing.md.
 name = "remcmd-app"
 product-name = "RemCmd"
-version = "0.0.1+1"
+version = "0.0.10001"
 identifier = "io.github.bianwoyali-design.remcmd"
 category = "DeveloperTool"
 formats = ["wix"]
-before-packaging-command = "cargo build --release -p remcmd-app"
+before-packaging-command = "cargo build --locked --release -p remcmd-app"
 license-file = "../../LICENSE"
 out-dir = "../../target/release"
 binaries-dir = "../../target/release"

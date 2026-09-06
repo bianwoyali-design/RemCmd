@@ -4,6 +4,8 @@ RemCmd releases are built by `.github/workflows/release.yml`. A `v*` tag
 packages macOS, Windows, and Linux artifacts and creates a GitHub prerelease
 when the tag contains a prerelease suffix.
 
+Release metadata validation requires Python 3.11 or newer. CI uses Python 3.12.
+
 ## Prepare a Release
 
 1. Create a release branch from the latest `main`.
@@ -12,7 +14,7 @@ when the tag contains a prerelease suffix.
 4. Refresh `Cargo.lock` and add the release section to `CHANGELOG.md`.
 5. Update user-facing channel or platform limitations in `README.md`,
    `docs/installation.md`, and the platform-specific documentation.
-6. Run the complete validation suite.
+6. Run `python3 scripts/release_metadata.py` and the complete validation suite.
 
 For prerelease MSI version mapping, follow
 [Windows Code Signing](windows-code-signing.md#msi-versioning).
@@ -59,5 +61,9 @@ attaches the generated packages, and marks prerelease versions as GitHub
 prereleases.
 
 If packaging succeeds but release creation fails, rerun the workflow manually
-with `release_tag` set to the existing tag. This recovery path rebuilds the
-artifacts and creates the release without moving the tag.
+with `release_tag` set to the existing tag. This recovery path resolves and builds the exact tagged commit, validates that
+the tag and Cargo/MSI versions agree, and creates the release without moving the
+tag. Packaging reuses successful CI results for that exact commit, including formatting,
+Clippy and the three-platform workspace tests, instead of rerunning the suite in
+every packaging job. Wait for CI to complete before starting the Release workflow.
+Published releases include `SHA256SUMS` and `BUILD-METADATA.json` for verification.

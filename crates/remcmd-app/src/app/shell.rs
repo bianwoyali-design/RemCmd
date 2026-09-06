@@ -219,8 +219,12 @@ impl RemCmdApp {
                 self.ensure_sftp_directory(session_id, SftpBrowserPlacement::Sidebar, cx);
             }
         } else {
-            let duration = self.theme.motion_duration(MOTION_STANDARD_DURATION);
             self.right_sidebar_animation_task = Some(cx.spawn(async move |this, cx| {
+                let Ok(duration) = this.update(cx, |this, _| {
+                    this.theme.motion_duration(MOTION_STANDARD_DURATION)
+                }) else {
+                    return;
+                };
                 Timer::after(duration).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.right_sidebar_transition_id == transition_id && !this.right_sidebar_open
