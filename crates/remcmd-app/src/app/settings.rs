@@ -743,6 +743,18 @@ impl RemCmdApp {
             .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id(selector.element_id())
+            .relative()
+            .child(crate::accessibility::node(
+                selector.element_id(),
+                crate::accessibility::Node::button(
+                    format!(
+                        "{}: {}",
+                        self.tr(selector.label_key()),
+                        self.settings_value_label(selector)
+                    ),
+                    true,
+                ),
+            ))
             .tab_index(0)
             .border_1()
             .border_color(self.theme.transparent)
@@ -825,6 +837,15 @@ impl RemCmdApp {
                 "{}-option-{index}",
                 selector.element_id()
             )))
+            .relative()
+            .child(crate::accessibility::node(
+                "option",
+                crate::accessibility::Node {
+                    selected: is_selected,
+                    menu: true,
+                    ..crate::accessibility::Node::button(self.settings_option_label(&option), true)
+                },
+            ))
             .group(hover_group)
             .when(index == self.settings_menu_cursor, |this| {
                 this.bg(self.theme.list_selected_bg)
@@ -939,6 +960,18 @@ impl RemCmdApp {
             .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id(selector.element_id())
+            .relative()
+            .child(crate::accessibility::node(
+                selector.element_id(),
+                crate::accessibility::Node::button(
+                    format!(
+                        "{}: {}",
+                        self.tr(selector.label_key()),
+                        self.settings_value_label(selector)
+                    ),
+                    true,
+                ),
+            ))
             .tab_index(0)
             .border_1()
             .border_color(self.theme.transparent)
@@ -1019,6 +1052,15 @@ impl RemCmdApp {
                 "{}-option-{index}",
                 selector.element_id()
             )))
+            .relative()
+            .child(crate::accessibility::node(
+                "option",
+                crate::accessibility::Node {
+                    selected: is_selected,
+                    menu: true,
+                    ..crate::accessibility::Node::button(selected_family.clone(), true)
+                },
+            ))
             .group(hover_group)
             .when(index == self.settings_menu_cursor, |this| {
                 this.bg(self.theme.list_selected_bg)
@@ -1208,6 +1250,18 @@ pub(super) enum SettingsSelector {
 }
 
 impl SettingsSelector {
+    const fn label_key(self) -> &'static str {
+        match self {
+            Self::Language => "settings-language",
+            Self::Theme => "settings-theme",
+            Self::TabLayout => "settings-tab-layout",
+            Self::TerminalFont => "settings-font",
+            Self::TerminalFontSize => "settings-font-size",
+            Self::TransferRate => "settings-speed-limit",
+            Self::ParallelTransfers => "settings-parallel-files",
+        }
+    }
+
     const fn element_id(self) -> &'static str {
         match self {
             Self::Language => "settings-language-selector",

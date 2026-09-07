@@ -1,3 +1,4 @@
+mod accessibility;
 mod app;
 mod file_editor;
 mod i18n;

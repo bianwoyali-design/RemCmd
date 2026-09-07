@@ -389,15 +389,21 @@ impl RemCmdApp {
         tone: IconTone,
         enabled: bool,
     ) -> gpui::Stateful<gpui::Div> {
+        let id = id.into();
         let theme = self.theme;
         let tooltip = tooltip.into();
         icon_button(
-            id,
+            id.clone(),
             icon(icon_name, theme, tone, 18.0),
             tone,
             enabled,
             &theme,
         )
+        .relative()
+        .child(crate::accessibility::node(
+            id,
+            crate::accessibility::Node::button(tooltip.clone(), enabled),
+        ))
         .tooltip(move |_, cx| -> AnyView {
             cx.new(|_| CommandTooltip {
                 label: tooltip.clone(),
@@ -464,6 +470,11 @@ impl RemCmdApp {
             true,
             &theme,
         )
+        .relative()
+        .child(crate::accessibility::node(
+            id,
+            crate::accessibility::Node::button(tooltip.clone(), true),
+        ))
         .size(px(TITLEBAR_CONTROL_HOVER_SIZE))
         .rounded_full()
         .tooltip(move |_, cx| -> AnyView {
@@ -667,6 +678,13 @@ impl RemCmdApp {
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("right-sidebar-tab-{label}")))
+                    .child(crate::accessibility::node(
+                        "sidebar-view",
+                        crate::accessibility::Node {
+                            selected,
+                            ..crate::accessibility::Node::button(label.clone(), true)
+                        },
+                    ))
                     .relative()
                     .flex()
                     .flex_1()
@@ -1201,6 +1219,13 @@ impl RemCmdApp {
 
             let tab_element = div()
                 .id(SharedString::from(format!("titlebar-tab-{}", tab_id.0)))
+                .child(crate::accessibility::node(
+                    "titlebar-tab",
+                    crate::accessibility::Node {
+                        selected: is_active,
+                        ..crate::accessibility::Node::button(self.terminal_tab_title(tab), true)
+                    },
+                ))
                 .relative()
                 .flex()
                 .w_full()
@@ -1386,6 +1411,11 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("show_home")
+                    .relative()
+                    .child(crate::accessibility::node(
+                        "show_home",
+                        crate::accessibility::Node::button(self.tr("sidebar-home"), true),
+                    ))
                     .tab_index(0)
                     .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
@@ -1408,6 +1438,11 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("open_local_terminal")
+                    .relative()
+                    .child(crate::accessibility::node(
+                        "open_local_terminal",
+                        crate::accessibility::Node::button(self.tr("sidebar-local-terminal"), true),
+                    ))
                     .tab_index(0)
                     .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
@@ -1440,6 +1475,11 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("add_connection")
+                    .relative()
+                    .child(crate::accessibility::node(
+                        "add_connection",
+                        crate::accessibility::Node::button(self.tr("sidebar-new-connection"), true),
+                    ))
                     .tab_index(0)
                     .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
@@ -1465,6 +1505,11 @@ impl RemCmdApp {
         connection_tree = connection_tree.child(
             div()
                 .id("toggle_connections")
+                .relative()
+                .child(crate::accessibility::node(
+                    "toggle-connections",
+                    crate::accessibility::Node::button(self.tr("sidebar-connections"), true),
+                ))
                 .tab_index(0)
                 .focus(|style| style.bg(self.theme.list_selected_bg))
                 .flex()
@@ -1537,6 +1582,11 @@ impl RemCmdApp {
                 connection_tree = connection_tree.child(
                     div()
                         .id(SharedString::from(format!("profile-{}", profile.id)))
+                        .relative()
+                        .child(crate::accessibility::node(
+                            "profile",
+                            crate::accessibility::Node::button(profile.name.clone(), true),
+                        ))
                         .flex()
                         .flex_none()
                         .items_center()
@@ -1634,6 +1684,14 @@ impl RemCmdApp {
                     .child(
                         div()
                             .id("show_settings")
+                            .relative()
+                            .child(crate::accessibility::node(
+                                "show_settings",
+                                crate::accessibility::Node::button(
+                                    self.tr("sidebar-settings"),
+                                    true,
+                                ),
+                            ))
                             .flex()
                             .flex_1()
                             .min_w(px(0.0))
@@ -1744,6 +1802,14 @@ impl RemCmdApp {
 
         div()
             .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
+            .relative()
+            .child(crate::accessibility::node(
+                "terminal-tab",
+                crate::accessibility::Node {
+                    selected: is_active,
+                    ..crate::accessibility::Node::button(terminal_title.clone(), true)
+                },
+            ))
             .flex()
             .flex_none()
             .items_center()
@@ -2500,6 +2566,11 @@ impl RemCmdApp {
                     div()
                         .id(SharedString::from(format!("home-profile-{}", profile.id)))
                         .relative()
+                        .child(crate::accessibility::node(
+                            "home-profile",
+                            crate::accessibility::Node::button(profile.name.clone(), true),
+                        ))
+                        .relative()
                         .flex()
                         .items_center()
                         .gap_3()
@@ -2696,6 +2767,11 @@ impl RemCmdApp {
         let action_pressed = self.theme.button_primary_pressed_bg;
         let mut connect = div()
             .id("server-overview-connect")
+            .relative()
+            .child(crate::accessibility::node(
+                "connect",
+                crate::accessibility::Node::button(action_label.clone(), can_connect),
+            ))
             .flex()
             .items_center()
             .justify_center()
@@ -3170,6 +3246,14 @@ impl RemCmdApp {
         let hover_group = SharedString::from(format!("{id}-hover"));
         div()
             .id(id)
+            .relative()
+            .child(crate::accessibility::node(
+                id,
+                crate::accessibility::Node {
+                    menu: true,
+                    ..crate::accessibility::Node::button(label.clone(), enabled)
+                },
+            ))
             .flex()
             .items_center()
             .gap_2()
@@ -3358,69 +3442,71 @@ impl Render for AboutWindow {
         let mut version_args = fluent_bundle::FluentArgs::new();
         version_args.set("version", env!("CARGO_PKG_VERSION"));
 
-        div()
-            .flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .bg(theme.panel_bg)
-            .text_color(theme.text_primary)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .text_center()
-                    .child(
-                        div()
-                            .size(px(96.0))
-                            .rounded_lg()
-                            .shadow(vec![BoxShadow {
-                                color: theme.shadow,
-                                offset: point(px(0.0), px(5.0)),
-                                blur_radius: px(18.0),
-                                spread_radius: px(-6.0),
-                            }])
-                            .child(app_icon(96.0)),
-                    )
-                    .child(div().mt_5().child(wordmark(theme, 174.0, 38.0)))
-                    .child(
-                        div()
-                            .mt_3()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(
-                                self.localizer
-                                    .text_with("about-version", Some(&version_args)),
+        crate::accessibility::root(
+            div()
+                .flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .bg(theme.panel_bg)
+                .text_color(theme.text_primary)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .text_center()
+                        .child(
+                            div()
+                                .size(px(96.0))
+                                .rounded_lg()
+                                .shadow(vec![BoxShadow {
+                                    color: theme.shadow,
+                                    offset: point(px(0.0), px(5.0)),
+                                    blur_radius: px(18.0),
+                                    spread_radius: px(-6.0),
+                                }])
+                                .child(app_icon(96.0)),
+                        )
+                        .child(div().mt_5().child(wordmark(theme, 174.0, 38.0)))
+                        .child(
+                            div()
+                                .mt_3()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(
+                                    self.localizer
+                                        .text_with("about-version", Some(&version_args)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt_3()
+                                .text_sm()
+                                .text_color(theme.text_muted)
+                                .child(self.localizer.text("about-tagline")),
+                        )
+                        .child(
+                            div().mt_4().child(
+                                crate::theme::text_button(
+                                    "about-check-updates",
+                                    self.localizer.text("updates-check"),
+                                    crate::theme::TextButtonTone::Secondary,
+                                    true,
+                                    &theme,
+                                )
+                                .on_click(|_, _, cx| cx.dispatch_action(&super::CheckForUpdates)),
                             ),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .child(self.localizer.text("about-tagline")),
-                    )
-                    .child(
-                        div().mt_4().child(
-                            crate::theme::text_button(
-                                "about-check-updates",
-                                self.localizer.text("updates-check"),
-                                crate::theme::TextButtonTone::Secondary,
-                                true,
-                                &theme,
-                            )
-                            .on_click(|_, _, cx| cx.dispatch_action(&super::CheckForUpdates)),
+                        )
+                        .child(
+                            div()
+                                .mt_4()
+                                .text_xs()
+                                .text_color(theme.text_faint)
+                                .child(self.localizer.text("about-license")),
                         ),
-                    )
-                    .child(
-                        div()
-                            .mt_4()
-                            .text_xs()
-                            .text_color(theme.text_faint)
-                            .child(self.localizer.text("about-license")),
-                    ),
-            )
+                ),
+        )
     }
 }
 

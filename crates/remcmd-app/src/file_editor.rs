@@ -806,10 +806,17 @@ impl Element for FileEditorElement {
 }
 
 impl Render for FileEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut accessibility = crate::accessibility::Node::text("", self.content.clone());
+        accessibility.role = crate::accessibility::Role::TextArea;
+        accessibility.focused = self.focus_handle.is_focused(window);
+        let focus = self.focus_handle.clone();
+        accessibility.handler = Some(std::rc::Rc::new(move |_, window, _| window.focus(&focus)));
         let width = self.content_width.max(1.0);
         div()
             .id("remote_file_editor")
+            .relative()
+            .child(crate::accessibility::node("file-editor", accessibility))
             .key_context("FileEditor")
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)

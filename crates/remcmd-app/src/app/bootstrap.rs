@@ -170,6 +170,7 @@ pub(super) fn bind_profile_editor_keys(cx: &mut App) {
 }
 
 pub(super) fn launch(cx: &mut App) {
+    crate::accessibility::install(cx);
     let log_directory = default_log_directory().unwrap_or_else(|_| fallback_log_directory());
     let diagnostics = Diagnostics::initialize(log_directory);
     let diagnostic_store = diagnostics.store();
