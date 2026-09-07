@@ -1597,7 +1597,10 @@ impl RemCmdApp {
             );
         }
 
-        let settings_selected = self.active_panel == ActivePanel::Settings;
+        let settings_selected = matches!(
+            self.active_panel,
+            ActivePanel::Settings | ActivePanel::Updates
+        );
         let settings_background = if settings_selected {
             self.theme.list_selected_bg
         } else {
@@ -1646,7 +1649,11 @@ impl RemCmdApp {
                             .hover(move |this| this.bg(settings_hover))
                             .active(move |this| this.bg(pressed_background))
                             .child(self.render_sidebar_icon(IconName::Settings, 17.0))
-                            .child(self.tr("sidebar-settings"))
+                            .child(self.tr(if self.updates.has_release() {
+                                "settings-with-update"
+                            } else {
+                                "sidebar-settings"
+                            }))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_settings(window, cx);
                             })),
@@ -2861,6 +2868,7 @@ impl RemCmdApp {
             ActivePanel::Home => return self.render_home(cx),
             ActivePanel::Server => return self.render_server_overview(selected_profile, cx),
             ActivePanel::Settings => return self.render_settings(window, cx),
+            ActivePanel::Updates => return self.render_updates_panel(cx),
             ActivePanel::Diagnostics => return self.render_diagnostics(cx),
             ActivePanel::OpenSshImport => return self.render_openssh_import(cx),
             ActivePanel::Connection => {}
@@ -3394,8 +3402,20 @@ impl Render for AboutWindow {
                             .child(self.localizer.text("about-tagline")),
                     )
                     .child(
+                        div().mt_4().child(
+                            crate::theme::text_button(
+                                "about-check-updates",
+                                self.localizer.text("updates-check"),
+                                crate::theme::TextButtonTone::Secondary,
+                                true,
+                                &theme,
+                            )
+                            .on_click(|_, _, cx| cx.dispatch_action(&super::CheckForUpdates)),
+                        ),
+                    )
+                    .child(
                         div()
-                            .mt_5()
+                            .mt_4()
                             .text_xs()
                             .text_color(theme.text_faint)
                             .child(self.localizer.text("about-license")),
@@ -3411,6 +3431,7 @@ pub(super) enum ActivePanel {
     Server,
     Connection,
     Settings,
+    Updates,
     Diagnostics,
     OpenSshImport,
 }
@@ -3684,7 +3705,7 @@ pub(super) fn titlebar_active_tab_basis(
 }
 
 pub(super) fn about_window_options(cx: &App, _localizer: &Localizer) -> WindowOptions {
-    let window_size = size(px(440.0), px(380.0));
+    let window_size = size(px(440.0), px(440.0));
     let titlebar = {
         #[cfg(target_os = "macos")]
         {

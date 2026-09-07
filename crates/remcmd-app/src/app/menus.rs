@@ -1,13 +1,14 @@
 use super::{
-    AnyElement, AnyView, App, CancelProfileEditor, CloseActivePane, CloseActiveTab, CloseWindow,
-    CommandTooltip, ConnectSelectedProfile, Context, DisconnectActiveSession, ExitTarget, IconName,
-    IntoElement, KeyBinding, Localizer, Menu, MenuItem, MinimizeWindow, NewConnection,
-    NewLocalTerminal, NewRemoteTerminal, Quit, RemCmdApp, RemCmdMainWindow, ResetActiveTerminal,
-    RightSidebarView, SaveProfileEditor, SharedString, ShowAbout, ShowFilesView, ShowHome,
-    ShowPerformanceSidebar, ShowSettings, ShowSftpSidebar, ShowTerminalView, SplitAxis,
-    SplitHorizontal, SplitVertical, TerminalTabView, ToggleBottomPanel, ToggleConnectionSearch,
-    ToggleFullscreen, ToggleLeftSidebar, Window, WindowControlArea, ZoomWindow, div, file_editor,
-    icon_with_color, platform_chrome_height, px, text_field, wordmark,
+    AnyElement, AnyView, App, CancelProfileEditor, CheckForUpdates, CloseActivePane,
+    CloseActiveTab, CloseWindow, CommandTooltip, ConnectSelectedProfile, Context,
+    DisconnectActiveSession, ExitTarget, IconName, IntoElement, KeyBinding, Localizer, Menu,
+    MenuItem, MinimizeWindow, NewConnection, NewLocalTerminal, NewRemoteTerminal, Quit, RemCmdApp,
+    RemCmdMainWindow, ResetActiveTerminal, RightSidebarView, SaveProfileEditor, SharedString,
+    ShowAbout, ShowFilesView, ShowHome, ShowPerformanceSidebar, ShowSettings, ShowSftpSidebar,
+    ShowTerminalView, SplitAxis, SplitHorizontal, SplitVertical, TerminalTabView,
+    ToggleBottomPanel, ToggleConnectionSearch, ToggleFullscreen, ToggleLeftSidebar, Window,
+    WindowControlArea, ZoomWindow, div, file_editor, icon_with_color, platform_chrome_height, px,
+    text_field, wordmark,
 };
 use gpui::prelude::*;
 
@@ -352,6 +353,10 @@ impl RemCmdApp {
             WindowsMenuCommand::CloseWindow => self.request_exit(ExitTarget::Window, window, cx),
             WindowsMenuCommand::ShowSettings => self.show_settings(window, cx),
             WindowsMenuCommand::ShowAbout => self.show_about(cx),
+            WindowsMenuCommand::CheckForUpdates => {
+                self.show_updates(window, cx);
+                self.check_for_updates(true, cx);
+            }
             WindowsMenuCommand::Quit => self.request_exit(ExitTarget::Application, window, cx),
         }
         cx.notify();
@@ -576,6 +581,7 @@ pub(super) enum WindowsMenuCommand {
     CloseWindow,
     ShowSettings,
     ShowAbout,
+    CheckForUpdates,
     Quit,
 }
 
@@ -816,17 +822,25 @@ pub(super) fn windows_menu_entries(menu: WindowsMenu) -> Vec<WindowsMenuEntry> {
                 command: Command::CloseWindow,
             },
         ],
-        WindowsMenu::Help => vec![Item {
-            label_key: "about-title",
-            shortcut: "",
-            command: Command::ShowAbout,
-        }],
+        WindowsMenu::Help => vec![
+            Item {
+                label_key: "about-title",
+                shortcut: "",
+                command: Command::ShowAbout,
+            },
+            Item {
+                label_key: "updates-check",
+                shortcut: "",
+                command: Command::CheckForUpdates,
+            },
+        ],
     }
 }
 
 pub(super) fn application_menus(localizer: &Localizer) -> Vec<Menu> {
     let mut application_items = vec![
         MenuItem::action(localizer.text("about-title"), ShowAbout),
+        MenuItem::action(localizer.text("updates-check"), CheckForUpdates),
         MenuItem::separator(),
         MenuItem::action(localizer.text("menu-settings"), ShowSettings),
     ];
@@ -1094,6 +1108,12 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
             cx.quit();
         }
     });
+    cx.on_action(|_: &CheckForUpdates, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.show_updates(window, cx);
+            this.check_for_updates(true, cx);
+        });
+    });
     cx.set_menus(application_menus(localizer));
 }
 
@@ -1187,11 +1207,18 @@ mod tests {
         )));
         assert_eq!(
             help_entries,
-            vec![WindowsMenuEntry::Item {
-                label_key: "about-title",
-                shortcut: "",
-                command: WindowsMenuCommand::ShowAbout,
-            }]
+            vec![
+                WindowsMenuEntry::Item {
+                    label_key: "about-title",
+                    shortcut: "",
+                    command: WindowsMenuCommand::ShowAbout,
+                },
+                WindowsMenuEntry::Item {
+                    label_key: "updates-check",
+                    shortcut: "",
+                    command: WindowsMenuCommand::CheckForUpdates,
+                },
+            ]
         );
     }
 

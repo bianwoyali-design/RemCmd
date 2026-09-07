@@ -101,6 +101,7 @@ pub(super) fn open_main_window(cx: &mut App) -> WindowHandle<RemCmdApp> {
             });
             false
         });
+        app.update(cx, |this, cx| this.schedule_update_check(cx));
         app
     })
     .expect("failed to open main window")

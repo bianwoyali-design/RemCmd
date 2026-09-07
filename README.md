@@ -48,6 +48,8 @@ RemCmd is currently in beta. Download the latest build from the
   SFTP, and server performance sessions.
 - Redacted JSONL diagnostics with filtering, seven-day retention, and
   anonymized ZIP support-bundle export.
+- Stable release checks with daily automatic checking, cancellable verified
+  downloads, and an installer-assisted update flow.
 
 ## Install
 
@@ -142,6 +144,7 @@ App data lives under the platform-standard directory:
 - [Proxies and jump hosts](docs/proxies-and-jump-hosts.md)
 - [Diagnostics and support bundles](docs/diagnostics.md)
 - [Windows packaging and future signing](docs/windows-code-signing.md)
+- [Software updates](docs/updating.md)
 - [Release process](docs/releasing.md)
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)

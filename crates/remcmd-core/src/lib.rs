@@ -2,6 +2,32 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Update preferences are independent of connection profiles and credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    pub automatic: bool,
+    pub last_check_unix: u64,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            automatic: true,
+            last_check_unix: 0,
+        }
+    }
+}
+
+impl UpdateSettings {
+    pub fn automatic_check_due(self, now: u64) -> bool {
+        self.automatic
+            && (self.last_check_unix == 0
+                || now < self.last_check_unix
+                || now.saturating_sub(self.last_check_unix) >= 24 * 60 * 60)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConnectionProfile {
     pub id: String,
@@ -386,5 +412,24 @@ mod tests {
 
         assert_eq!(decoded.auth, AuthConfig::None);
         assert!(json.contains(r#""type":"none""#));
+    }
+
+    #[test]
+    fn update_checks_are_daily_and_handle_clock_rollback_or_opt_out() {
+        assert!(UpdateSettings::default().automatic_check_due(100));
+        let settings = UpdateSettings {
+            automatic: true,
+            last_check_unix: 100,
+        };
+        assert!(!settings.automatic_check_due(101));
+        assert!(settings.automatic_check_due(100 + 86_400));
+        assert!(settings.automatic_check_due(50));
+        assert!(
+            !UpdateSettings {
+                automatic: false,
+                ..settings
+            }
+            .automatic_check_due(100 + 86_400)
+        );
     }
 }
