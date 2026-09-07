@@ -449,6 +449,10 @@ impl RemCmdApp {
             )
             .on_click(move |_, _, cx| cx.open_url(&url)),
         );
+        let accessibility_status = match self.updates.error.as_ref() {
+            Some(error) => format!("{current}\n{status}\n{error}"),
+            None => format!("{current}\n{status}"),
+        };
         let mut content = div()
             .flex()
             .flex_col()
@@ -477,7 +481,10 @@ impl RemCmdApp {
                     .relative()
                     .child(crate::accessibility::node(
                         "update-status",
-                        crate::accessibility::Node::text(self.tr("updates-title"), status.clone()),
+                        crate::accessibility::Node::text(
+                            self.tr("updates-title"),
+                            accessibility_status,
+                        ),
                     ))
                     .child(div().text_sm().child(status))
                     .when_some(self.updates.error.as_ref(), |this, error| {
