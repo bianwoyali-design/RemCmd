@@ -853,10 +853,16 @@ impl RemCmdApp {
         let leading_transition_id = self.left_sidebar_transition_id;
         let leading_open = self.left_sidebar_open;
         let expanded_sidebar_width = self.effective_sidebar_width(window);
+        let closed_button_offset = if cfg!(target_os = "macos") {
+            COLLAPSED_TITLEBAR_LEADING_WIDTH
+                - TITLEBAR_TAB_GROUP_HEIGHT
+                - TITLEBAR_LEFT_CONTROL_EDGE_GAP
+        } else {
+            TITLEBAR_EDGE_INSET
+        };
         let open_button_offset =
             (expanded_sidebar_width - TITLEBAR_TAB_GROUP_HEIGHT - TITLEBAR_LEFT_CONTROL_EDGE_GAP)
-                .max(TITLEBAR_EDGE_INSET);
-        let closed_button_offset = TITLEBAR_EDGE_INSET;
+                .max(closed_button_offset);
         let button_start_offset = if leading_transition_id == 0 {
             if leading_open {
                 open_button_offset
