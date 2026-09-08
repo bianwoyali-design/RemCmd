@@ -786,6 +786,17 @@ impl RemCmdApp {
                     "sftp-entry-{element_suffix}-{}",
                     entry.path
                 )))
+                .relative()
+                .child(crate::accessibility::node(
+                    "sftp-entry",
+                    crate::accessibility::Node {
+                        selected: is_selected,
+                        ..crate::accessibility::Node::button(
+                            entry.name.clone(),
+                            is_directory || is_file,
+                        )
+                    },
+                ))
                 .flex()
                 .flex_none()
                 .w_full()

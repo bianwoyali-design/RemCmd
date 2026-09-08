@@ -914,6 +914,11 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("profile-advanced-toggle")
+                    .relative()
+                    .child(crate::accessibility::node(
+                        "advanced",
+                        crate::accessibility::Node::button(self.tr("profile-advanced"), true),
+                    ))
                     .tab_index(0)
                     .flex()
                     .items_center()
@@ -1168,6 +1173,11 @@ impl RemCmdApp {
             .child(icon(IconName::Picker, self.theme, IconTone::Default, 15.0));
         let button = div()
             .id("profile-auth-selector")
+            .relative()
+            .child(crate::accessibility::node(
+                "profile-auth-selector",
+                crate::accessibility::Node::button(self.tr(profile_auth_kind_key(selected)), true),
+            ))
             .tab_index(0)
             .border_1()
             .border_color(self.theme.transparent)
@@ -1235,6 +1245,18 @@ impl RemCmdApp {
                 menu = menu.child(
                     div()
                         .id(SharedString::from(format!("profile-auth-option-{index}")))
+                        .relative()
+                        .child(crate::accessibility::node(
+                            "auth-option",
+                            crate::accessibility::Node {
+                                selected: is_selected,
+                                menu: true,
+                                ..crate::accessibility::Node::button(
+                                    self.tr(profile_auth_kind_key(auth_kind)),
+                                    true,
+                                )
+                            },
+                        ))
                         .group(hover_group.clone())
                         .when(index == self.profile_auth_cursor, |this| {
                             this.bg(self.theme.list_selected_bg)

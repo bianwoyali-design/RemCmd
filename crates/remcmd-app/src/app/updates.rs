@@ -79,6 +79,20 @@ fn package_kind() -> Option<PackageKind> {
 }
 
 impl RemCmdApp {
+    fn set_automatic_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.updates.settings.automatic == enabled {
+            return;
+        }
+        self.updates.settings.automatic = enabled;
+        if enabled {
+            self.schedule_update_check(cx);
+        } else {
+            self.updates.auto_task = None;
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
     pub(super) fn schedule_update_check(&mut self, cx: &mut Context<Self>) {
         if !self.updates.settings.automatic || self.updates.auto_task.is_some() {
             return;
@@ -287,6 +301,11 @@ impl RemCmdApp {
         div().mt_6().child(
             div()
                 .id("open-updates")
+                .relative()
+                .child(crate::accessibility::node(
+                    "open-updates",
+                    crate::accessibility::Node::button(self.tr("updates-title"), true),
+                ))
                 .tab_index(0)
                 .flex()
                 .items_center()
@@ -344,6 +363,18 @@ impl RemCmdApp {
             Status::Cancelled => self.tr("updates-cancelled"),
             Status::Failed => self.tr("updates-failed"),
         };
+        let app = cx.entity().downgrade();
+        let automatic_action =
+            std::rc::Rc::new(move |action, _: &mut Window, cx: &mut gpui::App| {
+                let _ = app.update(cx, |app, cx| {
+                    let enabled = match action {
+                        crate::accessibility::Action::SetChecked(enabled) => enabled,
+                        crate::accessibility::Action::Press => !app.updates.settings.automatic,
+                        _ => return,
+                    };
+                    app.set_automatic_updates(enabled, cx);
+                });
+            });
         let busy = self.updates.status.busy();
         let mut actions = div().flex().flex_wrap().gap_2().mt_4();
         let check = text_button(
@@ -418,6 +449,10 @@ impl RemCmdApp {
             )
             .on_click(move |_, _, cx| cx.open_url(&url)),
         );
+        let accessibility_status = match self.updates.error.as_ref() {
+            Some(error) => format!("{current}\n{status}\n{error}"),
+            None => format!("{current}\n{status}"),
+        };
         let mut content = div()
             .flex()
             .flex_col()
@@ -443,6 +478,14 @@ impl RemCmdApp {
                     .p_4()
                     .rounded_lg()
                     .bg(self.theme.settings_group_bg)
+                    .relative()
+                    .child(crate::accessibility::node(
+                        "update-status",
+                        crate::accessibility::Node::text(
+                            self.tr("updates-title"),
+                            accessibility_status,
+                        ),
+                    ))
                     .child(div().text_sm().child(status))
                     .when_some(self.updates.error.as_ref(), |this, error| {
                         this.child(
@@ -481,6 +524,16 @@ impl RemCmdApp {
             .child(
                 div()
                     .id("automatic-updates")
+                    .relative()
+                    .child(crate::accessibility::node(
+                        "automatic-updates",
+                        crate::accessibility::Node {
+                            role: crate::accessibility::Role::CheckBox,
+                            selected: self.updates.settings.automatic,
+                            handler: Some(automatic_action),
+                            ..crate::accessibility::Node::button(self.tr("updates-automatic"), true)
+                        },
+                    ))
                     .tab_index(0)
                     .flex()
                     .items_center()
@@ -515,14 +568,7 @@ impl RemCmdApp {
                     )
                     .child(self.tr("updates-automatic"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.updates.settings.automatic = !this.updates.settings.automatic;
-                        if this.updates.settings.automatic {
-                            this.schedule_update_check(cx);
-                        } else {
-                            this.updates.auto_task = None;
-                        }
-                        this.persist_settings();
-                        cx.notify();
+                        this.set_automatic_updates(!this.updates.settings.automatic, cx);
                     })),
             )
             .child(

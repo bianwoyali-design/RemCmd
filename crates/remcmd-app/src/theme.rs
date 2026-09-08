@@ -396,6 +396,8 @@ pub fn text_button(
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let label = label.into();
+    let id = id.into();
+    let accessibility_focus = std::rc::Rc::new(std::cell::Cell::new(false));
     let (text, background, pressed_background) = match tone {
         TextButtonTone::Primary => (
             theme.on_accent,
@@ -410,7 +412,15 @@ pub fn text_button(
     };
 
     let mut el = div()
-        .id(id)
+        .id(id.clone())
+        .relative()
+        .child(crate::accessibility::node(
+            id,
+            crate::accessibility::Node {
+                focus_marker: Some(accessibility_focus.clone()),
+                ..crate::accessibility::Node::button(label.clone(), enabled)
+            },
+        ))
         .flex()
         .flex_none()
         .items_center()
@@ -431,7 +441,10 @@ pub fn text_button(
             .tab_index(0)
             .border_1()
             .border_color(theme.transparent)
-            .focus(move |style| style.border_color(focus_color))
+            .focus(move |style| {
+                accessibility_focus.set(true);
+                style.border_color(focus_color)
+            })
             .cursor_pointer()
             .active(move |this| this.bg(pressed_background));
     } else {

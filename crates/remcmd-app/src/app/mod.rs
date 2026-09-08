@@ -755,18 +755,26 @@ impl Render for RemCmdApp {
         }
 
         if self.proxy_command_approval_prompt.is_some() {
-            root = root.child(self.render_proxy_command_approval_prompt(cx));
+            root = root.child(crate::accessibility::modal(
+                self.render_proxy_command_approval_prompt(cx),
+            ));
         } else if self
             .active_session()
             .is_some_and(|session| session.host_key_prompt.is_some())
         {
-            root = root.child(self.render_host_key_prompt(cx));
+            root = root.child(crate::accessibility::modal(self.render_host_key_prompt(cx)));
         } else if self.credential_prompt.is_some() {
-            root = root.child(self.render_credential_prompt(cx));
+            root = root.child(crate::accessibility::modal(
+                self.render_credential_prompt(cx),
+            ));
         } else if self.sftp_create_prompt.is_some() {
-            root = root.child(self.render_sftp_create_prompt(cx));
+            root = root.child(crate::accessibility::modal(
+                self.render_sftp_create_prompt(cx),
+            ));
         } else if self.editor.is_some() {
-            root = root.child(self.render_profile_editor_overlay(window, cx));
+            root = root.child(crate::accessibility::modal(
+                self.render_profile_editor_overlay(window, cx),
+            ));
             if self.profile_auth_selector_open {
                 root = root.child(
                     div()
@@ -794,6 +802,6 @@ impl Render for RemCmdApp {
             window.focus(&focus_handle);
         }
 
-        root
+        crate::accessibility::root(root)
     }
 }

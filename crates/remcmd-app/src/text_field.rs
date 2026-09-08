@@ -718,10 +718,33 @@ impl Element for TextElement {
 }
 
 impl Render for TextField {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
 
+        let input = cx.entity().downgrade();
+        let mut accessibility = crate::accessibility::Node::button(self.placeholder.clone(), true);
+        accessibility.role = crate::accessibility::Role::TextField;
+        accessibility.secure = self.is_secure;
+        accessibility.value = Some(if self.is_secure {
+            secure_mask(&self.content)
+        } else {
+            self.content.clone()
+        });
+        accessibility.focused = self.focus_handle.is_focused(window);
+        accessibility.handler = Some(std::rc::Rc::new(move |action, window, cx| {
+            let _ = input.update(cx, |input, cx| {
+                window.focus(&input.focus_handle);
+                if let crate::accessibility::Action::SetValue(value) = action {
+                    input.replace_all(value, cx);
+                }
+            });
+        }));
         div()
+            .relative()
+            .child(crate::accessibility::node(
+                "text-field-accessibility",
+                accessibility,
+            ))
             .flex()
             .key_context("TextField")
             .track_focus(&self.focus_handle(cx))

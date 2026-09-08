@@ -48,6 +48,8 @@ RemCmd is currently in beta. Download the latest build from the
   SFTP, and server performance sessions.
 - Redacted JSONL diagnostics with filtering, seven-day retention, and
   anonymized ZIP support-bundle export.
+- Native macOS accessibility labels, input focus and actions for custom controls,
+  with readable terminal output and password masking.
 - Stable release checks with daily automatic checking, cancellable verified
   downloads, and an installer-assisted update flow.
 

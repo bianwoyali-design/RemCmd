@@ -991,6 +991,24 @@ impl RemCmdApp {
                 )
             })
         });
+        let mut accessibility = crate::accessibility::Node::text(
+            self.tr("terminal-view"),
+            render_state
+                .as_ref()
+                .map(|(snapshot, _, _, _)| {
+                    (0..snapshot.size.rows())
+                        .filter_map(|row| snapshot.row_text(row))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+        );
+        accessibility.role = crate::accessibility::Role::TextArea;
+        accessibility.focus_handle = Some(focus_handle.clone());
+        let accessibility_focus = focus_handle.clone();
+        accessibility.handler = Some(std::rc::Rc::new(move |_, window, _| {
+            window.focus(&accessibility_focus)
+        }));
         let terminal_font_family = self.terminal_font_family.clone();
         let input_entity = cx.entity();
         let layout_entity = input_entity.clone();
@@ -1046,6 +1064,8 @@ impl RemCmdApp {
         .size_full();
 
         let terminal_view = div()
+            .relative()
+            .child(crate::accessibility::node("terminal-output", accessibility))
             .id(SharedString::from(element_id))
             .key_context("Terminal")
             .track_focus(&focus_handle)
