@@ -2,9 +2,14 @@
 
 All notable changes to RemCmd are documented in this file.
 
-## [Unreleased]
+## [0.1.0] - 2026-09-08
 
 ### Added
+
+- Native macOS accessibility for custom controls, including focus, actions,
+  terminal output, and secure-field masking.
+- Stable candidate packaging metadata for macOS DMG, Windows MSI, Debian,
+  and AppImage artifacts, with Debian runtime dependencies declared.
 
 - English and Simplified Chinese Fluent catalogs, system-language detection,
   English fallback, and immediate runtime language switching across app and
@@ -20,6 +25,11 @@ All notable changes to RemCmd are documented in this file.
 - Automatic SCP upload fallback when a server has no SFTP subsystem, plus
   aggregate byte progress for multi-file upload batches.
 - macOS, Windows, and Ubuntu workspace-test jobs in CI.
+
+### Fixed
+
+- Update status now exposes the current version and a localized error reason
+  to assist accessibility users when checks fail.
 
 ### Changed
 
@@ -113,6 +123,6 @@ All notable changes to RemCmd are documented in this file.
 - Windows alpha installers are not yet Authenticode-signed.
 - SFTP features require an SFTP subsystem on the remote server.
 
-[Unreleased]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-beta.1...HEAD
+[0.1.0]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-beta.1...HEAD
 [0.1.0-beta.1]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-alpha.1...v0.1.0-beta.1
 [0.1.0-alpha.1]: https://github.com/bianwoyali-design/RemCmd/releases/tag/v0.1.0-alpha.1
