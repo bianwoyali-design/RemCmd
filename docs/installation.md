@@ -2,8 +2,9 @@
 
 Download the latest RemCmd package from the
 [GitHub Releases page](https://github.com/bianwoyali-design/RemCmd/releases).
-Release builds are beta software. Verify that the release and downloaded file
-come from the official `bianwoyali-design/RemCmd` repository before installing.
+Release-candidate builds are prerelease software. Verify that the downloaded
+file, checksum manifest, and source commit come from the official
+`bianwoyali-design/RemCmd` repository before installing.
 
 ## macOS
 
@@ -36,6 +37,11 @@ Download the `RemCmd-v*-linux-x86_64.deb` package, then install it with:
 ```bash
 sudo apt install ./RemCmd-v*-linux-x86_64.deb
 ```
+
+When replacing the older `0.1.0-beta.1` Debian package, Debian's version
+ordering treats that legacy hyphenated prerelease as newer than `0.1.0`.
+Remove the beta package first, or explicitly allow the one-time downgrade with
+`sudo apt install --allow-downgrades ./RemCmd-v*-linux-x86_64.deb`.
 
 ### AppImage
 

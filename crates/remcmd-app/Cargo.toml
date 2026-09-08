@@ -26,6 +26,24 @@ icons = [
 signing-identity = "-"
 minimum-system-version = "13.0"
 
+[package.metadata.packager.deb]
+# cargo-packager does not infer shared-library dependencies. Keep these in the
+# package metadata so apt can install a usable runtime on a minimal system.
+depends = [
+    "libc6 (>= 2.35)",
+    "libdbus-1-3",
+    "libegl1",
+    "libfontconfig1",
+    "libgcc-s1",
+    "libwayland-client0",
+    "libvulkan1",
+    "libx11-6",
+    "libx11-xcb1",
+    "libxcb1",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+]
+
 [[bin]]
 name = "remcmd"
 path = "src/main.rs"

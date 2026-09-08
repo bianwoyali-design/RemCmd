@@ -207,3 +207,36 @@ jobs:
                     args+=(--prerelease)
                   fi
                   gh "${args[@]}"
+
+    candidate-manifest:
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
+        needs: [validate, package]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Download candidate artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: candidate-artifacts
+                  merge-multiple: true
+            - name: Add checksums and source identity
+              env:
+                  SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+                  RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+                  WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              run: |
+                  set -euo pipefail
+                  cd candidate-artifacts
+                  sha256sum RemCmd-* > SHA256SUMS
+                  jq -n \
+                    --arg commit "$SOURCE_COMMIT" \
+                    --arg version "$RELEASE_VERSION" \
+                    --arg workflow "$WORKFLOW_URL" \
+                    '{commit: $commit, version: $version, workflow: $workflow, kind: "release-candidate"}' \
+                    > BUILD-METADATA.json
+            - name: Upload candidate manifest
+              uses: actions/upload-artifact@v4
+              with:
+                  name: remcmd-release-candidate-${{ needs.validate.outputs.version }}
+                  path: candidate-artifacts
+                  if-no-files-found: error
+                  retention-days: 14
