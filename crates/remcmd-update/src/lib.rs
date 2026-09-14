@@ -232,7 +232,8 @@ pub async fn check(
     current: &str,
     platform: Option<PackageKind>,
 ) -> Result<Option<Release>, UpdateError> {
-    let mut response = client()?
+    let client = client()?;
+    let response = client
         .get(LATEST_URL)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2026-03-10")
@@ -242,6 +243,16 @@ pub async fn check(
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
+    if matches!(
+        response.status(),
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return check_public_release(&client, current, platform).await;
+    }
+    parse_release(&read_metadata(response).await?, current, platform)
+}
+
+async fn read_metadata(mut response: reqwest::Response) -> Result<Vec<u8>, UpdateError> {
     if !response.status().is_success() {
         return Err(UpdateError::Http(response.status().as_u16()));
     }
@@ -252,7 +263,117 @@ pub async fn check(
         }
         bytes.extend_from_slice(&chunk);
     }
-    parse_release(&bytes, current, platform)
+    Ok(bytes)
+}
+
+fn public_release_version(url: &Url, current: &str) -> Result<Option<Version>, UpdateError> {
+    // GitHub redirects /releases/latest to /releases when no stable release exists.
+    if url.as_str() == RELEASES_URL || url.as_str() == format!("{RELEASES_URL}/") {
+        return Ok(None);
+    }
+    let prefix = format!("{RELEASES_URL}/tag/v");
+    let tag = url
+        .as_str()
+        .strip_prefix(&prefix)
+        .ok_or(UpdateError::UnsafeUrl)?;
+    let version = Version::parse(tag).map_err(|_| UpdateError::InvalidRelease)?;
+    let current = Version::parse(current).map_err(|_| UpdateError::InvalidRelease)?;
+    if !version.pre.is_empty() || !version.cmp_precedence(&current).is_gt() {
+        return Ok(None);
+    }
+    Ok(Some(version))
+}
+
+fn manifest_digest(bytes: &[u8], name: &str) -> Result<Option<String>, UpdateError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| UpdateError::InvalidRelease)?;
+    let mut digest = None;
+    for line in text.lines() {
+        let Some((hash, filename)) = line.split_once(' ') else {
+            continue;
+        };
+        if filename.trim_start_matches(' ').trim_start_matches('*') != name {
+            continue;
+        }
+        if digest.is_some() || hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(UpdateError::InvalidRelease);
+        }
+        digest = Some(hash.to_ascii_lowercase());
+    }
+    Ok(digest)
+}
+
+async fn check_public_release(
+    client: &Client,
+    current: &str,
+    platform: Option<PackageKind>,
+) -> Result<Option<Release>, UpdateError> {
+    // The public release redirect does not consume the shared unauthenticated
+    // REST API quota. Keep the system proxy and the same HTTPS/redirect policy.
+    let response = client
+        .get(format!("{RELEASES_URL}/latest"))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(UpdateError::Http(response.status().as_u16()));
+    }
+    let Some(version) = public_release_version(response.url(), current)? else {
+        return Ok(None);
+    };
+    // The redirect is sufficient; do not download or parse the release HTML.
+    drop(response);
+    let mut release = Release {
+        version: version.to_string(),
+        url: format!("{RELEASES_URL}/tag/v{version}"),
+        notes: String::new(),
+        package: None,
+    };
+    if let Some(kind) = platform {
+        let name = format!("RemCmd-v{version}-{}", kind.suffix());
+        let base = format!("{RELEASES_URL}/download/v{version}");
+        let sums = client
+            .get(format!("{base}/SHA256SUMS"))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        // Older releases may not carry our manifest. Still offer their release
+        // page, but never offer an unverified in-app download.
+        if sums.status() != StatusCode::NOT_FOUND {
+            let bytes = read_metadata(sums).await?;
+            if let Some(sha256) = manifest_digest(&bytes, &name)? {
+                let url = format!("{base}/{name}");
+                let asset = client
+                    .head(&url)
+                    .timeout(Duration::from_secs(20))
+                    .send()
+                    .await?;
+                if asset.status() != StatusCode::NOT_FOUND {
+                    if !asset.status().is_success() {
+                        return Err(UpdateError::Http(asset.status().as_u16()));
+                    }
+                    let size = asset
+                        .headers()
+                        .get(reqwest::header::CONTENT_LENGTH)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .ok_or(UpdateError::InvalidRelease)?;
+                    if size == 0 || size > MAX_PACKAGE_BYTES {
+                        return Err(UpdateError::TooLarge);
+                    }
+                    release.package = Some(Package {
+                        name,
+                        size,
+                        url,
+                        sha256,
+                    });
+                }
+            }
+        }
+    }
+    Ok(Some(release))
 }
 
 async fn cancelled(cancel: &mut watch::Receiver<bool>) {
@@ -475,6 +596,58 @@ mod tests {
         ] {
             assert!(!trusted_redirect(&Url::parse(url).unwrap()));
         }
+    }
+
+    #[test]
+    fn public_release_redirects_identify_only_new_stable_releases_in_this_repository() {
+        for suffix in ["", "/", "/tag/v0.1.0", "/tag/v0.0.9", "/tag/v0.2.0-rc.1"] {
+            let url = Url::parse(&format!("{RELEASES_URL}{suffix}")).unwrap();
+            assert!(public_release_version(&url, "0.1.0").unwrap().is_none());
+        }
+        let newer = Url::parse(&format!("{RELEASES_URL}/tag/v0.2.0")).unwrap();
+        assert_eq!(
+            public_release_version(&newer, "0.1.0").unwrap().unwrap(),
+            Version::new(0, 2, 0)
+        );
+        for url in [
+            "https://github.com/other/project/releases/tag/v0.2.0",
+            "http://github.com/bianwoyali-design/RemCmd/releases/tag/v0.2.0",
+            "https://github.com/bianwoyali-design/RemCmd/releases/tag/v0.2.0?redirect=evil",
+            "https://github.com/bianwoyali-design/RemCmd/releases/tag/v0.2.0/extra",
+        ] {
+            assert!(public_release_version(&Url::parse(url).unwrap(), "0.1.0").is_err());
+        }
+    }
+
+    #[test]
+    fn release_manifest_requires_one_exact_filename_and_valid_digest() {
+        let hash = "a".repeat(64);
+        let name = "RemCmd-v0.2.0-macos-aarch64.dmg";
+        for marker in [" ", "*"] {
+            let sums = format!("{hash} {marker}{name}\n");
+            assert_eq!(
+                manifest_digest(sums.as_bytes(), name).unwrap(),
+                Some(hash.clone())
+            );
+        }
+        assert!(
+            manifest_digest(format!("{hash}  ../{name}\n").as_bytes(), name)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manifest_digest(format!("{hash}  {name}\n{hash}  {name}\n").as_bytes(), name).is_err()
+        );
+        assert!(manifest_digest(format!("invalid  {name}\n").as_bytes(), name).is_err());
+        assert!(manifest_digest(b"\xff", name).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires access to the public GitHub release endpoints"]
+    async fn public_release_check_works_without_rest_api_quota() {
+        let result =
+            check_public_release(&client().unwrap(), "0.1.0", Some(PackageKind::MacArm)).await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
