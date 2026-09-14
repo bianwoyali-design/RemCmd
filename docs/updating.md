@@ -11,7 +11,8 @@ selects the package for the current operating system and architecture.
 
 1. Choose **Download Update**. Progress is shown in the update panel; cancel or
    retry if needed.
-2. RemCmd checks the downloaded size and SHA-256 digest supplied by GitHub. A
+2. RemCmd checks the downloaded size and SHA-256 digest from the GitHub API or
+   the release's `SHA256SUMS` file. A
    partial or invalid download never becomes an installable file.
 3. Choose **Open Download**. RemCmd verifies the file again before opening it.
 4. On macOS, use the DMG to replace the application. On Windows, follow the MSI
@@ -38,6 +39,10 @@ unavailable network does not cause a request loop.
 
 Requests follow the operating system proxy configuration and go to GitHub's
 public release API, including the RemCmd version in the User-Agent. No connection profiles, host addresses or credentials are sent.
+If the API rate-limits requests, RemCmd uses GitHub's public latest-release
+redirect and published checksum file instead. This needs no GitHub login or
+proxy changes. Releases without a checksum file remain available through the
+release-page link, but are not downloaded inside the app through this fallback.
 Download redirects are restricted to GitHub's HTTPS release hosts. Verification
 failures leave the current installation unchanged.
 
