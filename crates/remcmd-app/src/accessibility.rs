@@ -184,6 +184,7 @@ mod native {
     use std::{
         cell::{Cell, RefCell},
         collections::HashMap,
+        sync::Once,
     };
 
     struct Record {
@@ -313,25 +314,33 @@ mod native {
         let Some(window) = view.window() else {
             return;
         };
-        // SAFETY: Add no ivars, retain GPUI's entire NSWindow implementation, and
-        // expose only the documented object-returning accessibility focus getter.
-        unsafe {
-            if window.class().name() == c"RemCmdAccessibleWindow" {
-                return;
-            }
-            let class = if let Some(mut builder) =
-                objc2::runtime::ClassBuilder::new(c"RemCmdAccessibleWindow", window.class())
-            {
-                builder.add_method(
+        static WINDOW: Once = Once::new();
+        static PANEL: Once = Once::new();
+        let class = window.class();
+        let installed = match class.name().to_bytes() {
+            b"GPUIWindow" => &WINDOW,
+            b"GPUIPanel" => &PANEL,
+            _ => return,
+        };
+        installed.call_once(|| {
+            // Keep GPUI/AppKit's original window class and lifetime intact. A
+            // single replacement subclass cannot safely represent both windows
+            // and panels. Add only the object-returning focus getter to each
+            // concrete GPUI class; class_addMethod preserves existing overrides.
+            // SAFETY: @@: is an object result with only self and _cmd arguments,
+            // matching focused_element. No ivars or ownership methods change.
+            unsafe {
+                objc2::ffi::class_addMethod(
+                    class as *const _ as *mut _,
                     objc2::sel!(accessibilityFocusedUIElement),
-                    focused_element as extern "C-unwind" fn(_, _) -> _,
+                    std::mem::transmute::<
+                        extern "C-unwind" fn(&NSWindow, objc2::runtime::Sel) -> *mut AnyObject,
+                        objc2::runtime::Imp,
+                    >(focused_element),
+                    c"@@:".as_ptr(),
                 );
-                builder.register()
-            } else {
-                objc2::runtime::AnyClass::get(c"RemCmdAccessibleWindow").unwrap()
-            };
-            AnyObject::set_class(&window, class);
-        }
+            }
+        });
     }
     fn activate(view: &NSView) {
         if let Some(window) = view.window() {
