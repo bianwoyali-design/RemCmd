@@ -61,8 +61,8 @@ commit on an up-to-date `main`:
 ```bash
 git switch main
 git pull --ff-only
-git tag -a v0.1.0-beta.1 -m "RemCmd v0.1.0-beta.1"
-git push origin v0.1.0-beta.1
+git tag -a v0.1.0 -m "RemCmd v0.1.0"
+git push origin v0.1.0
 ```
 
 Do not move or reuse a published tag. The tag push runs the Release workflow,
