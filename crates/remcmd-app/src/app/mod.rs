@@ -20,6 +20,8 @@ mod diagnostics;
 mod keyboard;
 mod lifecycle;
 mod menus;
+#[cfg(target_os = "macos")]
+mod native_material;
 mod openssh_import;
 mod profiles;
 mod quick_commands;
@@ -243,6 +245,8 @@ struct RemCmdApp {
     settings_menu_cursor: usize,
     profile_auth_cursor: usize,
     theme: Theme,
+    #[cfg(target_os = "macos")]
+    sidebar_backdrop: Option<native_material::SidebarBackdrop>,
     settings_path: PathBuf,
     settings_error: Option<String>,
     updates: UpdateState,
@@ -265,6 +269,16 @@ struct RemCmdApp {
 struct RemCmdMainWindow(WindowHandle<RemCmdApp>);
 
 impl Global for RemCmdMainWindow {}
+
+fn main_window_background(theme: Theme) -> WindowBackgroundAppearance {
+    if theme.reduce_transparency {
+        WindowBackgroundAppearance::Opaque
+    } else if cfg!(target_os = "macos") {
+        WindowBackgroundAppearance::Transparent
+    } else {
+        WindowBackgroundAppearance::Blurred
+    }
+}
 
 struct DiagnosticsGlobal(DiagnosticStore);
 
@@ -317,11 +331,13 @@ impl RemCmdApp {
         ));
         let theme = Theme::resolve(theme_mode, window);
         set_global_theme(theme, cx);
-        window.set_background_appearance(if theme.reduce_transparency {
-            WindowBackgroundAppearance::Opaque
-        } else {
-            WindowBackgroundAppearance::Blurred
-        });
+        window.set_background_appearance(main_window_background(theme));
+        #[cfg(target_os = "macos")]
+        let sidebar_backdrop = native_material::SidebarBackdrop::install(
+            window,
+            theme_mode,
+            theme.reduce_transparency,
+        );
         #[cfg(target_os = "macos")]
         let platform_preferences_task = cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -432,6 +448,8 @@ impl RemCmdApp {
             settings_menu_cursor: 0,
             profile_auth_cursor: 0,
             theme,
+            #[cfg(target_os = "macos")]
+            sidebar_backdrop,
             settings_path,
             settings_error,
             updates: UpdateState::new(settings.updates),

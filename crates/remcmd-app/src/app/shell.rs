@@ -1879,6 +1879,8 @@ impl RemCmdApp {
                     .left_0()
                     .bg(self.theme.sidebar_bg),
             )
+        } else if cfg!(target_os = "macos") && !self.theme.reduce_transparency {
+            surface
         } else {
             surface.bg(self.theme.sidebar_bg)
         }
