@@ -8,6 +8,8 @@ use super::{
     point, px, save_settings, set_global_theme, uniform_list,
 };
 use gpui::prelude::*;
+use gpui::{Animation, AnimationExt, ease_out_quint};
+use std::time::Duration;
 
 impl RemCmdApp {
     pub(super) fn set_language_mode(
@@ -813,7 +815,19 @@ impl RemCmdApp {
             .flex_none()
             .max_w(px(max_control_width))
             .child(button)
-            .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
+            .when(is_open, |this| {
+                this.child(
+                    deferred(
+                        menu.with_animation(
+                            SharedString::from(format!("{}-menu-open", selector.element_id())),
+                            Animation::new(self.theme.motion_duration(Duration::from_millis(140)))
+                                .with_easing(ease_out_quint()),
+                            |menu, progress| menu.opacity(progress).top(px(30.0 - 4.0 * progress)),
+                        ),
+                    )
+                    .with_priority(10),
+                )
+            })
     }
 
     pub(super) fn render_settings_selector_row(

@@ -1,16 +1,33 @@
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, size,
+    Animation, AnimationExt, App, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, Element,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun, Timer,
+    UTF16Selection, UnderlineStyle, Window, actions, div, ease_in_out, fill, point, prelude::*, px,
+    relative, size,
 };
 use secrecy::zeroize::Zeroize;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::Theme;
+
+pub(crate) const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const INPUT_FOCUS_DURATION: Duration = Duration::from_millis(150);
+
+fn mix_color(from: Hsla, to: Hsla, progress: f32) -> Hsla {
+    let from: Rgba = from.into();
+    let to: Rgba = to.into();
+    Rgba {
+        r: from.r + (to.r - from.r) * progress,
+        g: from.g + (to.g - from.g) * progress,
+        b: from.b + (to.b - from.b) * progress,
+        a: from.a + (to.a - from.a) * progress,
+    }
+    .into()
+}
 
 actions!(
     text_field,
@@ -62,6 +79,9 @@ pub struct TextField {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    cursor_visible: bool,
+    blink_running: bool,
+    focus_appearance_initialized: bool,
 }
 
 impl TextField {
@@ -107,6 +127,9 @@ impl TextField {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            cursor_visible: true,
+            blink_running: false,
+            focus_appearance_initialized: false,
         }
     }
 
@@ -132,6 +155,7 @@ impl TextField {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.cursor_visible = true;
         cx.notify();
         content
     }
@@ -141,6 +165,7 @@ impl TextField {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -151,6 +176,7 @@ impl TextField {
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -273,6 +299,7 @@ impl TextField {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -337,6 +364,8 @@ impl TextField {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+
+        self.cursor_visible = true;
 
         cx.notify();
     }
@@ -453,6 +482,7 @@ impl EntityInputHandler for TextField {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -483,6 +513,8 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .map(|new_range| (range.start + new_range.start)..(range.start + new_range.end))
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+
+        self.cursor_visible = true;
 
         cx.notify();
     }
@@ -705,6 +737,8 @@ impl Element for TextElement {
             .unwrap();
 
         if focus_handle.is_focused(window)
+            && window.is_window_active()
+            && self.input.read(cx).cursor_visible
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -720,6 +754,57 @@ impl Element for TextElement {
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let focused = self.focus_handle.is_focused(window);
+        if focused && window.is_window_active() && !theme.reduce_motion && !self.blink_running {
+            self.cursor_visible = true;
+            self.blink_running = true;
+            cx.spawn_in(window, async |this, cx| {
+                loop {
+                    Timer::after(CARET_BLINK_INTERVAL).await;
+                    let Ok(keep_running) = this.update_in(cx, |this, window, cx| {
+                        if !this.focus_handle.is_focused(window)
+                            || !window.is_window_active()
+                            || cx.global::<Theme>().reduce_motion
+                        {
+                            this.cursor_visible = true;
+                            this.blink_running = false;
+                            return false;
+                        }
+                        if this.selected_range.is_empty() {
+                            this.cursor_visible = !this.cursor_visible;
+                            cx.notify();
+                        } else {
+                            this.cursor_visible = true;
+                        }
+                        true
+                    }) else {
+                        break;
+                    };
+                    if !keep_running {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        let animate_focus = self.focus_appearance_initialized && !theme.reduce_motion;
+        self.focus_appearance_initialized = true;
+        let (start_border, end_border, start_bg, end_bg) = if focused {
+            (
+                theme.input_border,
+                theme.accent,
+                theme.input_bg,
+                theme.input_focused_bg,
+            )
+        } else {
+            (
+                theme.accent,
+                theme.input_border,
+                theme.input_focused_bg,
+                theme.input_bg,
+            )
+        };
+        let focus_ring = theme.input_focus_ring;
 
         let input = cx.entity().downgrade();
         let mut accessibility = crate::accessibility::Node::button(self.placeholder.clone(), true);
@@ -750,8 +835,7 @@ impl Render for TextField {
             .track_focus(&self.focus_handle(cx))
             .tab_index(0)
             .border_1()
-            .border_color(theme.transparent)
-            .focus(move |style| style.border_color(theme.accent))
+            .border_color(end_border)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -779,7 +863,7 @@ impl Render for TextField {
             } else {
                 crate::theme::CONTROL_RADIUS
             }))
-            .bg(theme.input_bg)
+            .bg(end_bg)
             .overflow_hidden()
             .child(
                 div()
@@ -788,6 +872,27 @@ impl Render for TextField {
                     .px_3()
                     .py_1()
                     .child(TextElement { input: cx.entity() }),
+            )
+            .with_animation(
+                SharedString::from(format!("text-field-focus-{focused}")),
+                Animation::new(if animate_focus {
+                    INPUT_FOCUS_DURATION
+                } else {
+                    Duration::from_millis(1)
+                })
+                .with_easing(ease_in_out),
+                move |this, progress| {
+                    let mut ring = focus_ring;
+                    ring.a *= if focused { progress } else { 1.0 - progress };
+                    this.border_color(mix_color(start_border, end_border, progress))
+                        .bg(mix_color(start_bg, end_bg, progress))
+                        .shadow(vec![BoxShadow {
+                            color: ring,
+                            offset: point(px(0.0), px(0.0)),
+                            blur_radius: px(5.0),
+                            spread_radius: px(2.0),
+                        }])
+                },
             )
     }
 }
