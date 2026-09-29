@@ -1,11 +1,12 @@
 use gpui::{
-    AnyElement, App, Global, Hsla, Window, WindowAppearance, div, hsla, prelude::*, px, rgb, rgba,
+    AnyElement, App, BoxShadow, Global, Hsla, Window, WindowAppearance, div, hsla, point,
+    prelude::*, px, rgb, rgba,
 };
 
 use remcmd_core::ThemeMode;
 
-pub const CONTROL_RADIUS: f32 = 6.0;
-pub const CONTROL_HEIGHT: f32 = 30.0;
+pub const CONTROL_RADIUS: f32 = 9.0;
+pub const CONTROL_HEIGHT: f32 = 32.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThemeAppearance {
@@ -75,6 +76,9 @@ pub struct Theme {
     pub titlebar_tab_separator: Hsla,
 
     pub input_bg: Hsla,
+    pub input_focused_bg: Hsla,
+    pub input_border: Hsla,
+    pub input_focus_ring: Hsla,
     pub input_text: Hsla,
     pub input_cursor: Hsla,
     pub input_placeholder: Hsla,
@@ -140,6 +144,9 @@ impl Theme {
             titlebar_tab_separator: alpha(0xffffff24),
 
             input_bg: alpha(0xffffff18),
+            input_focused_bg: alpha(0xffffff24),
+            input_border: alpha(0xffffff33),
+            input_focus_ring: alpha(0x1683ff52),
             input_text: opaque(0xf4f4f5),
             input_cursor: hsla(0.0, 0.0, 1.0, 0.9),
             input_placeholder: hsla(0.0, 0.0, 1.0, 0.45),
@@ -203,6 +210,9 @@ impl Theme {
             titlebar_tab_separator: alpha(0x0000001f),
 
             input_bg: alpha(0x0000000d),
+            input_focused_bg: opaque(0xffffff),
+            input_border: alpha(0x00000026),
+            input_focus_ring: alpha(0x1683ff47),
             input_text: opaque(0x1a1a1a),
             input_cursor: hsla(0.0, 0.0, 0.0, 0.8),
             input_placeholder: hsla(0.0, 0.0, 0.0, 0.4),
@@ -286,6 +296,7 @@ impl Theme {
                 opaque(0x909090)
             };
             self.border_strong = self.border;
+            self.input_border = self.border;
             self.settings_separator = self.border;
             self.titlebar_tab_border = self.border;
         }
@@ -364,7 +375,7 @@ pub fn icon_button(
         .items_center()
         .justify_center()
         .size(px(32.0))
-        .rounded_md()
+        .rounded(px(CONTROL_RADIUS))
         .bg(theme.transparent)
         .text_color(text)
         .child(icon);
@@ -377,8 +388,11 @@ pub fn icon_button(
             .border_color(theme.transparent)
             .focus(move |style| style.border_color(focus_color))
             .cursor_pointer()
-            .hover(move |this| this.bg(theme.control_hover_bg))
-            .active(move |this| this.bg(theme.control_pressed_bg));
+            .hover(move |this| this.bg(theme.control_hover_bg).border_color(theme.border))
+            .active(move |this| {
+                this.bg(theme.control_pressed_bg)
+                    .border_color(theme.border_strong)
+            });
     } else {
         el = el.opacity(0.5);
     }
@@ -398,16 +412,20 @@ pub fn text_button(
     let label = label.into();
     let id = id.into();
     let accessibility_focus = std::rc::Rc::new(std::cell::Cell::new(false));
-    let (text, background, pressed_background) = match tone {
+    let (text, background, hover_background, pressed_background, edge) = match tone {
         TextButtonTone::Primary => (
             theme.on_accent,
             theme.button_primary_bg,
+            theme.accent_hover,
             theme.button_primary_pressed_bg,
+            theme.accent_hover,
         ),
         TextButtonTone::Secondary => (
             theme.text_primary,
             theme.button_secondary_bg,
+            theme.control_hover_bg,
             theme.button_secondary_pressed_bg,
+            theme.border,
         ),
     };
 
@@ -428,7 +446,18 @@ pub fn text_button(
         .min_h(px(CONTROL_HEIGHT))
         .px_3()
         .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(edge)
         .bg(background)
+        .shadow(vec![BoxShadow {
+            color: Hsla {
+                a: theme.shadow.a * 0.5,
+                ..theme.shadow
+            },
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(3.0),
+            spread_radius: px(0.0),
+        }])
         .text_color(text)
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -439,14 +468,20 @@ pub fn text_button(
         let focus_color = theme.accent;
         el = el
             .tab_index(0)
-            .border_1()
-            .border_color(theme.transparent)
             .focus(move |style| {
                 accessibility_focus.set(true);
                 style.border_color(focus_color)
             })
             .cursor_pointer()
-            .active(move |this| this.bg(pressed_background));
+            .hover(move |this| this.bg(hover_background))
+            .active(move |this| {
+                this.bg(pressed_background).shadow(vec![BoxShadow {
+                    color: theme.shadow,
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(1.0),
+                    spread_radius: px(0.0),
+                }])
+            });
     } else {
         el = el.opacity(0.5);
     }

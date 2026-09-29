@@ -1888,7 +1888,7 @@ impl RemCmdApp {
 
     pub(super) fn dialog_surface(&self) -> gpui::Div {
         div()
-            .rounded(px(12.0))
+            .rounded(px(14.0))
             .border_1()
             .border_color(self.theme.border)
             .bg(self.theme.panel_bg)
@@ -1902,7 +1902,7 @@ impl RemCmdApp {
 
     pub(super) fn glass_floating_surface(&self) -> gpui::Div {
         div()
-            .rounded_lg()
+            .rounded(px(12.0))
             .border_1()
             .border_color(self.theme.border_strong)
             .bg(self.theme.floating_glass_bg)

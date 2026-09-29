@@ -4,11 +4,12 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Render, ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, point, prelude::*, px, relative, size,
+    Render, ScrollHandle, ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::text_field::CARET_BLINK_INTERVAL;
 use crate::theme::Theme;
 
 const LINE_HEIGHT: f32 = 22.0;
@@ -84,6 +85,8 @@ pub struct FileEditor {
     last_layouts: Vec<EditorLineLayout>,
     is_selecting: bool,
     reveal_cursor: bool,
+    cursor_visible: bool,
+    blink_running: bool,
     scroll_handle: ScrollHandle,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
@@ -114,6 +117,8 @@ impl FileEditor {
             last_layouts: Vec::new(),
             is_selecting: false,
             reveal_cursor: false,
+            cursor_visible: true,
+            blink_running: false,
             scroll_handle: ScrollHandle::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -135,6 +140,7 @@ impl FileEditor {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.reveal_cursor = false;
+        self.cursor_visible = true;
         self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
@@ -154,6 +160,7 @@ impl FileEditor {
         self.marked_range = None;
         self.preferred_column = None;
         self.reveal_cursor = true;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -332,6 +339,7 @@ impl FileEditor {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         self.reveal_cursor = true;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -346,6 +354,7 @@ impl FileEditor {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.reveal_cursor = true;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -590,6 +599,7 @@ impl EntityInputHandler for FileEditor {
         self.marked_range = None;
         self.preferred_column = None;
         self.reveal_cursor = true;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -622,6 +632,7 @@ impl EntityInputHandler for FileEditor {
         self.selection_reversed = false;
         self.preferred_column = None;
         self.reveal_cursor = true;
+        self.cursor_visible = true;
         cx.notify();
     }
 
@@ -792,6 +803,8 @@ impl Element for FileEditorElement {
                 .expect("file editor text should paint");
         }
         if focus_handle.is_focused(window)
+            && window.is_window_active()
+            && self.editor.read(cx).cursor_visible
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -807,6 +820,43 @@ impl Element for FileEditorElement {
 
 impl Render for FileEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.is_focused(window);
+        if focused
+            && window.is_window_active()
+            && !cx.global::<Theme>().reduce_motion
+            && !self.blink_running
+        {
+            self.cursor_visible = true;
+            self.blink_running = true;
+            cx.spawn_in(window, async |this, cx| {
+                loop {
+                    Timer::after(CARET_BLINK_INTERVAL).await;
+                    let Ok(keep_running) = this.update_in(cx, |this, window, cx| {
+                        if !this.focus_handle.is_focused(window)
+                            || !window.is_window_active()
+                            || cx.global::<Theme>().reduce_motion
+                        {
+                            this.cursor_visible = true;
+                            this.blink_running = false;
+                            return false;
+                        }
+                        if this.selected_range.is_empty() {
+                            this.cursor_visible = !this.cursor_visible;
+                            cx.notify();
+                        } else {
+                            this.cursor_visible = true;
+                        }
+                        true
+                    }) else {
+                        break;
+                    };
+                    if !keep_running {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let mut accessibility = crate::accessibility::Node::text("", self.content.clone());
         accessibility.role = crate::accessibility::Role::TextArea;
         accessibility.focused = self.focus_handle.is_focused(window);
