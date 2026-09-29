@@ -83,7 +83,11 @@ pub(super) fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(720.0), px(480.0))),
-        window_background: WindowBackgroundAppearance::Blurred,
+        window_background: if cfg!(target_os = "macos") {
+            WindowBackgroundAppearance::Transparent
+        } else {
+            WindowBackgroundAppearance::Blurred
+        },
         titlebar: Some(main_window_titlebar()),
         ..Default::default()
     }

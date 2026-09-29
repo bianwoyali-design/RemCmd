@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use super::native_material;
 use super::{
     ActivePanel, AnyElement, AppSettings, CancelSettingsSelector, Context, CredentialPromptKind,
     FontWeight, IconName, IconTone, LanguageMode, Localizer, Range, RemCmdApp, ScrollHandle,
@@ -98,11 +100,14 @@ impl RemCmdApp {
             return;
         }
         self.theme = theme;
-        window.set_background_appearance(if theme.reduce_transparency {
-            gpui::WindowBackgroundAppearance::Opaque
-        } else {
-            gpui::WindowBackgroundAppearance::Blurred
-        });
+        window.set_background_appearance(super::main_window_background(theme));
+        #[cfg(target_os = "macos")]
+        native_material::SidebarBackdrop::sync(
+            &mut self.sidebar_backdrop,
+            window,
+            self.theme_mode,
+            theme.reduce_transparency,
+        );
         set_global_theme(theme, cx);
         if let Some(about) = self.about_window {
             let _ = about.update(cx, |_, window, cx| {
@@ -126,6 +131,13 @@ impl RemCmdApp {
         self.theme_mode = theme_mode;
         self.theme = Theme::resolve(theme_mode, window);
         set_global_theme(self.theme, cx);
+        #[cfg(target_os = "macos")]
+        native_material::SidebarBackdrop::sync(
+            &mut self.sidebar_backdrop,
+            window,
+            theme_mode,
+            self.theme.reduce_transparency,
+        );
 
         self.persist_settings();
         cx.notify();
