@@ -1,0 +1,21 @@
+{
+  "fill": {
+    "solid": "srgb:0.00392,0.34902,0.81961,1.00000"
+  },
+  "groups": [
+    {
+      "name": "RemCmd artwork",
+      "specular": false,
+      "layers": [
+        {
+          "image-name": "Artwork.svg",
+          "name": "Blue panels and RC",
+          "glass": false
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

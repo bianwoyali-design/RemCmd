@@ -24,7 +24,7 @@
       <stop offset="1" stop-color="#014398" stop-opacity=".22" />
     </linearGradient>
     <clipPath id="rectangle-outline">
-      <rect width="616" height="616" rx="128" />
+      <rect width="616" height="616" />
     </clipPath>
   </defs>
   <g id="original-badge" transform="scale(1.6623376623376624) translate(-204 -208)">
@@ -32,7 +32,7 @@
       <path id="blue-bright-block" d="M0 0H616V120L330 360L0 170Z" fill="url(#blue-bright)" />
       <path id="blue-deep-block" d="M616 120V616H180L330 360Z" fill="url(#blue-deep)" />
       <path id="blue-primary-block" d="M0 170L330 360L180 616H0Z" fill="url(#blue-primary)" />
-      <rect id="edge-highlight" x="1" y="1" width="614" height="614" rx="127" fill="none" stroke="url(#edge)" stroke-width="2" />
+      <rect id="edge-highlight" x="1" y="1" width="614" height="614" fill="none" stroke="url(#edge)" stroke-width="2" />
     </g>
     <g id="white-content" transform="translate(512 516) scale(0.90) translate(-512 -516)">
       <g id="RC-lettermark" fill="url(#letter-fill)" fill-rule="evenodd" transform="translate(0 -30)">
