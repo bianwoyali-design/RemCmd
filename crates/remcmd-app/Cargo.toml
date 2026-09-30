@@ -19,12 +19,14 @@ icons = [
     "../../assets/icons/remcmd.ico",
     "../../assets/icons/remcmd-*.png",
 ]
+resources = [{ src = "../../assets/icons/macos/Assets.car", target = "Assets.car" }]
 
 [package.metadata.packager.macos]
 # Ad-hoc signing makes the packaged bundle internally consistent for alpha
 # installs. It is intentionally not a substitute for Developer ID notarization.
 signing-identity = "-"
 minimum-system-version = "13.0"
+info-plist-path = "../../packaging/macos/Info.plist"
 
 [package.metadata.packager.deb]
 # cargo-packager does not infer shared-library dependencies. Keep these in the
