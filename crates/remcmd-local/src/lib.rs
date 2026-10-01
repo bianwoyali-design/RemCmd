@@ -16,43 +16,14 @@ use tokio::sync::mpsc as tokio_mpsc;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const OUTPUT_BUFFER_SIZE: usize = 16 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalPtySize {
-    pub columns: u32,
-    pub rows: u32,
-    pub pixel_width: u32,
-    pub pixel_height: u32,
-}
+pub use remcmd_core::PtySize as LocalPtySize;
 
-impl LocalPtySize {
-    pub const fn new(columns: u32, rows: u32) -> Self {
-        Self {
-            columns,
-            rows,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
-    }
-
-    pub const fn with_pixels(mut self, pixel_width: u32, pixel_height: u32) -> Self {
-        self.pixel_width = pixel_width;
-        self.pixel_height = pixel_height;
-        self
-    }
-
-    fn portable(self) -> PortablePtySize {
-        PortablePtySize {
-            rows: clamp_u16(self.rows),
-            cols: clamp_u16(self.columns),
-            pixel_width: clamp_u16(self.pixel_width),
-            pixel_height: clamp_u16(self.pixel_height),
-        }
-    }
-}
-
-impl Default for LocalPtySize {
-    fn default() -> Self {
-        Self::new(80, 24)
+fn portable_pty_size(size: LocalPtySize) -> PortablePtySize {
+    PortablePtySize {
+        rows: clamp_u16(size.rows),
+        cols: clamp_u16(size.columns),
+        pixel_width: clamp_u16(size.pixel_width),
+        pixel_height: clamp_u16(size.pixel_height),
     }
 }
 
@@ -186,7 +157,7 @@ fn run_local_terminal(
     }
 
     let pty_system = native_pty_system();
-    let pair = match pty_system.openpty(initial_size.portable()) {
+    let pair = match pty_system.openpty(portable_pty_size(initial_size)) {
         Ok(pair) => pair,
         Err(error) => {
             send_failure(&events, format!("failed to open local PTY: {error}"));
@@ -288,7 +259,7 @@ fn run_local_terminal(
                 }
             }
             Ok(LocalTerminalCommand::Resize(size)) => {
-                if let Err(error) = pair.master.resize(size.portable()) {
+                if let Err(error) = pair.master.resize(portable_pty_size(size)) {
                     send_failure(&events, format!("failed to resize local PTY: {error}"));
                     let _ = child.kill();
                     return;
@@ -351,13 +322,12 @@ mod tests {
 
     #[test]
     fn pty_size_clamps_platform_dimensions() {
-        let size = LocalPtySize {
+        let size = portable_pty_size(LocalPtySize {
             columns: u32::MAX,
             rows: 24,
             pixel_width: u32::MAX,
             pixel_height: 0,
-        }
-        .portable();
+        });
 
         assert_eq!(size.cols, u16::MAX);
         assert_eq!(size.rows, 24);

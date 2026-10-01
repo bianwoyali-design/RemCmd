@@ -15,6 +15,7 @@ mod ssh_runtime;
 mod terminal_canvas;
 mod terminal_input;
 mod terminal_view;
+mod text_edit;
 mod text_field;
 mod theme;
 mod windows_chrome;

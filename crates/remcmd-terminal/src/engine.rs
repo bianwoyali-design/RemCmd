@@ -80,11 +80,6 @@ impl TerminalEngine {
         Ok(())
     }
 
-    pub fn set_config(&mut self, config: TerminalConfig) {
-        self.terminal.set_options(map_config(config.clone()));
-        self.config = config;
-    }
-
     pub fn reset(&mut self) {
         let events = EventQueue::default();
         self.parser = Processor::new();

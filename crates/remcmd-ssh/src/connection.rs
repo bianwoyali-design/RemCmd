@@ -21,8 +21,7 @@ use crate::{
     SshTransport, TransferRateLimiter,
     host_key::HostKeyDecision,
     performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
-    scp::ScpWorkerHandle,
-    sftp::SftpWorkerHandle,
+    remote_files::{FileCommand, RemoteFiles},
     transport::TransportOpen,
 };
 
@@ -41,50 +40,8 @@ pub enum ConnectionCommand {
     /// Reports a new terminal size to the remote PTY.
     Resize(PtySize),
 
-    /// Reads one remote directory through an SFTP subsystem channel.
-    ReadDirectory { request_id: u64, path: String },
-
-    /// Recursively lists regular files and directories below one remote path.
-    ReadDirectoryTree { request_id: u64, path: String },
-
-    /// Reads one remote file through an SFTP subsystem channel.
-    ReadFile { request_id: u64, path: String },
-
-    /// Replaces a remote file if its contents have not changed since it was read.
-    WriteFile {
-        request_id: u64,
-        path: String,
-        expected_contents: Vec<u8>,
-        contents: Vec<u8>,
-    },
-
-    /// Creates one empty remote file without replacing an existing item.
-    CreateFile { request_id: u64, path: String },
-
-    /// Creates remote directories in parent-first order.
-    CreateDirectories { request_id: u64, paths: Vec<String> },
-
-    /// Recursively deletes remote files and directories.
-    DeletePaths { request_id: u64, paths: Vec<String> },
-
-    /// Copies one local file to a remote SFTP path.
-    UploadFile {
-        transfer_id: u64,
-        local_path: PathBuf,
-        remote_path: String,
-        overwrite: bool,
-    },
-
-    /// Copies one remote SFTP file to a local path.
-    DownloadFile {
-        transfer_id: u64,
-        remote_path: String,
-        local_path: PathBuf,
-        overwrite: bool,
-    },
-
-    /// Requests cancellation of an active SFTP transfer.
-    CancelTransfer { transfer_id: u64 },
+    /// Routes remote file requests to the selected protocol worker.
+    Files(FileCommand),
 
     /// Starts or stops periodic server performance sampling.
     SetPerformanceMonitoring(bool),
@@ -225,7 +182,7 @@ impl ConnectionHandle {
 
     /// Requests one remote directory listing through this SSH connection.
     pub fn read_directory(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
-        self.send(ConnectionCommand::ReadDirectory {
+        self.send_file(FileCommand::ReadDirectory {
             request_id,
             path: path.into(),
         })
@@ -237,7 +194,7 @@ impl ConnectionHandle {
         request_id: u64,
         path: impl Into<String>,
     ) -> Result<(), SshError> {
-        self.send(ConnectionCommand::ReadDirectoryTree {
+        self.send_file(FileCommand::ReadDirectoryTree {
             request_id,
             path: path.into(),
         })
@@ -245,7 +202,7 @@ impl ConnectionHandle {
 
     /// Requests one remote file through this SSH connection.
     pub fn read_file(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
-        self.send(ConnectionCommand::ReadFile {
+        self.send_file(FileCommand::ReadFile {
             request_id,
             path: path.into(),
         })
@@ -259,7 +216,7 @@ impl ConnectionHandle {
         expected_contents: Vec<u8>,
         contents: Vec<u8>,
     ) -> Result<(), SshError> {
-        self.send(ConnectionCommand::WriteFile {
+        self.send_file(FileCommand::WriteFile {
             request_id,
             path: path.into(),
             expected_contents,
@@ -269,7 +226,7 @@ impl ConnectionHandle {
 
     /// Creates one empty remote file without overwriting an existing item.
     pub fn create_file(&self, request_id: u64, path: impl Into<String>) -> Result<(), SshError> {
-        self.send(ConnectionCommand::CreateFile {
+        self.send_file(FileCommand::CreateFile {
             request_id,
             path: path.into(),
         })
@@ -277,12 +234,12 @@ impl ConnectionHandle {
 
     /// Creates remote directories in parent-first order.
     pub fn create_directories(&self, request_id: u64, paths: Vec<String>) -> Result<(), SshError> {
-        self.send(ConnectionCommand::CreateDirectories { request_id, paths })
+        self.send_file(FileCommand::CreateDirectories { request_id, paths })
     }
 
     /// Recursively deletes remote files and directories.
     pub fn delete_paths(&self, request_id: u64, paths: Vec<String>) -> Result<(), SshError> {
-        self.send(ConnectionCommand::DeletePaths { request_id, paths })
+        self.send_file(FileCommand::DeletePaths { request_id, paths })
     }
 
     /// Queues a local file upload through this SSH connection.
@@ -293,7 +250,8 @@ impl ConnectionHandle {
         remote_path: impl Into<String>,
         overwrite: bool,
     ) -> Result<(), SshError> {
-        self.send(ConnectionCommand::UploadFile {
+        self.send_file(FileCommand::Transfer {
+            direction: SftpTransferDirection::Upload,
             transfer_id,
             local_path,
             remote_path: remote_path.into(),
@@ -309,7 +267,8 @@ impl ConnectionHandle {
         local_path: PathBuf,
         overwrite: bool,
     ) -> Result<(), SshError> {
-        self.send(ConnectionCommand::DownloadFile {
+        self.send_file(FileCommand::Transfer {
+            direction: SftpTransferDirection::Download,
             transfer_id,
             remote_path: remote_path.into(),
             local_path,
@@ -319,7 +278,7 @@ impl ConnectionHandle {
 
     /// Requests cancellation of an active SFTP transfer.
     pub fn cancel_transfer(&self, transfer_id: u64) -> Result<(), SshError> {
-        self.send(ConnectionCommand::CancelTransfer { transfer_id })
+        self.send_file(FileCommand::CancelTransfer { transfer_id })
     }
 
     /// Starts or stops periodic server performance sampling.
@@ -340,6 +299,10 @@ impl ConnectionHandle {
     /// Rejects the unknown host key presented by this connection.
     pub fn reject_host_key(&self) -> Result<(), SshError> {
         self.send_host_key_decision(HostKeyDecision::Reject)
+    }
+
+    fn send_file(&self, command: FileCommand) -> Result<(), SshError> {
+        self.send(ConnectionCommand::Files(command))
     }
 
     fn send(&self, command: ConnectionCommand) -> Result<(), SshError> {
@@ -428,15 +391,6 @@ impl SshConnection {
         )
     }
 
-    pub fn spawn_plan(runtime: &Handle, plan: ConnectionPlan, initial_size: PtySize) -> Self {
-        Self::spawn_plan_with_transfer_rate_limiter(
-            runtime,
-            plan,
-            initial_size,
-            Arc::new(TransferRateLimiter::default()),
-        )
-    }
-
     pub fn spawn_plan_with_transfer_rate_limiter(
         runtime: &Handle,
         plan: ConnectionPlan,
@@ -513,19 +467,7 @@ where
                     Some(ConnectionCommand::Input(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
-                    Some(
-                        ConnectionCommand::ReadDirectory { .. }
-                        | ConnectionCommand::ReadDirectoryTree { .. }
-                        | ConnectionCommand::ReadFile { .. }
-                        | ConnectionCommand::WriteFile { .. }
-                        | ConnectionCommand::CreateFile { .. }
-                        | ConnectionCommand::CreateDirectories { .. }
-                        | ConnectionCommand::DeletePaths { .. }
-                        | ConnectionCommand::UploadFile { .. }
-                        | ConnectionCommand::DownloadFile { .. }
-                        | ConnectionCommand::CancelTransfer { .. }
-                        | ConnectionCommand::SetPerformanceMonitoring(_),
-                    ) => {
+                    Some(ConnectionCommand::Files(_) | ConnectionCommand::SetPerformanceMonitoring(_)) => {
                         // Subsystem requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
@@ -561,19 +503,7 @@ async fn wait_for_host_key_decision(
                     Some(ConnectionCommand::Input(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
-                    Some(
-                        ConnectionCommand::ReadDirectory { .. }
-                        | ConnectionCommand::ReadDirectoryTree { .. }
-                        | ConnectionCommand::ReadFile { .. }
-                        | ConnectionCommand::WriteFile { .. }
-                        | ConnectionCommand::CreateFile { .. }
-                        | ConnectionCommand::CreateDirectories { .. }
-                        | ConnectionCommand::DeletePaths { .. }
-                        | ConnectionCommand::UploadFile { .. }
-                        | ConnectionCommand::DownloadFile { .. }
-                        | ConnectionCommand::CancelTransfer { .. }
-                        | ConnectionCommand::SetPerformanceMonitoring(_),
-                    ) => {
+                    Some(ConnectionCommand::Files(_) | ConnectionCommand::SetPerformanceMonitoring(_)) => {
                         // Subsystem requests are ignored until authentication completes.
                     }
                     Some(ConnectionCommand::Disconnect) | None => {
@@ -613,8 +543,7 @@ async fn run_connection_plan(
         events,
         transfer_rate_limiter,
     } = context;
-    let target_profile = plan.target_profile().clone();
-    let mut session = SshSession::new(target_profile.clone());
+    let mut session = SshSession::default();
 
     if let Err(error) = session.begin_connect() {
         report_failure(&mut session, error, &events).await;
@@ -643,12 +572,10 @@ async fn run_connection_plan(
             (step, stage)
         })
         .collect::<Vec<_>>();
-    steps.push((
-        target,
-        ConnectionStage::Target {
-            profile_id: target_profile.id.clone(),
-        },
-    ));
+    let target_stage = ConnectionStage::Target {
+        profile_id: target.profile.id.clone(),
+    };
+    steps.push((target, target_stage));
 
     let mut established: Vec<SshTransport> = Vec::new();
     let mut authentication_started = false;
@@ -784,7 +711,7 @@ async fn run_connection_plan(
             }
         };
         tracing::info!(
-            stage = connection_stage_name(&stage),
+            stage = stage.diagnostic_name(),
             elapsed_ms = stage_started_at.elapsed().as_millis() as u64,
             result = "success",
             "SSH transport established"
@@ -816,7 +743,7 @@ async fn run_connection_plan(
         {
             PendingResult::Completed(Ok(())) => {
                 tracing::info!(
-                    stage = connection_stage_name(&stage),
+                    stage = stage.diagnostic_name(),
                     authentication = ?auth_kind,
                     elapsed_ms = authentication_started_at.elapsed().as_millis() as u64,
                     result = "success",
@@ -837,7 +764,7 @@ async fn run_connection_plan(
             }
             PendingResult::Completed(Err(error)) => {
                 tracing::warn!(
-                    stage = connection_stage_name(&stage),
+                    stage = stage.diagnostic_name(),
                     authentication = ?auth_kind,
                     elapsed_ms = authentication_started_at.elapsed().as_millis() as u64,
                     result = "failed",
@@ -912,10 +839,7 @@ async fn run_connection_plan(
 
     let transport = Arc::new(transport);
     let mut pending_command = None;
-    let mut sftp_worker = None;
-    let mut scp_worker = None;
-    let mut sftp_available = None;
-    let mut scp_available = None;
+    let mut files = RemoteFiles::new(transport.clone(), events.clone(), transfer_rate_limiter);
     let mut transfer_probe_pending = true;
     let mut transfer_probe = Box::pin(async {
         tokio::join!(
@@ -964,8 +888,8 @@ async fn run_connection_plan(
                             (Ok(true), _) => unreachable!("available SFTP has no fallback message"),
                         })
                     };
-                    sftp_available = Some(available);
-                    scp_available = Some(fallback_available);
+                    files.sftp_available = Some(available);
+                    files.scp_available = Some(fallback_available);
                     if events
                         .send(ConnectionEvent::SftpAvailabilityChanged {
                             available,
@@ -1075,557 +999,8 @@ async fn run_connection_plan(
                     return;
                 }
             }
-            Some(ConnectionCommand::ReadDirectory { request_id, path }) => {
-                if sftp_available != Some(true) {
-                    let error = SshError::new(
-                        SshErrorKind::Sftp,
-                        if transfer_probe_pending {
-                            "SFTP availability is still being checked"
-                        } else {
-                            "SFTP is unavailable on this server"
-                        },
-                    );
-                    if events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path,
-                            operation: SftpOperation::ReadDirectory,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        close_resources(&transport, Some(&writer)).await;
-                        return;
-                    }
-                    continue;
-                }
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path,
-                                    operation: SftpOperation::ReadDirectory,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.read_directory(request_id, path.clone())
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path,
-                            operation: SftpOperation::ReadDirectory,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::ReadDirectoryTree { request_id, path }) => {
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path,
-                                    operation: SftpOperation::ReadDirectoryTree,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.read_directory_tree(request_id, path.clone())
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path,
-                            operation: SftpOperation::ReadDirectoryTree,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::ReadFile { request_id, path }) => {
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path,
-                                    operation: SftpOperation::ReadFile,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.read_file(request_id, path.clone())
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path,
-                            operation: SftpOperation::ReadFile,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::WriteFile {
-                request_id,
-                path,
-                expected_contents,
-                contents,
-            }) => {
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path,
-                                    operation: SftpOperation::WriteFile,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) =
-                        worker.write_file(request_id, path.clone(), expected_contents, contents)
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path,
-                            operation: SftpOperation::WriteFile,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::CreateFile { request_id, path }) => {
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path,
-                                    operation: SftpOperation::CreateFile,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.create_file(request_id, path.clone())
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path,
-                            operation: SftpOperation::CreateFile,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::CreateDirectories { request_id, paths }) => {
-                let error_path = paths.first().cloned().unwrap_or_default();
-                if sftp_available == Some(true) && sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            sftp_available = Some(false);
-                            if scp_available == Some(true) {
-                                if events
-                                    .send(ConnectionEvent::SftpAvailabilityChanged {
-                                        available: false,
-                                        scp_available: true,
-                                        message: Some(format!(
-                                            "Opening SFTP failed: {error}; using SCP upload fallback"
-                                        )),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    close_resources(&transport, Some(&writer)).await;
-                                    return;
-                                }
-                            } else {
-                                if events
-                                    .send(ConnectionEvent::SftpFailed {
-                                        request_id,
-                                        path: error_path,
-                                        operation: SftpOperation::CreateDirectory,
-                                        error,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    close_resources(&transport, Some(&writer)).await;
-                                    return;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                let result = if let Some(worker) = sftp_worker.as_ref() {
-                    worker.create_directories(request_id, paths)
-                } else if scp_available == Some(true) {
-                    let worker = scp_worker.get_or_insert_with(|| {
-                        ScpWorkerHandle::spawn(
-                            transport.clone(),
-                            events.clone(),
-                            transfer_rate_limiter.clone(),
-                        )
-                    });
-                    worker.create_directories(request_id, paths)
-                } else {
-                    Err(SshError::new(
-                        SshErrorKind::Sftp,
-                        if transfer_probe_pending {
-                            "File-transfer availability is still being checked"
-                        } else {
-                            "SFTP and SCP are unavailable on this server"
-                        },
-                    ))
-                };
-                if let Err(error) = result
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path: error_path,
-                            operation: SftpOperation::CreateDirectory,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::DeletePaths { request_id, paths }) => {
-                let error_path = paths.first().cloned().unwrap_or_default();
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id,
-                                    path: error_path,
-                                    operation: SftpOperation::DeletePaths,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.delete_paths(request_id, paths)
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id,
-                            path: error_path,
-                            operation: SftpOperation::DeletePaths,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::UploadFile {
-                transfer_id,
-                local_path,
-                remote_path,
-                overwrite,
-            }) => {
-                if sftp_available == Some(true) && sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(sftp_session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                sftp_session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            sftp_available = Some(false);
-                            if scp_available == Some(true) {
-                                if events
-                                    .send(ConnectionEvent::SftpAvailabilityChanged {
-                                        available: false,
-                                        scp_available: true,
-                                        message: Some(format!(
-                                            "Opening SFTP failed: {error}; using SCP upload fallback"
-                                        )),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    close_resources(&transport, Some(&writer)).await;
-                                    return;
-                                }
-                            } else {
-                                if events
-                                    .send(ConnectionEvent::SftpFailed {
-                                        request_id: transfer_id,
-                                        path: remote_path,
-                                        operation: SftpOperation::UploadFile,
-                                        error,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    close_resources(&transport, Some(&writer)).await;
-                                    return;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                let result = if let Some(worker) = sftp_worker.as_ref() {
-                    worker.upload_file(transfer_id, local_path, remote_path.clone(), overwrite)
-                } else if scp_available == Some(true) {
-                    let worker = scp_worker.get_or_insert_with(|| {
-                        ScpWorkerHandle::spawn(
-                            transport.clone(),
-                            events.clone(),
-                            transfer_rate_limiter.clone(),
-                        )
-                    });
-                    worker.upload_file(transfer_id, local_path, remote_path.clone(), overwrite)
-                } else {
-                    Err(SshError::new(
-                        SshErrorKind::Sftp,
-                        if transfer_probe_pending {
-                            "File-transfer availability is still being checked"
-                        } else {
-                            "SFTP and SCP are unavailable on this server"
-                        },
-                    ))
-                };
-                if let Err(error) = result
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id: transfer_id,
-                            path: remote_path,
-                            operation: SftpOperation::UploadFile,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::DownloadFile {
-                transfer_id,
-                remote_path,
-                local_path,
-                overwrite,
-            }) => {
-                if sftp_worker.is_none() {
-                    match transport.open_sftp().await {
-                        Ok(sftp_session) => {
-                            sftp_worker = Some(SftpWorkerHandle::spawn_with_limiter(
-                                sftp_session,
-                                events.clone(),
-                                transfer_rate_limiter.clone(),
-                            ));
-                        }
-                        Err(error) => {
-                            if events
-                                .send(ConnectionEvent::SftpFailed {
-                                    request_id: transfer_id,
-                                    path: remote_path,
-                                    operation: SftpOperation::DownloadFile,
-                                    error,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                close_resources(&transport, Some(&writer)).await;
-                                return;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.download_file(
-                        transfer_id,
-                        remote_path.clone(),
-                        local_path,
-                        overwrite,
-                    )
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id: transfer_id,
-                            path: remote_path,
-                            operation: SftpOperation::DownloadFile,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
-                    close_resources(&transport, Some(&writer)).await;
-                    return;
-                }
-            }
-            Some(ConnectionCommand::CancelTransfer { transfer_id }) => {
-                let mut cancellation_error = None;
-                if let Some(worker) = sftp_worker.as_ref()
-                    && let Err(error) = worker.cancel_transfer(transfer_id)
-                {
-                    cancellation_error = Some(error);
-                }
-                if let Some(worker) = scp_worker.as_ref()
-                    && let Err(error) = worker.cancel_transfer(transfer_id)
-                {
-                    cancellation_error.get_or_insert(error);
-                }
-                if let Some(error) = cancellation_error
-                    && events
-                        .send(ConnectionEvent::SftpFailed {
-                            request_id: transfer_id,
-                            path: String::new(),
-                            operation: SftpOperation::CancelTransfer,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                {
+            Some(ConnectionCommand::Files(command)) => {
+                if !files.dispatch(command, transfer_probe_pending).await {
                     close_resources(&transport, Some(&writer)).await;
                     return;
                 }
@@ -1661,20 +1036,12 @@ async fn report_failure(
     events: &mpsc::Sender<ConnectionEvent>,
 ) {
     tracing::warn!(
-        stage = error.stage().map(connection_stage_name).unwrap_or("unknown"),
+        stage = error.stage().map(ConnectionStage::diagnostic_name).unwrap_or("unknown"),
         error_kind = ?error.kind(),
         "SSH connection failed"
     );
-    session.mark_failed(error.clone());
+    session.mark_failed();
     let _ = events.send(ConnectionEvent::Failed(error)).await;
-}
-
-fn connection_stage_name(stage: &ConnectionStage) -> &'static str {
-    match stage {
-        ConnectionStage::Proxy => "proxy",
-        ConnectionStage::Jump { .. } => "jump",
-        ConnectionStage::Target { .. } => "target",
-    }
 }
 
 async fn finish_disconnection(

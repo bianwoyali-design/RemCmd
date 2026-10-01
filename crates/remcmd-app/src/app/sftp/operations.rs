@@ -1,21 +1,25 @@
-use super::sftp_state::{
-    PendingSftpDownloadTree, RemoteTextFormat, SFTP_ERROR_HINT_DURATION, SftpAvailability,
-    SftpBrowserPlacement, SftpCreateKind, SftpCreatePrompt, SftpTransferSpec, SftpTransferTask,
-    build_local_upload_plan, build_remote_download_plan, collapse_nested_remote_entries,
-    join_remote_relative, remote_join_path, remote_parent_path, remote_relative_path,
-    sftp_browser_placement_for_request,
-};
-use super::{
+use super::super::{
     ClipboardItem, ConnectionHandle, Context, FileEditor, FileEditorEvent, MAX_REMOTE_FILE_BYTES,
     PathPromptOptions, PromptButton, PromptLevel, RemCmdApp, RemoteDirectoryTree, RemoteFile,
     RemoteFileEntry, RemoteFileKind, SessionId, SessionState, SftpOperation, SftpTransferDirection,
     SshErrorKind, SshRuntime, TerminalTabView, TextField, Timer, Window,
 };
+use super::state::{
+    PendingSftpDownloadTree, RemoteTextFormat, SFTP_ERROR_HINT_DURATION, SftpAvailability,
+    SftpBrowserPlacement, SftpCreateKind, SftpCreatePrompt, SftpTransferSpec, SftpTransferTask,
+    collapse_nested_remote_entries, sftp_browser_placement_for_request,
+};
 use gpui::Focusable;
 use gpui::prelude::*;
+use remcmd_ssh::{
+    remote_path::{
+        join_remote_relative, remote_join_path, remote_parent_path, remote_relative_path,
+    },
+    transfer::{build_local_upload_plan, build_remote_download_plan},
+};
 
 impl RemCmdApp {
-    pub(super) fn ensure_sftp_directory(
+    pub(in crate::app) fn ensure_sftp_directory(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -45,7 +49,7 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn show_sftp_error(
+    pub(in crate::app) fn show_sftp_error(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -61,7 +65,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn fail_sftp_request(
+    pub(in crate::app) fn fail_sftp_request(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -84,7 +88,7 @@ impl RemCmdApp {
         failed
     }
 
-    pub(super) fn schedule_sftp_error_clear(
+    pub(in crate::app) fn schedule_sftp_error_clear(
         &self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -107,7 +111,7 @@ impl RemCmdApp {
         .detach();
     }
 
-    pub(super) fn request_sftp_directory(
+    pub(in crate::app) fn request_sftp_directory(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -155,7 +159,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn refresh_active_sftp_directory(
+    pub(in crate::app) fn refresh_active_sftp_directory(
         &mut self,
         placement: SftpBrowserPlacement,
         cx: &mut Context<Self>,
@@ -170,7 +174,7 @@ impl RemCmdApp {
         self.request_sftp_directory(session_id, placement, path, cx);
     }
 
-    pub(super) fn refresh_sftp_directory_for_session(
+    pub(in crate::app) fn refresh_sftp_directory_for_session(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -184,7 +188,7 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn toggle_remote_tree_directory(
+    pub(in crate::app) fn toggle_remote_tree_directory(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -210,7 +214,7 @@ impl RemCmdApp {
         self.expand_remote_tree_directory(session_id, placement, path, cx);
     }
 
-    pub(super) fn expand_remote_tree_directory(
+    pub(in crate::app) fn expand_remote_tree_directory(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -260,7 +264,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn open_remote_directory(
+    pub(in crate::app) fn open_remote_directory(
         &mut self,
         placement: SftpBrowserPlacement,
         path: String,
@@ -271,7 +275,7 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn open_parent_remote_directory(
+    pub(in crate::app) fn open_parent_remote_directory(
         &mut self,
         placement: SftpBrowserPlacement,
         cx: &mut Context<Self>,
@@ -286,7 +290,7 @@ impl RemCmdApp {
         self.request_sftp_directory(session_id, placement, parent, cx);
     }
 
-    pub(super) fn open_remote_file(
+    pub(in crate::app) fn open_remote_file(
         &mut self,
         path: String,
         editable: bool,
@@ -324,7 +328,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn complete_remote_file_read(
+    pub(in crate::app) fn complete_remote_file_read(
         &mut self,
         session_id: SessionId,
         request_id: u64,
@@ -372,7 +376,11 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn save_remote_file(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+    pub(in crate::app) fn save_remote_file(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
         let Some((handle, path, expected_contents, contents)) =
             self.session(session_id).and_then(|session| {
                 let handle = (session.connection_state == SessionState::Connected)
@@ -423,7 +431,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn complete_remote_file_write(
+    pub(in crate::app) fn complete_remote_file_write(
         &mut self,
         session_id: SessionId,
         request_id: u64,
@@ -443,7 +451,11 @@ impl RemCmdApp {
         state.write_request_id = None;
     }
 
-    pub(super) fn revert_remote_file(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+    pub(in crate::app) fn revert_remote_file(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
         let replacement = self
             .session(session_id)
             .and_then(|session| session.sftp.file.as_ref())
@@ -465,7 +477,11 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn close_remote_file(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+    pub(in crate::app) fn close_remote_file(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
         let dirty = self
             .session(session_id)
             .and_then(|session| session.sftp.file.as_ref())
@@ -484,7 +500,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn choose_sftp_uploads(
+    pub(in crate::app) fn choose_sftp_uploads(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -592,7 +608,7 @@ impl RemCmdApp {
         .detach();
     }
 
-    pub(super) fn choose_sftp_downloads(
+    pub(in crate::app) fn choose_sftp_downloads(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -686,7 +702,7 @@ impl RemCmdApp {
         .detach();
     }
 
-    pub(super) fn complete_directory_tree_download(
+    pub(in crate::app) fn complete_directory_tree_download(
         &mut self,
         session_id: SessionId,
         request_id: u64,
@@ -750,7 +766,7 @@ impl RemCmdApp {
         .detach();
     }
 
-    pub(super) fn selected_sftp_entries(
+    pub(in crate::app) fn selected_sftp_entries(
         &self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -760,7 +776,7 @@ impl RemCmdApp {
             .unwrap_or_default()
     }
 
-    pub(super) fn download_selected_sftp_entries(
+    pub(in crate::app) fn download_selected_sftp_entries(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -771,7 +787,7 @@ impl RemCmdApp {
         self.choose_sftp_downloads(session_id, placement, entries, cx);
     }
 
-    pub(super) fn open_selected_sftp_file(
+    pub(in crate::app) fn open_selected_sftp_file(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -789,7 +805,7 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn copy_selected_sftp_paths(
+    pub(in crate::app) fn copy_selected_sftp_paths(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -807,7 +823,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn delete_selected_sftp_entries(
+    pub(in crate::app) fn delete_selected_sftp_entries(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -869,7 +885,7 @@ impl RemCmdApp {
         .detach();
     }
 
-    pub(super) fn open_sftp_create_prompt(
+    pub(in crate::app) fn open_sftp_create_prompt(
         &mut self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -895,7 +911,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn submit_sftp_create(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn submit_sftp_create(&mut self, cx: &mut Context<Self>) {
         let Some(prompt) = self.sftp_create_prompt.as_ref() else {
             return;
         };
@@ -950,7 +966,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn enqueue_sftp_transfer(
+    pub(in crate::app) fn enqueue_sftp_transfer(
         &mut self,
         session_id: SessionId,
         transfer: SftpTransferSpec,
@@ -971,14 +987,14 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn active_sftp_transfer_count(&self) -> usize {
+    pub(in crate::app) fn active_sftp_transfer_count(&self) -> usize {
         self.sessions
             .iter()
             .map(|session| session.transfers.active_count())
             .sum()
     }
 
-    pub(super) fn take_next_queued_sftp_transfer(
+    pub(in crate::app) fn take_next_queued_sftp_transfer(
         &mut self,
     ) -> Option<(SessionId, Option<ConnectionHandle>, SftpTransferTask)> {
         if self.sessions.is_empty() {
@@ -1002,7 +1018,7 @@ impl RemCmdApp {
         None
     }
 
-    pub(super) fn start_queued_sftp_transfers(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn start_queued_sftp_transfers(&mut self, cx: &mut Context<Self>) {
         let connect_before_transfer = self.tr("sftp-connect-transfer");
         loop {
             if self.active_sftp_transfer_count()
@@ -1050,7 +1066,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn cancel_sftp_transfer(
+    pub(in crate::app) fn cancel_sftp_transfer(
         &mut self,
         session_id: SessionId,
         transfer_id: u64,
@@ -1082,7 +1098,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn replace_sftp_transfer_destination(
+    pub(in crate::app) fn replace_sftp_transfer_destination(
         &mut self,
         session_id: SessionId,
         transfer_id: u64,
@@ -1097,7 +1113,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn clear_finished_sftp_transfers(
+    pub(in crate::app) fn clear_finished_sftp_transfers(
         &mut self,
         session_id: SessionId,
         cx: &mut Context<Self>,
@@ -1108,7 +1124,7 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn complete_sftp_transfer(
+    pub(in crate::app) fn complete_sftp_transfer(
         &mut self,
         session_id: SessionId,
         transfer_id: u64,

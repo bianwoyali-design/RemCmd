@@ -1,8 +1,8 @@
 use super::{
     ActivePanel, AnyElement, Bounds, ClipboardItem, ConnectionCredential, ConnectionHandle,
     ConnectionStage, Context, CursorStyle, ElementInputHandler, EntityInputHandler, FocusHandle,
-    HostKeyInfo, IconName, IconTone, IntoElement, KeyDownEvent, Keystroke, LocalPtySize,
-    LocalTerminal, LocalTerminalEvent, LocalTerminalHandle, Localizer, MouseButton, MouseDownEvent,
+    HostKeyInfo, IconName, IconTone, IntoElement, KeyDownEvent, Keystroke, LocalTerminal,
+    LocalTerminalEvent, LocalTerminalHandle, Localizer, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaneId, PaneLayout, Pixels, PtySize, Range, Rc, RefCell,
     RemCmdApp, RightSidebarView, SIDEBAR_SFTP_REQUEST_ID_START, ScrollWheelEvent,
     ServerPerformanceState, SessionId, SessionState, SftpAvailability, SftpBrowserPlacement,
@@ -28,7 +28,7 @@ impl RemCmdApp {
 
     pub(super) fn start_local_terminal(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         let size = PtySize::new(TERMINAL_COLUMNS, TERMINAL_ROWS);
-        let terminal = LocalTerminal::spawn(local_pty_size(size));
+        let terminal = LocalTerminal::spawn(size);
         let (handle, mut events) = terminal.split();
         let sftp_unavailable = self.tr("sftp-ssh-only");
 
@@ -817,7 +817,6 @@ impl RemCmdApp {
                 false
             }
             LocalTerminalEvent::Resized(size) => {
-                let size = ssh_pty_size(size);
                 let dimensions_changed = self
                     .session_mut(session_id)
                     .and_then(|session| session.terminal.as_mut())
@@ -1548,7 +1547,7 @@ impl TerminalSession {
                 .local_terminal_handle
                 .as_ref()
                 .ok_or_else(|| "local terminal handle is missing".to_owned())?
-                .resize(local_pty_size(size))
+                .resize(size)
                 .map_err(|error| error.to_string()),
         }
     }
@@ -1909,14 +1908,6 @@ pub(super) fn terminal_layout_for_pixels(
         cell_width,
         cell_height,
     }
-}
-
-pub(super) fn local_pty_size(size: PtySize) -> LocalPtySize {
-    LocalPtySize::new(size.columns, size.rows).with_pixels(size.pixel_width, size.pixel_height)
-}
-
-pub(super) fn ssh_pty_size(size: LocalPtySize) -> PtySize {
-    PtySize::new(size.columns, size.rows).with_pixels(size.pixel_width, size.pixel_height)
 }
 
 pub(super) fn terminal_point_for_pixels(

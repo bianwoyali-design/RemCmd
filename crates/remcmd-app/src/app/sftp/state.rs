@@ -1,26 +1,27 @@
-use super::{
-    App, Entity, FileEditor, Localizer, Pixels, RemoteDirectory, RemoteDirectoryTree,
-    RemoteFileEntry, RemoteFileKind, ScrollHandle, SessionId, SftpOperation, SftpTransferDirection,
-    TextField, UniformListScrollHandle,
+use super::super::{
+    App, Entity, FileEditor, Localizer, Pixels, RemoteDirectory, RemoteFileEntry, RemoteFileKind,
+    ScrollHandle, SessionId, SftpOperation, SftpTransferDirection, TextField,
+    UniformListScrollHandle,
 };
+use remcmd_ssh::remote_path::{remote_file_name, remote_path_depth, remote_path_is_descendant};
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 
-pub(super) const SFTP_ERROR_HINT_DURATION: Duration = Duration::from_secs(3);
+pub(in crate::app) const SFTP_ERROR_HINT_DURATION: Duration = Duration::from_secs(3);
 
-pub(super) const SIDEBAR_SFTP_REQUEST_ID_START: u64 = 1 << 63;
+pub(in crate::app) const SIDEBAR_SFTP_REQUEST_ID_START: u64 = 1 << 63;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SftpBrowserPlacement {
+pub(in crate::app) enum SftpBrowserPlacement {
     Center,
     Sidebar,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) enum SftpAvailability {
+pub(in crate::app) enum SftpAvailability {
     #[default]
     Checking,
     Available,
@@ -29,7 +30,7 @@ pub(super) enum SftpAvailability {
 }
 
 impl SftpBrowserPlacement {
-    pub(super) fn element_suffix(self) -> &'static str {
+    pub(in crate::app) fn element_suffix(self) -> &'static str {
         match self {
             Self::Center => "center",
             Self::Sidebar => "sidebar",
@@ -37,37 +38,37 @@ impl SftpBrowserPlacement {
     }
 }
 
-pub(super) struct SftpBrowserState {
-    pub(super) path: String,
-    pub(super) entries: Vec<RemoteFileEntry>,
-    pub(super) file: Option<SftpFileState>,
-    pub(super) loading: bool,
-    pub(super) loaded: bool,
-    pub(super) error: Option<String>,
-    pub(super) next_request_id: u64,
-    pub(super) active_request_id: Option<u64>,
-    pub(super) active_request_path: Option<String>,
-    pub(super) resolved_source_path: Option<String>,
-    pub(super) tree_entries: HashMap<String, Vec<RemoteFileEntry>>,
-    pub(super) expanded_paths: HashSet<String>,
-    pub(super) tree_requests: HashMap<u64, String>,
-    pub(super) pending_download_trees: HashMap<u64, PendingSftpDownloadTree>,
-    pub(super) selected_paths: Vec<String>,
-    pub(super) selection_anchor: Option<String>,
-    pub(super) scroll_handle: UniformListScrollHandle,
-    pub(super) breadcrumb_scroll_handle: ScrollHandle,
-    pub(super) error_generation: u64,
+pub(in crate::app) struct SftpBrowserState {
+    pub(in crate::app) path: String,
+    pub(in crate::app) entries: Vec<RemoteFileEntry>,
+    pub(in crate::app) file: Option<SftpFileState>,
+    pub(in crate::app) loading: bool,
+    pub(in crate::app) loaded: bool,
+    pub(in crate::app) error: Option<String>,
+    pub(in crate::app) next_request_id: u64,
+    pub(in crate::app) active_request_id: Option<u64>,
+    pub(in crate::app) active_request_path: Option<String>,
+    pub(in crate::app) resolved_source_path: Option<String>,
+    pub(in crate::app) tree_entries: HashMap<String, Vec<RemoteFileEntry>>,
+    pub(in crate::app) expanded_paths: HashSet<String>,
+    pub(in crate::app) tree_requests: HashMap<u64, String>,
+    pub(in crate::app) pending_download_trees: HashMap<u64, PendingSftpDownloadTree>,
+    pub(in crate::app) selected_paths: Vec<String>,
+    pub(in crate::app) selection_anchor: Option<String>,
+    pub(in crate::app) scroll_handle: UniformListScrollHandle,
+    pub(in crate::app) breadcrumb_scroll_handle: ScrollHandle,
+    pub(in crate::app) error_generation: u64,
 }
 
 #[derive(Clone)]
-pub(super) struct SftpTreeRow {
-    pub(super) entry: RemoteFileEntry,
-    pub(super) depth: usize,
+pub(in crate::app) struct SftpTreeRow {
+    pub(in crate::app) entry: RemoteFileEntry,
+    pub(in crate::app) depth: usize,
 }
 
-pub(super) struct PendingSftpDownloadTree {
-    pub(super) destination: PathBuf,
-    pub(super) batch_id: u64,
+pub(in crate::app) struct PendingSftpDownloadTree {
+    pub(in crate::app) destination: PathBuf,
+    pub(in crate::app) batch_id: u64,
 }
 
 impl Default for SftpBrowserState {
@@ -97,19 +98,19 @@ impl Default for SftpBrowserState {
 }
 
 impl SftpBrowserState {
-    pub(super) fn with_request_id_start(next_request_id: u64) -> Self {
+    pub(in crate::app) fn with_request_id_start(next_request_id: u64) -> Self {
         Self {
             next_request_id,
             ..Self::default()
         }
     }
 
-    pub(super) fn needs_request(&self, path: &str) -> bool {
+    pub(in crate::app) fn needs_request(&self, path: &str) -> bool {
         self.active_request_path.as_deref() != Some(path)
             && self.resolved_source_path.as_deref() != Some(path)
     }
 
-    pub(super) fn begin_request(&mut self, path: String) -> u64 {
+    pub(in crate::app) fn begin_request(&mut self, path: String) -> u64 {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         if !self.loaded || self.path != path {
@@ -128,7 +129,11 @@ impl SftpBrowserState {
         request_id
     }
 
-    pub(super) fn complete_request(&mut self, request_id: u64, directory: RemoteDirectory) -> bool {
+    pub(in crate::app) fn complete_request(
+        &mut self,
+        request_id: u64,
+        directory: RemoteDirectory,
+    ) -> bool {
         if let Some(requested_path) = self.tree_requests.remove(&request_id) {
             self.expanded_paths.remove(&requested_path);
             self.expanded_paths.insert(directory.path.clone());
@@ -153,7 +158,7 @@ impl SftpBrowserState {
         true
     }
 
-    pub(super) fn fail_request(&mut self, request_id: u64, error: String) -> bool {
+    pub(in crate::app) fn fail_request(&mut self, request_id: u64, error: String) -> bool {
         if let Some(path) = self.tree_requests.remove(&request_id) {
             self.expanded_paths.remove(&path);
             self.set_error(error);
@@ -176,7 +181,7 @@ impl SftpBrowserState {
         true
     }
 
-    pub(super) fn stop_loading(&mut self) {
+    pub(in crate::app) fn stop_loading(&mut self) {
         self.loading = false;
         self.active_request_id = None;
         self.active_request_path = None;
@@ -188,13 +193,13 @@ impl SftpBrowserState {
         }
     }
 
-    pub(super) fn next_request_id(&mut self) -> u64 {
+    pub(in crate::app) fn next_request_id(&mut self) -> u64 {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         request_id
     }
 
-    pub(super) fn begin_tree_request(&mut self, path: String) -> u64 {
+    pub(in crate::app) fn begin_tree_request(&mut self, path: String) -> u64 {
         let request_id = self.next_request_id();
         self.tree_requests.insert(request_id, path.clone());
         self.expanded_paths.insert(path);
@@ -202,7 +207,11 @@ impl SftpBrowserState {
         request_id
     }
 
-    pub(super) fn begin_download_tree(&mut self, destination: PathBuf, batch_id: u64) -> u64 {
+    pub(in crate::app) fn begin_download_tree(
+        &mut self,
+        destination: PathBuf,
+        batch_id: u64,
+    ) -> u64 {
         let request_id = self.next_request_id();
         self.pending_download_trees.insert(
             request_id,
@@ -214,25 +223,25 @@ impl SftpBrowserState {
         request_id
     }
 
-    pub(super) fn take_download_tree(
+    pub(in crate::app) fn take_download_tree(
         &mut self,
         request_id: u64,
     ) -> Option<PendingSftpDownloadTree> {
         self.pending_download_trees.remove(&request_id)
     }
 
-    pub(super) fn set_error(&mut self, error: String) -> u64 {
+    pub(in crate::app) fn set_error(&mut self, error: String) -> u64 {
         self.error_generation = self.error_generation.wrapping_add(1);
         self.error = Some(error);
         self.error_generation
     }
 
-    pub(super) fn clear_error(&mut self) {
+    pub(in crate::app) fn clear_error(&mut self) {
         self.error_generation = self.error_generation.wrapping_add(1);
         self.error = None;
     }
 
-    pub(super) fn clear_error_if_current(&mut self, generation: u64) -> bool {
+    pub(in crate::app) fn clear_error_if_current(&mut self, generation: u64) -> bool {
         if self.error_generation != generation || self.error.is_none() {
             return false;
         }
@@ -240,7 +249,7 @@ impl SftpBrowserState {
         true
     }
 
-    pub(super) fn visible_rows(&self, tree: bool) -> Vec<SftpTreeRow> {
+    pub(in crate::app) fn visible_rows(&self, tree: bool) -> Vec<SftpTreeRow> {
         if !tree {
             return self
                 .entries
@@ -274,21 +283,26 @@ impl SftpBrowserState {
         rows
     }
 
-    pub(super) fn selected_entries(&self) -> Vec<RemoteFileEntry> {
+    pub(in crate::app) fn selected_entries(&self) -> Vec<RemoteFileEntry> {
         self.selected_paths
             .iter()
             .filter_map(|path| self.entry(path).cloned())
             .collect()
     }
 
-    pub(super) fn entry(&self, path: &str) -> Option<&RemoteFileEntry> {
+    pub(in crate::app) fn entry(&self, path: &str) -> Option<&RemoteFileEntry> {
         self.entries
             .iter()
             .chain(self.tree_entries.values().flatten())
             .find(|entry| entry.path == path)
     }
 
-    pub(super) fn select_path(&mut self, path: &str, modifiers: gpui::Modifiers, tree: bool) {
+    pub(in crate::app) fn select_path(
+        &mut self,
+        path: &str,
+        modifiers: gpui::Modifiers,
+        tree: bool,
+    ) {
         let visible_paths = self
             .visible_rows(tree)
             .into_iter()
@@ -337,7 +351,7 @@ impl SftpBrowserState {
         }
     }
 
-    pub(super) fn select_for_context_menu(&mut self, path: &str) {
+    pub(in crate::app) fn select_for_context_menu(&mut self, path: &str) {
         if !self.selected_paths.iter().any(|selected| selected == path) {
             self.selected_paths.clear();
             self.selected_paths.push(path.to_owned());
@@ -345,7 +359,7 @@ impl SftpBrowserState {
         }
     }
 
-    pub(super) fn remove_paths(&mut self, paths: &[String]) {
+    pub(in crate::app) fn remove_paths(&mut self, paths: &[String]) {
         self.selected_paths
             .retain(|selected| !paths.iter().any(|path| selected == path));
         self.tree_entries.retain(|path, _| {
@@ -367,7 +381,7 @@ impl SftpBrowserState {
         });
     }
 
-    pub(super) fn begin_file_request(&mut self, path: String, editable: bool) -> u64 {
+    pub(in crate::app) fn begin_file_request(&mut self, path: String, editable: bool) -> u64 {
         let request_id = self.next_request_id();
         self.file = Some(SftpFileState {
             path,
@@ -384,7 +398,7 @@ impl SftpBrowserState {
         request_id
     }
 
-    pub(super) fn begin_file_save(&mut self) -> Option<u64> {
+    pub(in crate::app) fn begin_file_save(&mut self) -> Option<u64> {
         let request_id = self.next_request_id();
         let file = self.file.as_mut()?;
         file.saving = true;
@@ -393,7 +407,7 @@ impl SftpBrowserState {
         Some(request_id)
     }
 
-    pub(super) fn fail_file_request(
+    pub(in crate::app) fn fail_file_request(
         &mut self,
         request_id: u64,
         operation: SftpOperation,
@@ -426,7 +440,7 @@ impl SftpBrowserState {
         }
     }
 
-    pub(super) fn display_path(&self) -> &str {
+    pub(in crate::app) fn display_path(&self) -> &str {
         self.file
             .as_ref()
             .map(|file| file.path.as_str())
@@ -434,41 +448,41 @@ impl SftpBrowserState {
     }
 }
 
-pub(super) struct SftpFileState {
-    pub(super) path: String,
-    pub(super) original_contents: Vec<u8>,
-    pub(super) editor: Option<Entity<FileEditor>>,
-    pub(super) text_format: Option<RemoteTextFormat>,
-    pub(super) loading: bool,
-    pub(super) saving: bool,
-    pub(super) error: Option<String>,
-    pub(super) editable: bool,
-    pub(super) read_request_id: Option<u64>,
-    pub(super) write_request_id: Option<u64>,
+pub(in crate::app) struct SftpFileState {
+    pub(in crate::app) path: String,
+    pub(in crate::app) original_contents: Vec<u8>,
+    pub(in crate::app) editor: Option<Entity<FileEditor>>,
+    pub(in crate::app) text_format: Option<RemoteTextFormat>,
+    pub(in crate::app) loading: bool,
+    pub(in crate::app) saving: bool,
+    pub(in crate::app) error: Option<String>,
+    pub(in crate::app) editable: bool,
+    pub(in crate::app) read_request_id: Option<u64>,
+    pub(in crate::app) write_request_id: Option<u64>,
 }
 
-pub(super) struct SftpContextMenu {
-    pub(super) session_id: SessionId,
-    pub(super) placement: SftpBrowserPlacement,
-    pub(super) position: gpui::Point<Pixels>,
+pub(in crate::app) struct SftpContextMenu {
+    pub(in crate::app) session_id: SessionId,
+    pub(in crate::app) placement: SftpBrowserPlacement,
+    pub(in crate::app) position: gpui::Point<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SftpCreateKind {
+pub(in crate::app) enum SftpCreateKind {
     File,
     Directory,
 }
 
-pub(super) struct SftpCreatePrompt {
-    pub(super) session_id: SessionId,
-    pub(super) placement: SftpBrowserPlacement,
-    pub(super) kind: SftpCreateKind,
-    pub(super) input: Entity<TextField>,
-    pub(super) error: Option<String>,
+pub(in crate::app) struct SftpCreatePrompt {
+    pub(in crate::app) session_id: SessionId,
+    pub(in crate::app) placement: SftpBrowserPlacement,
+    pub(in crate::app) kind: SftpCreateKind,
+    pub(in crate::app) input: Entity<TextField>,
+    pub(in crate::app) error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SftpTransferState {
+pub(in crate::app) enum SftpTransferState {
     Queued,
     Running,
     Cancelling,
@@ -479,50 +493,50 @@ pub(super) enum SftpTransferState {
 }
 
 impl SftpTransferState {
-    pub(super) const fn is_active(self) -> bool {
+    pub(in crate::app) const fn is_active(self) -> bool {
         matches!(self, Self::Running | Self::Cancelling)
     }
 
-    pub(super) const fn is_finished(self) -> bool {
+    pub(in crate::app) const fn is_finished(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct SftpTransferTask {
-    pub(super) id: u64,
-    pub(super) batch_id: u64,
-    pub(super) direction: SftpTransferDirection,
-    pub(super) local_path: PathBuf,
-    pub(super) remote_path: String,
-    pub(super) overwrite: bool,
-    pub(super) state: SftpTransferState,
-    pub(super) transferred: u64,
-    pub(super) total: Option<u64>,
-    pub(super) error: Option<String>,
+pub(in crate::app) struct SftpTransferTask {
+    pub(in crate::app) id: u64,
+    pub(in crate::app) batch_id: u64,
+    pub(in crate::app) direction: SftpTransferDirection,
+    pub(in crate::app) local_path: PathBuf,
+    pub(in crate::app) remote_path: String,
+    pub(in crate::app) overwrite: bool,
+    pub(in crate::app) state: SftpTransferState,
+    pub(in crate::app) transferred: u64,
+    pub(in crate::app) total: Option<u64>,
+    pub(in crate::app) error: Option<String>,
 }
 
-pub(super) struct SftpTransferSpec {
-    pub(super) batch_id: u64,
-    pub(super) direction: SftpTransferDirection,
-    pub(super) local_path: PathBuf,
-    pub(super) remote_path: String,
-    pub(super) overwrite: bool,
-    pub(super) expected_total: Option<u64>,
+pub(in crate::app) struct SftpTransferSpec {
+    pub(in crate::app) batch_id: u64,
+    pub(in crate::app) direction: SftpTransferDirection,
+    pub(in crate::app) local_path: PathBuf,
+    pub(in crate::app) remote_path: String,
+    pub(in crate::app) overwrite: bool,
+    pub(in crate::app) expected_total: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct SftpTransferBatchProgress {
-    pub(super) task_count: usize,
-    pub(super) settled_count: usize,
-    pub(super) failed_count: usize,
-    pub(super) transferred: u64,
-    pub(super) total: Option<u64>,
-    pub(super) fraction: f32,
+pub(in crate::app) struct SftpTransferBatchProgress {
+    pub(in crate::app) task_count: usize,
+    pub(in crate::app) settled_count: usize,
+    pub(in crate::app) failed_count: usize,
+    pub(in crate::app) transferred: u64,
+    pub(in crate::app) total: Option<u64>,
+    pub(in crate::app) fraction: f32,
 }
 
 impl SftpTransferTask {
-    pub(super) fn display_name(&self) -> String {
+    pub(in crate::app) fn display_name(&self) -> String {
         match self.direction {
             SftpTransferDirection::Upload => self
                 .local_path
@@ -533,7 +547,7 @@ impl SftpTransferTask {
         }
     }
 
-    pub(super) fn status_text(&self, localizer: &Localizer) -> String {
+    pub(in crate::app) fn status_text(&self, localizer: &Localizer) -> String {
         match self.state {
             SftpTransferState::Queued => localizer.text("sftp-queued"),
             SftpTransferState::Running => self.total.map_or_else(
@@ -563,21 +577,21 @@ impl SftpTransferTask {
 }
 
 #[derive(Default)]
-pub(super) struct SftpTransferQueue {
-    pub(super) next_id: u64,
-    pub(super) next_batch_id: u64,
-    pub(super) tasks: Vec<SftpTransferTask>,
+pub(in crate::app) struct SftpTransferQueue {
+    pub(in crate::app) next_id: u64,
+    pub(in crate::app) next_batch_id: u64,
+    pub(in crate::app) tasks: Vec<SftpTransferTask>,
 }
 
 impl SftpTransferQueue {
-    pub(super) fn begin_batch(&mut self) -> u64 {
+    pub(in crate::app) fn begin_batch(&mut self) -> u64 {
         self.next_batch_id = self.next_batch_id.max(1);
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
         batch_id
     }
 
-    pub(super) fn enqueue_in_batch(
+    pub(in crate::app) fn enqueue_in_batch(
         &mut self,
         batch_id: u64,
         direction: SftpTransferDirection,
@@ -604,7 +618,7 @@ impl SftpTransferQueue {
         id
     }
 
-    pub(super) fn start_next(&mut self) -> Option<SftpTransferTask> {
+    pub(in crate::app) fn start_next(&mut self) -> Option<SftpTransferTask> {
         let task = self
             .tasks
             .iter_mut()
@@ -614,18 +628,23 @@ impl SftpTransferQueue {
         Some(task.clone())
     }
 
-    pub(super) fn active_count(&self) -> usize {
+    pub(in crate::app) fn active_count(&self) -> usize {
         self.tasks
             .iter()
             .filter(|task| task.state.is_active())
             .count()
     }
 
-    pub(super) fn task_mut(&mut self, id: u64) -> Option<&mut SftpTransferTask> {
+    pub(in crate::app) fn task_mut(&mut self, id: u64) -> Option<&mut SftpTransferTask> {
         self.tasks.iter_mut().find(|task| task.id == id)
     }
 
-    pub(super) fn mark_progress(&mut self, id: u64, transferred: u64, total: Option<u64>) -> bool {
+    pub(in crate::app) fn mark_progress(
+        &mut self,
+        id: u64,
+        transferred: u64,
+        total: Option<u64>,
+    ) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
         };
@@ -642,7 +661,7 @@ impl SftpTransferQueue {
         true
     }
 
-    pub(super) fn latest_batch_progress(
+    pub(in crate::app) fn latest_batch_progress(
         &self,
         direction: SftpTransferDirection,
     ) -> Option<SftpTransferBatchProgress> {
@@ -717,14 +736,14 @@ impl SftpTransferQueue {
         })
     }
 
-    pub(super) fn latest_batch_direction(&self) -> Option<SftpTransferDirection> {
+    pub(in crate::app) fn latest_batch_direction(&self) -> Option<SftpTransferDirection> {
         self.tasks
             .iter()
             .max_by_key(|task| task.batch_id)
             .map(|task| task.direction)
     }
 
-    pub(super) fn mark_conflict(&mut self, id: u64) -> bool {
+    pub(in crate::app) fn mark_conflict(&mut self, id: u64) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
         };
@@ -735,7 +754,7 @@ impl SftpTransferQueue {
         true
     }
 
-    pub(super) fn mark_completed(&mut self, id: u64, bytes: u64) -> bool {
+    pub(in crate::app) fn mark_completed(&mut self, id: u64, bytes: u64) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
         };
@@ -752,7 +771,7 @@ impl SftpTransferQueue {
         true
     }
 
-    pub(super) fn mark_failed(&mut self, id: u64, error: String) -> bool {
+    pub(in crate::app) fn mark_failed(&mut self, id: u64, error: String) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
         };
@@ -764,7 +783,7 @@ impl SftpTransferQueue {
         true
     }
 
-    pub(super) fn mark_cancelled(&mut self, id: u64) -> bool {
+    pub(in crate::app) fn mark_cancelled(&mut self, id: u64) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
         };
@@ -776,7 +795,7 @@ impl SftpTransferQueue {
         true
     }
 
-    pub(super) fn retry_with_overwrite(&mut self, id: u64) -> bool {
+    pub(in crate::app) fn retry_with_overwrite(&mut self, id: u64) -> bool {
         let Some(task) = self.task_mut(id) else {
             return false;
         };
@@ -791,7 +810,7 @@ impl SftpTransferQueue {
         true
     }
 
-    pub(super) fn begin_cancel(&mut self, id: u64) -> Option<bool> {
+    pub(in crate::app) fn begin_cancel(&mut self, id: u64) -> Option<bool> {
         let task = self.task_mut(id)?;
         match task.state {
             SftpTransferState::Running => {
@@ -809,11 +828,11 @@ impl SftpTransferQueue {
         }
     }
 
-    pub(super) fn clear_finished(&mut self) {
+    pub(in crate::app) fn clear_finished(&mut self) {
         self.tasks.retain(|task| !task.state.is_finished());
     }
 
-    pub(super) fn fail_pending(&mut self, error: &str) {
+    pub(in crate::app) fn fail_pending(&mut self, error: &str) {
         for task in &mut self.tasks {
             if !task.state.is_finished() {
                 task.state = SftpTransferState::Failed;
@@ -824,7 +843,7 @@ impl SftpTransferQueue {
 }
 
 impl SftpFileState {
-    pub(super) fn is_dirty(&self, cx: &App) -> bool {
+    pub(in crate::app) fn is_dirty(&self, cx: &App) -> bool {
         if !self.editable {
             return false;
         }
@@ -836,7 +855,7 @@ impl SftpFileState {
             })
     }
 
-    pub(super) fn edited_contents(&self, cx: &App) -> Option<Vec<u8>> {
+    pub(in crate::app) fn edited_contents(&self, cx: &App) -> Option<Vec<u8>> {
         if !self.editable {
             return None;
         }
@@ -848,19 +867,19 @@ impl SftpFileState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RemoteTextFormat {
-    pub(super) utf8_bom: bool,
-    pub(super) line_ending: RemoteLineEnding,
+pub(in crate::app) struct RemoteTextFormat {
+    pub(in crate::app) utf8_bom: bool,
+    pub(in crate::app) line_ending: RemoteLineEnding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RemoteLineEnding {
+pub(in crate::app) enum RemoteLineEnding {
     Lf,
     CrLf,
 }
 
 impl RemoteTextFormat {
-    pub(super) fn decode(contents: &[u8]) -> Option<(Self, String)> {
+    pub(in crate::app) fn decode(contents: &[u8]) -> Option<(Self, String)> {
         if contents.contains(&0) {
             return None;
         }
@@ -886,7 +905,7 @@ impl RemoteTextFormat {
         ))
     }
 
-    pub(super) fn encode(self, text: &str) -> Vec<u8> {
+    pub(in crate::app) fn encode(self, text: &str) -> Vec<u8> {
         let text = match self.line_ending {
             RemoteLineEnding::Lf => text.to_owned(),
             RemoteLineEnding::CrLf => text.replace('\n', "\r\n"),
@@ -900,7 +919,7 @@ impl RemoteTextFormat {
     }
 }
 
-pub(super) fn sftp_browser_placement_for_request(request_id: u64) -> SftpBrowserPlacement {
+pub(in crate::app) fn sftp_browser_placement_for_request(request_id: u64) -> SftpBrowserPlacement {
     if request_id >= SIDEBAR_SFTP_REQUEST_ID_START {
         SftpBrowserPlacement::Sidebar
     } else {
@@ -908,146 +927,7 @@ pub(super) fn sftp_browser_placement_for_request(request_id: u64) -> SftpBrowser
     }
 }
 
-pub(super) fn remote_parent_path(path: &str) -> Option<String> {
-    let path = path.trim_end_matches('/');
-    if path.is_empty() || path == "." {
-        return None;
-    }
-
-    match path.rfind('/') {
-        Some(0) => Some("/".into()).filter(|_| path != "/"),
-        Some(separator) => Some(path[..separator].into()),
-        None => Some(".".into()),
-    }
-}
-
-pub(super) fn remote_file_name(path: &str) -> &str {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("download")
-}
-
-pub(super) fn remote_join_path(directory: &str, name: &str) -> String {
-    if directory == "/" {
-        format!("/{name}")
-    } else if directory == "." {
-        name.to_owned()
-    } else {
-        format!("{}/{}", directory.trim_end_matches('/'), name)
-    }
-}
-
-pub(super) struct LocalUploadPlan {
-    pub(super) directories: Vec<String>,
-    pub(super) files: Vec<(PathBuf, String, u64)>,
-}
-
-pub(super) fn build_local_upload_plan(
-    selected_paths: &[PathBuf],
-    remote_directory: &str,
-) -> std::io::Result<LocalUploadPlan> {
-    let mut directories = Vec::new();
-    let mut files = Vec::new();
-    let mut pending = Vec::new();
-
-    for path in selected_paths {
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let remote_path = remote_join_path(remote_directory, name.to_string_lossy().as_ref());
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            directories.push(remote_path.clone());
-            pending.push((path.clone(), remote_path));
-        } else if metadata.is_file() {
-            files.push((path.clone(), remote_path, metadata.len()));
-        }
-    }
-
-    while let Some((local_directory, remote_directory)) = pending.pop() {
-        let mut entries = std::fs::read_dir(&local_directory)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let local_path = entry.path();
-            let metadata = std::fs::symlink_metadata(&local_path)?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            let remote_path = remote_join_path(
-                &remote_directory,
-                entry.file_name().to_string_lossy().as_ref(),
-            );
-            if metadata.is_dir() {
-                directories.push(remote_path.clone());
-                pending.push((local_path, remote_path));
-            } else if metadata.is_file() {
-                files.push((local_path, remote_path, metadata.len()));
-            }
-        }
-    }
-
-    directories.sort_by(|left, right| {
-        remote_path_depth(left)
-            .cmp(&remote_path_depth(right))
-            .then_with(|| left.cmp(right))
-    });
-    directories.dedup();
-    files.sort_by(|left, right| left.1.cmp(&right.1));
-    files.dedup_by(|left, right| left.1 == right.1);
-    Ok(LocalUploadPlan { directories, files })
-}
-
-pub(super) fn build_remote_download_plan(
-    tree: RemoteDirectoryTree,
-    destination: PathBuf,
-) -> std::io::Result<Vec<(PathBuf, String, Option<u64>)>> {
-    std::fs::create_dir_all(&destination)?;
-    for directory in tree.directories {
-        let relative = remote_relative_path(&tree.root, &directory).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "remote directory escaped its requested root",
-            )
-        })?;
-        std::fs::create_dir_all(join_remote_relative(&destination, relative))?;
-    }
-
-    tree.files
-        .into_iter()
-        .map(|file| {
-            let relative = remote_relative_path(&tree.root, &file.path).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "remote file escaped its requested root",
-                )
-            })?;
-            let local_path = join_remote_relative(&destination, relative);
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            Ok((local_path, file.path, file.size))
-        })
-        .collect()
-}
-
-pub(super) fn remote_relative_path<'a>(root: &str, path: &'a str) -> Option<&'a str> {
-    if path == root {
-        return Some("");
-    }
-    path.strip_prefix(root.trim_end_matches('/'))?
-        .strip_prefix('/')
-}
-
-pub(super) fn join_remote_relative(root: &Path, relative: &str) -> PathBuf {
-    relative
-        .split('/')
-        .filter(|component| !component.is_empty() && *component != "." && *component != "..")
-        .fold(root.to_path_buf(), |path, component| path.join(component))
-}
-
-pub(super) fn collapse_nested_remote_entries(
+pub(in crate::app) fn collapse_nested_remote_entries(
     mut entries: Vec<RemoteFileEntry>,
 ) -> Vec<RemoteFileEntry> {
     entries.sort_by(|left, right| {
@@ -1069,25 +949,7 @@ pub(super) fn collapse_nested_remote_entries(
     entries
 }
 
-pub(super) fn remote_path_is_descendant(parent: &str, candidate: &str) -> bool {
-    if parent == candidate {
-        return false;
-    }
-    if parent == "/" {
-        return candidate.starts_with('/') && candidate.len() > 1;
-    }
-    candidate
-        .strip_prefix(parent.trim_end_matches('/'))
-        .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-pub(super) fn remote_path_depth(path: &str) -> usize {
-    path.split('/')
-        .filter(|component| !component.is_empty())
-        .count()
-}
-
-pub(super) fn remote_breadcrumbs(path: &str) -> Vec<(String, String)> {
+pub(in crate::app) fn remote_breadcrumbs(path: &str) -> Vec<(String, String)> {
     if !path.starts_with('/') {
         return vec![(path.to_owned(), path.to_owned())];
     }
@@ -1101,7 +963,7 @@ pub(super) fn remote_breadcrumbs(path: &str) -> Vec<(String, String)> {
     breadcrumbs
 }
 
-pub(super) fn format_remote_size(bytes: u64) -> String {
+pub(in crate::app) fn format_remote_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
@@ -1144,29 +1006,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_parent_path_handles_root_and_nested_directories() {
-        assert_eq!(remote_parent_path("/"), None);
-        assert_eq!(remote_parent_path("/home"), Some("/".into()));
-        assert_eq!(remote_parent_path("/home/test/"), Some("/home".into()));
-        assert_eq!(remote_parent_path("relative"), Some(".".into()));
-    }
-
-    #[test]
     fn remote_file_sizes_use_compact_binary_units() {
         assert_eq!(format_remote_size(42), "42 B");
         assert_eq!(format_remote_size(1536), "1.5 KB");
         assert_eq!(format_remote_size(2 * 1024 * 1024), "2.0 MB");
-    }
-
-    #[test]
-    fn remote_transfer_paths_join_root_relative_and_nested_directories() {
-        assert_eq!(remote_join_path("/", "notes.txt"), "/notes.txt");
-        assert_eq!(remote_join_path(".", "notes.txt"), "notes.txt");
-        assert_eq!(
-            remote_join_path("/home/test/", "notes.txt"),
-            "/home/test/notes.txt"
-        );
-        assert_eq!(remote_file_name("/home/test/notes.txt"), "notes.txt");
     }
 
     #[test]
@@ -1261,67 +1104,6 @@ mod tests {
                 ("test".into(), "/home/test".into()),
                 ("projects".into(), "/home/test/projects".into()),
             ]
-        );
-    }
-
-    #[test]
-    fn recursive_upload_plan_preserves_empty_directories_and_files() {
-        let temporary = tempfile::tempdir().unwrap();
-        let project = temporary.path().join("project");
-        std::fs::create_dir_all(project.join("empty")).unwrap();
-        std::fs::create_dir_all(project.join("src")).unwrap();
-        std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
-
-        let plan = build_local_upload_plan(std::slice::from_ref(&project), "/home/test").unwrap();
-
-        assert_eq!(
-            plan.directories,
-            vec![
-                "/home/test/project",
-                "/home/test/project/empty",
-                "/home/test/project/src",
-            ]
-        );
-        assert_eq!(
-            plan.files,
-            vec![(
-                project.join("src/main.rs"),
-                "/home/test/project/src/main.rs".into(),
-                13,
-            )]
-        );
-    }
-
-    #[test]
-    fn recursive_download_plan_creates_empty_directories_and_file_targets() {
-        let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("project");
-        let plan = build_remote_download_plan(
-            RemoteDirectoryTree {
-                root: "/home/test/project".into(),
-                directories: vec![
-                    "/home/test/project".into(),
-                    "/home/test/project/empty".into(),
-                    "/home/test/project/src".into(),
-                ],
-                files: vec![remote_entry(
-                    "/home/test/project/src/main.rs",
-                    RemoteFileKind::File,
-                )],
-            },
-            destination.clone(),
-        )
-        .unwrap();
-
-        assert!(destination.join("empty").is_dir());
-        assert!(destination.join("src").is_dir());
-        assert_eq!(
-            plan,
-            vec![(
-                destination.join("src/main.rs"),
-                "/home/test/project/src/main.rs".into(),
-                Some(12),
-            )]
         );
     }
 
