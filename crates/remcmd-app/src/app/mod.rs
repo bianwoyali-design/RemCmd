@@ -23,15 +23,11 @@ mod menus;
 #[cfg(target_os = "macos")]
 mod native_material;
 mod openssh_import;
+mod performance;
 mod profiles;
 mod quick_commands;
 mod settings;
-#[path = "sftp/operations.rs"]
-mod sftp_operations;
-#[path = "sftp/state.rs"]
-mod sftp_state;
-#[path = "sftp/view.rs"]
-mod sftp_view;
+mod sftp;
 mod shell;
 mod terminal_session;
 mod updates;
@@ -47,13 +43,14 @@ use lifecycle::ExitTarget;
 #[cfg(target_os = "macos")]
 pub(crate) use lifecycle::request_application_exit;
 use menus::{WINDOWS_CHROME_HEIGHT, WindowsMenu, application_menus, configure_application_menu};
+use performance::ServerPerformanceState;
 use profiles::{ProfileAuthKind, ProfileContextMenu, ProfileEditor, profile_auth_label};
 use quick_commands::{BOTTOM_PANEL_DEFAULT_HEIGHT, QuickCommandPrompt, clamp_bottom_panel_height};
 use settings::{
     SettingsSelector, UI_MONOSPACE_FONT_FAMILY, normalize_terminal_font_families,
     resolve_terminal_font_family,
 };
-use sftp_state::{
+use sftp::{
     SIDEBAR_SFTP_REQUEST_ID_START, SftpAvailability, SftpBrowserPlacement, SftpBrowserState,
     SftpContextMenu, SftpCreateKind, SftpCreatePrompt, SftpTransferQueue, format_remote_size,
     sftp_browser_placement_for_request,
@@ -61,8 +58,7 @@ use sftp_state::{
 use shell::{
     AboutWindow, ActivePanel, BottomPanelResize, CommandTooltip, MOTION_INSTANT_DURATION,
     MOTION_STANDARD_DURATION, RIGHT_SIDEBAR_DEFAULT_WIDTH, RightSidebarView, SIDEBAR_DEFAULT_WIDTH,
-    ServerPerformanceState, SidebarResize, content_top_inset, platform_chrome_height,
-    session_state_key,
+    SidebarResize, content_top_inset, platform_chrome_height, session_state_key,
 };
 #[cfg(target_os = "macos")]
 use shell::{TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y};
@@ -99,17 +95,17 @@ use gpui::{
 use secrecy::SecretString;
 
 use remcmd_core::{
-    AuthConfig, ConnectionProfile, ConnectionRoute, LanguageMode, ProxyConfig, TabLayout,
+    AuthConfig, ConnectionProfile, ConnectionRoute, LanguageMode, ProxyConfig, PtySize, TabLayout,
     TerminalSettings, ThemeMode, TransferSettings,
 };
 use remcmd_diagnostics::{
     DiagnosticFilter, DiagnosticLevel, DiagnosticStore, Diagnostics, SupportBundleContext,
     default_log_directory, fallback_log_directory,
 };
-use remcmd_local::{LocalPtySize, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
+use remcmd_local::{LocalTerminal, LocalTerminalEvent, LocalTerminalHandle};
 use remcmd_ssh::{
     AuthMethod, ConnectionEvent, ConnectionHandle, ConnectionPlan, ConnectionStage, ConnectionStep,
-    HostKeyInfo, MAX_REMOTE_FILE_BYTES, PtySize, RemoteDirectory, RemoteDirectoryTree, RemoteFile,
+    HostKeyInfo, MAX_REMOTE_FILE_BYTES, RemoteDirectory, RemoteDirectoryTree, RemoteFile,
     RemoteFileEntry, RemoteFileKind, RuntimeProxy, ServerPerformanceSnapshot, SessionState,
     SftpOperation, SftpTransferDirection, ShellEvent, SshConnection, SshError, SshErrorKind,
     TransferRateLimiter, proxy_command_content_digest,

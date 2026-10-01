@@ -1,3 +1,6 @@
+mod pty;
+pub use pty::PtySize;
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -61,13 +64,6 @@ impl ConnectionProfile {
             route: ConnectionRoute::default(),
             source: None,
         }
-    }
-
-    pub fn samples() -> Vec<Self> {
-        vec![
-            Self::new("local-dev", "Local Dev", "127.0.0.1", 22, "dev"),
-            Self::new("staging", "Staging", "192.168.1.10", 22, "ubuntu"),
-        ]
     }
 
     pub fn address(&self) -> String {

@@ -5351,7 +5351,6 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "tokio",
- "tracing",
  "unic-langid",
  "unicode-segmentation",
  "windows-sys 0.59.0",
@@ -5389,6 +5388,7 @@ name = "remcmd-local"
 version = "0.1.0"
 dependencies = [
  "portable-pty",
+ "remcmd-core",
  "tokio",
 ]
 

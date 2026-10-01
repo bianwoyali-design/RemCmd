@@ -84,78 +84,80 @@ fn connection_handle_forwards_commands() {
     );
     assert_eq!(
         command_rx.try_recv().expect("directory command"),
-        ConnectionCommand::ReadDirectory {
+        ConnectionCommand::Files(FileCommand::ReadDirectory {
             request_id: 7,
             path: "/home/test".into(),
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("directory tree command"),
-        ConnectionCommand::ReadDirectoryTree {
+        ConnectionCommand::Files(FileCommand::ReadDirectoryTree {
             request_id: 8,
             path: "/home/test/projects".into(),
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("file command"),
-        ConnectionCommand::ReadFile {
+        ConnectionCommand::Files(FileCommand::ReadFile {
             request_id: 9,
             path: "/home/test/notes.txt".into(),
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("file write command"),
-        ConnectionCommand::WriteFile {
+        ConnectionCommand::Files(FileCommand::WriteFile {
             request_id: 10,
             path: "/home/test/notes.txt".into(),
             expected_contents: b"old".to_vec(),
             contents: b"new".to_vec(),
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("file creation command"),
-        ConnectionCommand::CreateFile {
+        ConnectionCommand::Files(FileCommand::CreateFile {
             request_id: 11,
             path: "/home/test/new.txt".into(),
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("directory creation command"),
-        ConnectionCommand::CreateDirectories {
+        ConnectionCommand::Files(FileCommand::CreateDirectories {
             request_id: 12,
             paths: vec!["/home/test/new".into(), "/home/test/new/nested".into()],
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("recursive deletion command"),
-        ConnectionCommand::DeletePaths {
+        ConnectionCommand::Files(FileCommand::DeletePaths {
             request_id: 13,
             paths: vec!["/home/test/old".into()],
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("upload command"),
-        ConnectionCommand::UploadFile {
+        ConnectionCommand::Files(FileCommand::Transfer {
+            direction: SftpTransferDirection::Upload,
             transfer_id: 14,
             local_path: PathBuf::from("/tmp/upload.txt"),
             remote_path: "/home/test/upload.txt".into(),
             overwrite: false,
-        }
+        })
     );
     assert_eq!(
         command_rx.try_recv().expect("download command"),
-        ConnectionCommand::DownloadFile {
+        ConnectionCommand::Files(FileCommand::Transfer {
+            direction: SftpTransferDirection::Download,
             transfer_id: 15,
             remote_path: "/home/test/download.txt".into(),
             local_path: PathBuf::from("/tmp/download.txt"),
             overwrite: true,
-        }
+        })
     );
     assert_eq!(
         command_rx
             .try_recv()
             .expect("transfer cancellation command"),
-        ConnectionCommand::CancelTransfer { transfer_id: 15 }
+        ConnectionCommand::Files(FileCommand::CancelTransfer { transfer_id: 15 })
     );
     assert_eq!(
         command_rx.try_recv().expect("performance command"),

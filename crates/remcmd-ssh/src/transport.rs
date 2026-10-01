@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -27,9 +28,7 @@ use tokio::{
 };
 
 use crate::{
-    AuthMethod, ConnectionPlan, ConnectionStage, HostKeyInfo, PtySize, RuntimeProxy, SshError,
-    SshErrorKind, SshShell,
-    plan::ConnectionStep,
+    AuthMethod, HostKeyInfo, PtySize, RuntimeProxy, SshError, SshErrorKind, SshShell,
     proxy::{BoxedStream, open_initial_stream},
     shell_integration,
 };
@@ -309,43 +308,21 @@ impl SshTransport {
         auth: AuthMethod,
         timeout: Duration,
     ) -> Result<(), SshError> {
-        match auth {
+        let result = match auth {
             AuthMethod::None => {
-                let authentication = handle.authenticate_none(username);
-                let result = tokio::time::timeout(timeout, authentication)
-                    .await
-                    .map_err(|_| {
-                        SshError::new(
-                            SshErrorKind::Timeout,
-                            format!("authentication for user {username} timed out"),
-                        )
-                    })?
-                    .map_err(SshError::from)?;
-
-                Self::validate_authentication_result(result, username)
+                Self::authentication_response(handle.authenticate_none(username), username, timeout)
+                    .await?
             }
-
             AuthMethod::Password { password } => {
-                // Reading SecretString requires an explicit ExposeSecret call.
-                let authentication =
-                    handle.authenticate_password(username, password.expose_secret());
-
-                let result = tokio::time::timeout(timeout, authentication)
-                    .await
-                    .map_err(|_| {
-                        SshError::new(
-                            SshErrorKind::Timeout,
-                            format!("authentication for user {username} timed out"),
-                        )
-                    })?
-                    .map_err(SshError::from)?;
-
-                Self::validate_authentication_result(result, username)
+                Self::authentication_response(
+                    handle.authenticate_password(username, password.expose_secret()),
+                    username,
+                    timeout,
+                )
+                .await?
             }
-
             AuthMethod::PrivateKey { path, passphrase } => {
                 let private_key = Self::load_private_key(path, passphrase).await?;
-
                 let hash_algorithm = if matches!(private_key.algorithm(), Algorithm::Rsa { .. }) {
                     handle
                         .best_supported_rsa_hash()
@@ -355,39 +332,41 @@ impl SshTransport {
                 } else {
                     None
                 };
-
                 let private_key = PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_algorithm);
-
-                let authentication = handle.authenticate_publickey(username, private_key);
-
-                let result = tokio::time::timeout(timeout, authentication)
-                    .await
-                    .map_err(|_| {
-                        SshError::new(
-                            SshErrorKind::Timeout,
-                            format!("authentication for user {username} timed out"),
-                        )
-                    })?
-                    .map_err(SshError::from)?;
-
-                Self::validate_authentication_result(result, username)
+                Self::authentication_response(
+                    handle.authenticate_publickey(username, private_key),
+                    username,
+                    timeout,
+                )
+                .await?
             }
-
             AuthMethod::Agent => {
-                // Apply one timeout to connecting, listing keys, signing,
-                // and waiting for the server's authentication response.
-                let authentication = Self::authenticate_with_agent(handle, username);
-
-                tokio::time::timeout(timeout, authentication)
-                    .await
-                    .map_err(|_| {
-                        SshError::new(
-                            SshErrorKind::Timeout,
-                            format!("authentication for user {username} timed out"),
-                        )
-                    })?
+                // Keep the agent's connect, listing, signing, and response within one timeout.
+                return Self::authentication_response(
+                    Self::authenticate_with_agent(handle, username),
+                    username,
+                    timeout,
+                )
+                .await;
             }
-        }
+        };
+        Self::validate_authentication_result(result, username)
+    }
+
+    async fn authentication_response<T, E: Into<SshError>>(
+        authentication: impl Future<Output = Result<T, E>>,
+        username: &str,
+        timeout: Duration,
+    ) -> Result<T, SshError> {
+        tokio::time::timeout(timeout, authentication)
+            .await
+            .map_err(|_| {
+                SshError::new(
+                    SshErrorKind::Timeout,
+                    format!("authentication for user {username} timed out"),
+                )
+            })?
+            .map_err(Into::into)
     }
 
     fn validate_authentication_result(
@@ -599,83 +578,6 @@ impl SshTransport {
             .await
     }
 
-    /// Establishes and authenticates an SSH connection.
-    ///
-    /// This convenience API remains available to callers that do not need
-    /// progress events for the individual connection stages.
-    pub async fn connect(profile: &ConnectionProfile, auth: AuthMethod) -> Result<Self, SshError> {
-        Self::connect_plan(ConnectionPlan::direct(profile.clone(), auth)).await
-    }
-
-    /// Establishes every proxy, jump, and target step in a validated runtime plan.
-    pub async fn connect_plan(plan: ConnectionPlan) -> Result<Self, SshError> {
-        plan.validate()?;
-        let (target, jumps, proxy) = plan.into_parts();
-        let jump_total = jumps.len();
-        let mut steps = jumps
-            .into_iter()
-            .enumerate()
-            .map(|(index, step)| {
-                let stage = ConnectionStage::Jump {
-                    index: index + 1,
-                    total: jump_total,
-                    profile_id: step.profile.id.clone(),
-                };
-                (step, stage)
-            })
-            .collect::<Vec<_>>();
-        let target_stage = ConnectionStage::Target {
-            profile_id: target.profile.id.clone(),
-        };
-        steps.push((target, target_stage));
-
-        let mut established: Vec<Self> = Vec::new();
-        for (step_index, (step, stage)) in steps.into_iter().enumerate() {
-            let ConnectionStep { profile, auth } = step;
-            let opened = if step_index == 0 {
-                Self::open_first(&profile, proxy.as_ref()).await
-            } else {
-                established
-                    .last()
-                    .expect("a previous jump transport exists")
-                    .open_via(&profile)
-                    .await
-            };
-            let mut transport = match opened {
-                Ok(TransportOpen::Connected(transport)) => transport,
-                Ok(TransportOpen::UnknownHostKey(pending)) => {
-                    Self::disconnect_established(&established).await;
-                    return Err(pending.rejected_error().at_stage(stage));
-                }
-                Err(error) => {
-                    Self::disconnect_established(&established).await;
-                    return Err(error.at_stage(stage));
-                }
-            };
-            let auth_kind = auth.kind();
-            if let Err(error) = transport.authenticate(&profile.username, auth).await {
-                let _ = transport.disconnect_current().await;
-                Self::disconnect_established(&established).await;
-                tracing::warn!(
-                    stage = stage_name(&stage),
-                    authentication = ?auth_kind,
-                    result = "failed",
-                    "SSH authentication failed"
-                );
-                return Err(error.at_stage(stage));
-            }
-            tracing::info!(
-                stage = stage_name(&stage),
-                authentication = ?auth_kind,
-                result = "success",
-                "SSH authentication completed"
-            );
-            established.push(transport);
-        }
-
-        Ok(Self::combine_chain(established))
-    }
-
     pub async fn open_shell(&self, size: PtySize) -> Result<SshShell, SshError> {
         tokio::time::timeout(
             SHELL_OPEN_TIMEOUT,
@@ -814,41 +716,25 @@ impl SshTransport {
     /// Dropping SshTransport also closes local resources, but this method
     /// lets the server receive an explicit and orderly disconnect message.
     pub async fn disconnect(&self) -> Result<(), SshError> {
-        let mut first_error = self.disconnect_current().await.err();
-        for handle in self.upstream_handles.iter().rev() {
-            match handle
+        let mut first_error = None;
+        for handle in std::iter::once(&self.handle).chain(self.upstream_handles.iter().rev()) {
+            if let Err(error) = handle
                 .disconnect(
                     russh::Disconnect::ByApplication,
                     "Disconnected by user",
                     "en",
                 )
                 .await
-                .map_err(SshError::from)
             {
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Ok(()) | Err(_) => {}
+                first_error.get_or_insert_with(|| SshError::from(error));
             }
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    async fn disconnect_current(&self) -> Result<(), SshError> {
-        self.handle
-            .disconnect(
-                russh::Disconnect::ByApplication,
-                "Disconnected by user",
-                "en",
-            )
-            .await
-            .map_err(SshError::from)
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(crate) async fn disconnect_established(transports: &[Self]) {
         for transport in transports.iter().rev() {
-            let _ = transport.disconnect_current().await;
+            let _ = transport.disconnect().await;
         }
     }
 
@@ -865,11 +751,6 @@ impl SshTransport {
         final_transport.upstream_handles = upstream_handles;
         final_transport
     }
-
-    /// Reports whether the russh background connection has stopped.
-    pub fn is_closed(&self) -> bool {
-        self.handle.is_closed()
-    }
 }
 
 pub(crate) async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
@@ -880,14 +761,6 @@ pub(crate) async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshE
         )
     })?;
     race_tcp_connections(addresses).await
-}
-
-fn stage_name(stage: &ConnectionStage) -> &'static str {
-    match stage {
-        ConnectionStage::Proxy => "proxy",
-        ConnectionStage::Jump { .. } => "jump",
-        ConnectionStage::Target { .. } => "target",
-    }
 }
 
 async fn race_tcp_connections(

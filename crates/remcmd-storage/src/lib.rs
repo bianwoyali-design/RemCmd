@@ -10,6 +10,7 @@ use remcmd_core::{
     UpdateSettings,
 };
 use secrecy::SecretString;
+use serde::{Serialize, de::DeserializeOwned};
 
 mod credentials;
 mod openssh;
@@ -24,17 +25,17 @@ pub use openssh::{
 };
 
 pub fn default_profiles_path() -> io::Result<PathBuf> {
-    let project_dirs = ProjectDirs::from("", "", "RemCmd")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "app data directory not found"))?;
-
-    Ok(project_dirs.data_dir().join("profiles.json"))
+    default_data_path("profiles.json")
 }
 
 pub fn default_settings_path() -> io::Result<PathBuf> {
+    default_data_path("settings.json")
+}
+
+fn default_data_path(name: &str) -> io::Result<PathBuf> {
     let project_dirs = ProjectDirs::from("", "", "RemCmd")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "app data directory not found"))?;
-
-    Ok(project_dirs.data_dir().join("settings.json"))
+    Ok(project_dirs.data_dir().join(name))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
@@ -75,15 +76,11 @@ pub fn ensure_profiles_file(path: &Path) -> io::Result<()> {
 }
 
 pub fn load_profiles(path: &Path) -> io::Result<Vec<ConnectionProfile>> {
-    let content = fs::read_to_string(path)?;
-
-    serde_json::from_str(&content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    read_json(path)
 }
 
 pub fn save_profiles(path: &Path, profiles: &[ConnectionProfile]) -> io::Result<()> {
-    let content = serde_json::to_string_pretty(profiles).map_err(io::Error::other)?;
-    atomic_write(path, content.as_bytes())
+    write_json(path, profiles)
 }
 
 pub fn save_profiles_with_route_secrets(
@@ -141,17 +138,24 @@ pub fn load_settings(path: &Path) -> io::Result<AppSettings> {
         return Ok(AppSettings::default());
     }
 
-    let content = fs::read_to_string(path)?;
-
-    let mut settings: AppSettings = serde_json::from_str(&content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut settings: AppSettings = read_json(path)?;
     settings.transfers = settings.transfers.normalized();
     settings.terminal = settings.terminal.normalized();
     Ok(settings)
 }
 
 pub fn save_settings(path: &Path, settings: &AppSettings) -> io::Result<()> {
-    let content = serde_json::to_string_pretty(settings).map_err(io::Error::other)?;
+    write_json(path, settings)
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> io::Result<()> {
+    let content = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
     atomic_write(path, content.as_bytes())
 }
 

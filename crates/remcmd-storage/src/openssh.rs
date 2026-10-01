@@ -47,10 +47,6 @@ impl OpenSshImportCandidate {
         self.proxy_command.as_ref()
     }
 
-    pub fn take_proxy_command(&mut self) -> Option<SecretString> {
-        self.proxy_command.take()
-    }
-
     pub fn identity_file(&self) -> Option<&Path> {
         self.identity_file.as_deref()
     }

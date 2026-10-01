@@ -1,11 +1,6 @@
-use remcmd_core::ConnectionProfile;
-
 use crate::{SshError, SshErrorKind};
 
 /// Describes the current lifecycle stage of one SSH session.
-///
-/// The actual error is stored separately by `SshSession`, so this enum
-/// remains small, copyable, and convenient for UI state checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionState {
     /// No connection exists and a new connection may be started.
@@ -43,53 +38,27 @@ impl SessionState {
     }
 }
 
-/// Represents one runtime SSH session.
-///
-/// It owns a snapshot of the connection profile. Editing the saved profile
-/// later will not unexpectedly change an active session.
-#[derive(Debug)]
+/// Validates lifecycle transitions while connection plans and events own their data.
+#[derive(Debug, Default)]
 pub struct SshSession {
-    profile: ConnectionProfile,
     state: SessionState,
-    last_error: Option<SshError>,
 }
 
 impl SshSession {
-    /// Creates a session without opening a network connection.
-    pub fn new(profile: ConnectionProfile) -> Self {
-        Self {
-            profile,
-            state: SessionState::Disconnected,
-            last_error: None,
-        }
-    }
-
-    /// Returns the connection settings used by this session.
-    pub fn profile(&self) -> &ConnectionProfile {
-        &self.profile
-    }
-
     /// Returns the current state by value because SessionState is Copy.
     pub const fn state(&self) -> SessionState {
         self.state
     }
 
-    /// Returns the most recent failure without cloning its message.
-    pub fn last_error(&self) -> Option<&SshError> {
-        self.last_error.as_ref()
-    }
-
     /// Starts a new connection attempt.
     ///
-    /// Only disconnected or failed sessions may reconnect. Retrying clears
-    /// the previous error because it belongs to the old attempt.
+    /// Only disconnected or failed sessions may reconnect.
     pub fn begin_connect(&mut self) -> Result<(), SshError> {
         if !self.state.can_connect() {
             return Err(self.invalid_transition("start connecting"));
         }
 
         self.state = SessionState::Connecting;
-        self.last_error = None;
         Ok(())
     }
 
@@ -127,16 +96,12 @@ impl SshSession {
             SessionState::Disconnecting,
             SessionState::Disconnected,
             "finish disconnecting",
-        )?;
-
-        self.last_error = None;
-        Ok(())
+        )
     }
 
-    /// Records an operational failure from any connection stage.
-    pub fn mark_failed(&mut self, error: SshError) {
+    /// Marks an operational failure from any connection stage.
+    pub fn mark_failed(&mut self) {
         self.state = SessionState::Failed;
-        self.last_error = Some(error);
     }
 
     /// Performs a transition that has exactly one valid source state.
@@ -189,22 +154,16 @@ mod tests {
         assert!(!SessionState::Failed.can_disconnect());
     }
 
-    fn test_profile() -> ConnectionProfile {
-        ConnectionProfile::new("test-profile", "Test Server", "127.0.0.1", 22, "tester")
-    }
-
     #[test]
-    fn new_session_starts_disconnected_without_an_error() {
-        let session = SshSession::new(test_profile());
+    fn new_session_starts_disconnected() {
+        let session = SshSession::default();
 
-        assert_eq!(session.profile().id, "test-profile");
         assert_eq!(session.state(), SessionState::Disconnected);
-        assert!(session.last_error().is_none());
     }
 
     #[test]
     fn session_follows_successful_connection_lifecycle() {
-        let mut session = SshSession::new(test_profile());
+        let mut session = SshSession::default();
 
         session.begin_connect().expect("connection should start");
         assert_eq!(session.state(), SessionState::Connecting);
@@ -232,7 +191,7 @@ mod tests {
 
     #[test]
     fn invalid_transition_preserves_current_state() {
-        let mut session = SshSession::new(test_profile());
+        let mut session = SshSession::default();
 
         let error = session
             .mark_connected()
@@ -240,29 +199,19 @@ mod tests {
 
         assert_eq!(error.kind(), SshErrorKind::InvalidState);
         assert_eq!(session.state(), SessionState::Disconnected);
-        assert!(session.last_error().is_none());
     }
 
     #[test]
-    fn retry_after_failure_clears_previous_error() {
-        let mut session = SshSession::new(test_profile());
+    fn failed_session_can_retry() {
+        let mut session = SshSession::default();
 
         session.begin_connect().expect("connection should start");
-        session.mark_failed(SshError::new(SshErrorKind::Network, "connection refused"));
+        session.mark_failed();
 
         assert_eq!(session.state(), SessionState::Failed);
-
-        assert_eq!(
-            session
-                .last_error()
-                .expect("failure should be stored")
-                .message(),
-            "connection refused"
-        );
 
         session.begin_connect().expect("retry should start");
 
         assert_eq!(session.state(), SessionState::Connecting);
-        assert!(session.last_error().is_none());
     }
 }

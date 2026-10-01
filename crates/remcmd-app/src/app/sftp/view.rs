@@ -1,17 +1,18 @@
-use super::sftp_state::{
-    SftpAvailability, SftpBrowserPlacement, SftpContextMenu, SftpCreateKind, SftpTransferState,
-    SftpTreeRow, format_remote_size, remote_breadcrumbs, remote_parent_path,
-};
-use super::{
+use super::super::{
     AnyElement, CancelSftpCreate, Context, FontWeight, IconName, IconTone, MouseButton, Range,
     RemCmdApp, RemoteFileKind, SessionId, SessionState, SftpTransferDirection, SharedString,
     SubmitSftpCreate, TextButtonTone, UI_MONOSPACE_FONT_FAMILY, Window, div, icon, px, text_button,
     uniform_list,
 };
+use super::state::{
+    SftpAvailability, SftpBrowserPlacement, SftpContextMenu, SftpCreateKind, SftpTransferState,
+    SftpTreeRow, format_remote_size, remote_breadcrumbs,
+};
 use gpui::prelude::*;
+use remcmd_ssh::remote_path::remote_parent_path;
 
 impl RemCmdApp {
-    pub(super) fn render_sftp_context_menu(
+    pub(in crate::app) fn render_sftp_context_menu(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
@@ -158,7 +159,7 @@ impl RemCmdApp {
             .into_any_element()
     }
 
-    pub(super) fn render_sftp_create_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(in crate::app) fn render_sftp_create_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(prompt) = self.sftp_create_prompt.as_ref() else {
             return div().into_any_element();
         };
@@ -237,7 +238,7 @@ impl RemCmdApp {
             .into_any_element()
     }
 
-    pub(super) fn render_sftp_browser(
+    pub(in crate::app) fn render_sftp_browser(
         &self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -501,7 +502,7 @@ impl RemCmdApp {
             .into_any_element()
     }
 
-    pub(super) fn render_sftp_availability_hint(
+    pub(in crate::app) fn render_sftp_availability_hint(
         &self,
         title: impl Into<SharedString>,
         message: impl Into<SharedString>,
@@ -610,7 +611,7 @@ impl RemCmdApp {
             .into_any_element()
     }
 
-    pub(super) fn render_sftp_breadcrumbs(
+    pub(in crate::app) fn render_sftp_breadcrumbs(
         &self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -676,7 +677,7 @@ impl RemCmdApp {
         breadcrumbs
     }
 
-    pub(super) fn render_sftp_entry_rows(
+    pub(in crate::app) fn render_sftp_entry_rows(
         &self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -891,7 +892,7 @@ impl RemCmdApp {
         rows
     }
 
-    pub(super) fn render_sftp_transfer_queue(
+    pub(in crate::app) fn render_sftp_transfer_queue(
         &self,
         session_id: SessionId,
         placement: SftpBrowserPlacement,
@@ -1206,7 +1207,7 @@ impl RemCmdApp {
         queue.into_any_element()
     }
 
-    pub(super) fn render_sftp_file(
+    pub(in crate::app) fn render_sftp_file(
         &self,
         session_id: SessionId,
         cx: &mut Context<Self>,

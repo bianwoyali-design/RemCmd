@@ -1,27 +1,17 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::VecDeque, path::Path};
 
 use russh::{Channel, ChannelMsg, client};
 use tokio::{
     fs,
     io::AsyncReadExt,
-    sync::mpsc,
-    task::JoinSet,
     time::{Duration, timeout},
 };
 
 use crate::{
-    ConnectionEvent, SftpOperation, SftpTransferDirection, SshError, SshErrorKind, SshTransport,
-    TransferRateLimiter,
-    sftp::{
+    SshError, SshErrorKind, SshTransport,
+    transfer::{
         TRANSFER_CHUNK_BYTES, TransferContext, TransferResult, remote_transfer_temporary_path,
-        transfer_io_error, transfer_result_event, transfer_temporary_suffix,
+        transfer_io_error, transfer_temporary_suffix,
     },
 };
 
@@ -29,167 +19,10 @@ const SCP_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SCP_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SCP_ERROR_BYTES: usize = 16 * 1024;
 
-enum ScpCommand {
-    CreateDirectories {
-        request_id: u64,
-        paths: Vec<String>,
-    },
-    UploadFile {
-        transfer_id: u64,
-        local_path: PathBuf,
-        remote_path: String,
-        overwrite: bool,
-    },
-    CancelTransfer {
-        transfer_id: u64,
-    },
-}
-
-pub(crate) struct ScpWorkerHandle {
-    command_tx: mpsc::UnboundedSender<ScpCommand>,
-}
-
-impl ScpWorkerHandle {
-    pub(crate) fn spawn(
-        transport: Arc<SshTransport>,
-        events: mpsc::Sender<ConnectionEvent>,
-        rate_limiter: Arc<TransferRateLimiter>,
-    ) -> Self {
-        let (command_tx, mut commands) = mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            let cancellations = Arc::new(Mutex::new(HashMap::<u64, Arc<AtomicBool>>::new()));
-            let mut transfer_tasks = JoinSet::new();
-
-            while let Some(command) = commands.recv().await {
-                while transfer_tasks.try_join_next().is_some() {}
-                match command {
-                    ScpCommand::CreateDirectories { request_id, paths } => {
-                        let error_path = paths.first().cloned().unwrap_or_default();
-                        let event = match create_directories(&transport, &paths).await {
-                            Ok(()) => ConnectionEvent::DirectoriesCreated { request_id, paths },
-                            Err(error) => ConnectionEvent::SftpFailed {
-                                request_id,
-                                path: error_path,
-                                operation: SftpOperation::CreateDirectory,
-                                error,
-                            },
-                        };
-                        if events.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                    ScpCommand::UploadFile {
-                        transfer_id,
-                        local_path,
-                        remote_path,
-                        overwrite,
-                    } => {
-                        let cancellation = Arc::new(AtomicBool::new(false));
-                        cancellations
-                            .lock()
-                            .expect("SCP cancellation map should not be poisoned")
-                            .insert(transfer_id, cancellation.clone());
-                        let transport = transport.clone();
-                        let events = events.clone();
-                        let cancellations = cancellations.clone();
-                        let rate_limiter = rate_limiter.clone();
-                        transfer_tasks.spawn(async move {
-                            let context = TransferContext::new(
-                                transfer_id,
-                                cancellation,
-                                events.clone(),
-                                rate_limiter,
-                            );
-                            let result = upload_file(
-                                &transport,
-                                &local_path,
-                                &remote_path,
-                                overwrite,
-                                &context,
-                            )
-                            .await;
-                            let event = transfer_result_event(
-                                transfer_id,
-                                remote_path,
-                                SftpTransferDirection::Upload,
-                                result,
-                            );
-                            let _ = events.send(event).await;
-                            cancellations
-                                .lock()
-                                .expect("SCP cancellation map should not be poisoned")
-                                .remove(&transfer_id);
-                        });
-                    }
-                    ScpCommand::CancelTransfer { transfer_id } => {
-                        if let Some(cancellation) = cancellations
-                            .lock()
-                            .expect("SCP cancellation map should not be poisoned")
-                            .get(&transfer_id)
-                        {
-                            cancellation.store(true, Ordering::Release);
-                        }
-                    }
-                }
-            }
-
-            for cancellation in cancellations
-                .lock()
-                .expect("SCP cancellation map should not be poisoned")
-                .values()
-            {
-                cancellation.store(true, Ordering::Release);
-            }
-            if timeout(Duration::from_secs(2), async {
-                while transfer_tasks.join_next().await.is_some() {}
-            })
-            .await
-            .is_err()
-            {
-                transfer_tasks.abort_all();
-                while transfer_tasks.join_next().await.is_some() {}
-            }
-        });
-
-        Self { command_tx }
-    }
-
-    pub(crate) fn create_directories(
-        &self,
-        request_id: u64,
-        paths: Vec<String>,
-    ) -> Result<(), SshError> {
-        self.command_tx
-            .send(ScpCommand::CreateDirectories { request_id, paths })
-            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SCP upload worker is not running"))
-    }
-
-    pub(crate) fn upload_file(
-        &self,
-        transfer_id: u64,
-        local_path: PathBuf,
-        remote_path: String,
-        overwrite: bool,
-    ) -> Result<(), SshError> {
-        self.command_tx
-            .send(ScpCommand::UploadFile {
-                transfer_id,
-                local_path,
-                remote_path,
-                overwrite,
-            })
-            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SCP upload worker is not running"))
-    }
-
-    pub(crate) fn cancel_transfer(&self, transfer_id: u64) -> Result<(), SshError> {
-        self.command_tx
-            .send(ScpCommand::CancelTransfer { transfer_id })
-            .map_err(|_| SshError::new(SshErrorKind::Sftp, "SCP upload worker is not running"))
-    }
-}
-
-async fn create_directories(transport: &SshTransport, paths: &[String]) -> Result<(), SshError> {
+pub(crate) async fn create_directories(
+    transport: &SshTransport,
+    paths: &[String],
+) -> Result<(), SshError> {
     for path in paths {
         let command = format!("mkdir -p -- {}", shell_quote(path)?);
         transport.execute(&command).await?;
@@ -197,7 +30,7 @@ async fn create_directories(transport: &SshTransport, paths: &[String]) -> Resul
     Ok(())
 }
 
-async fn upload_file(
+pub(crate) async fn upload_file(
     transport: &SshTransport,
     local_path: &Path,
     remote_path: &str,
@@ -542,10 +375,13 @@ async fn local_file_mode(path: &Path) -> Result<u32, SshError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ConnectionEvent, SftpTransferDirection, TransferRateLimiter};
     use rand::rng;
     use russh::{ChannelId, server};
-    use tokio::{net::TcpListener, task::JoinHandle};
+    use std::sync::{Arc, Mutex};
+    use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
+    use crate::remote_files::{FileCommand, RemoteFiles};
     use crate::transport::ClientHandler;
 
     #[derive(Default)]
@@ -560,6 +396,7 @@ mod tests {
 
     struct ScpServer {
         state: Arc<Mutex<ScpServerState>>,
+        scp_channel: Option<ChannelId>,
     }
 
     impl server::Handler for ScpServer {
@@ -579,6 +416,18 @@ mod tests {
             Ok(())
         }
 
+        async fn subsystem_request(
+            &mut self,
+            channel: ChannelId,
+            _name: &str,
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_failure(channel)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+
         async fn exec_request(
             &mut self,
             channel: ChannelId,
@@ -593,6 +442,7 @@ mod tests {
                 .push(command.clone());
             session.channel_success(channel)?;
             if command.starts_with("scp -t ") {
+                self.scp_channel = Some(channel);
                 session.data(channel, vec![0])?;
             } else {
                 if command.contains("printf 'exists\\n'") {
@@ -611,6 +461,9 @@ mod tests {
             data: &[u8],
             session: &mut server::Session,
         ) -> Result<(), Self::Error> {
+            if self.scp_channel != Some(channel) {
+                return Ok(());
+            }
             let mut acknowledge_header = false;
             let mut finish = false;
             {
@@ -686,6 +539,7 @@ mod tests {
                 stream,
                 ScpServer {
                     state: handler_state,
+                    scp_channel: None,
                 },
             )
             .await
@@ -733,26 +587,8 @@ mod tests {
         assert!(validate_remote_path("/tmp/bad\nname").is_err());
     }
 
-    #[test]
-    fn scp_completion_uses_the_existing_transfer_event_contract() {
-        assert_eq!(
-            transfer_result_event(
-                7,
-                "/tmp/report".into(),
-                SftpTransferDirection::Upload,
-                Ok(TransferResult::Completed(42)),
-            ),
-            ConnectionEvent::TransferCompleted {
-                transfer_id: 7,
-                direction: SftpTransferDirection::Upload,
-                path: "/tmp/report".into(),
-                bytes: 42,
-            }
-        );
-    }
-
     #[tokio::test]
-    async fn uploads_file_bytes_over_the_scp_sink_protocol() {
+    async fn sftp_open_failure_routes_uploads_to_scp_and_keeps_download_errors_local() {
         let (address, public_key, server_task, state) = start_scp_server().await;
         let temporary = tempfile::tempdir().expect("temporary directory");
         let known_hosts = temporary.path().join("known_hosts");
@@ -775,24 +611,63 @@ mod tests {
                 .expect("SCP test authentication")
                 .success()
         );
-        let transport = SshTransport::from_test_handle(handle);
+        let transport = Arc::new(SshTransport::from_test_handle(handle));
         let local_path = temporary.path().join("report.txt");
         fs::write(&local_path, b"SCP fallback payload")
             .await
             .expect("local SCP payload");
         let (events, mut event_rx) = mpsc::channel(8);
-        let context = TransferContext::new(
-            17,
-            Arc::new(AtomicBool::new(false)),
+        let mut files = RemoteFiles::new(
+            transport.clone(),
             events,
             Arc::new(TransferRateLimiter::default()),
         );
-
-        let result = upload_file(&transport, &local_path, "/tmp/report.txt", false, &context)
+        assert!(
+            files
+                .dispatch(
+                    FileCommand::ReadDirectory {
+                        request_id: 16,
+                        path: "/tmp".into()
+                    },
+                    true
+                )
+                .await
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ConnectionEvent::SftpFailed {
+                request_id: 16,
+                operation: crate::SftpOperation::ReadDirectory,
+                ..
+            })
+        ));
+        files.sftp_available = Some(true);
+        files.scp_available = Some(true);
+        assert!(
+            timeout(
+                Duration::from_secs(12),
+                files.dispatch(
+                    FileCommand::Transfer {
+                        transfer_id: 17,
+                        direction: SftpTransferDirection::Upload,
+                        local_path,
+                        remote_path: "/tmp/report.txt".into(),
+                        overwrite: false,
+                    },
+                    false
+                )
+            )
             .await
-            .expect("SCP protocol upload");
-        assert!(matches!(result, TransferResult::Completed(20)));
-
+            .expect("SFTP failure should fall back after the channel-open timeout")
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ConnectionEvent::SftpAvailabilityChanged {
+                available: false,
+                scp_available: true,
+                ..
+            })
+        ));
         assert_eq!(
             event_rx.recv().await,
             Some(ConnectionEvent::TransferProgress {
@@ -801,6 +676,42 @@ mod tests {
                 total: Some(20),
             })
         );
+        assert_eq!(
+            timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap(),
+            Some(ConnectionEvent::TransferCompleted {
+                transfer_id: 17,
+                direction: SftpTransferDirection::Upload,
+                path: "/tmp/report.txt".into(),
+                bytes: 20,
+            })
+        );
+        assert!(
+            timeout(
+                Duration::from_secs(12),
+                files.dispatch(
+                    FileCommand::Transfer {
+                        transfer_id: 18,
+                        direction: SftpTransferDirection::Download,
+                        local_path: temporary.path().join("download.txt"),
+                        remote_path: "/tmp/report.txt".into(),
+                        overwrite: false,
+                    },
+                    false
+                )
+            )
+            .await
+            .expect("unsupported download should fail after the channel-open timeout")
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ConnectionEvent::SftpFailed {
+                request_id: 18,
+                operation: crate::SftpOperation::DownloadFile,
+                ..
+            })
+        ));
         {
             let state = state.lock().expect("SCP test state should not be poisoned");
             assert_eq!(state.commands.len(), 4);

@@ -1,3 +1,4 @@
+use crate::text_edit;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -182,7 +183,10 @@ impl TextField {
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
+            self.move_to(
+                text_edit::previous_boundary(&self.content, self.cursor_offset()),
+                cx,
+            );
         } else {
             self.move_to(self.selected_range.start, cx);
         }
@@ -190,18 +194,27 @@ impl TextField {
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.selected_range.end), cx);
+            self.move_to(
+                text_edit::next_boundary(&self.content, self.selected_range.end),
+                cx,
+            );
         } else {
             self.move_to(self.selected_range.end, cx);
         }
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+        self.select_to(
+            text_edit::previous_boundary(&self.content, self.cursor_offset()),
+            cx,
+        );
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.next_boundary(self.cursor_offset()), cx);
+        self.select_to(
+            text_edit::next_boundary(&self.content, self.cursor_offset()),
+            cx,
+        );
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -219,14 +232,20 @@ impl TextField {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+            self.select_to(
+                text_edit::previous_boundary(&self.content, self.cursor_offset()),
+                cx,
+            );
         }
         self.replace_text_in_range(None, "", window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx);
+            self.select_to(
+                text_edit::next_boundary(&self.content, self.cursor_offset()),
+                cx,
+            );
         }
         self.replace_text_in_range(None, "", window, cx);
     }
@@ -370,59 +389,14 @@ impl TextField {
         cx.notify();
     }
 
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-
-        utf8_offset
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-
-        utf16_offset
-    }
-
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+        text_edit::offset_to_utf16(&self.content, range.start)
+            ..text_edit::offset_to_utf16(&self.content, range.end)
     }
 
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(idx, _)| (idx < offset).then_some(idx))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .find_map(|(idx, _)| (idx > offset).then_some(idx))
-            .unwrap_or(self.content.len())
+        text_edit::offset_from_utf16(&self.content, range_utf16.start)
+            ..text_edit::offset_from_utf16(&self.content, range_utf16.end)
     }
 }
 
@@ -553,7 +527,7 @@ impl EntityInputHandler for TextField {
         let display_offset = last_layout.index_for_x(line_point.x)?;
         let utf8_index = self.content_offset_for_display_offset(display_offset);
 
-        Some(self.offset_to_utf16(utf8_index))
+        Some(text_edit::offset_to_utf16(&self.content, utf8_index))
     }
 }
 

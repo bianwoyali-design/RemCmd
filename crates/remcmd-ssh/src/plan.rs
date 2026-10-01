@@ -4,7 +4,7 @@ use remcmd_core::ConnectionProfile;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
-use crate::{AuthMethod, AuthMethodKind, SshError, SshErrorKind};
+use crate::{AuthMethod, SshError, SshErrorKind};
 
 /// Identifies the current connection stage without carrying credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +21,14 @@ pub enum ConnectionStage {
 }
 
 impl ConnectionStage {
+    pub(crate) const fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::Jump { .. } => "jump",
+            Self::Target { .. } => "target",
+        }
+    }
+
     pub fn profile_id(&self) -> Option<&str> {
         match self {
             Self::Proxy => None,
@@ -45,10 +53,6 @@ impl ConnectionStep {
 
     pub fn profile(&self) -> &ConnectionProfile {
         &self.profile
-    }
-
-    pub fn authentication_kind(&self) -> AuthMethodKind {
-        self.auth.kind()
     }
 }
 
@@ -177,14 +181,6 @@ impl ConnectionPlan {
 
     pub fn target_profile(&self) -> &ConnectionProfile {
         self.target.profile()
-    }
-
-    pub fn jump_profiles(&self) -> impl ExactSizeIterator<Item = &ConnectionProfile> {
-        self.jumps.iter().map(ConnectionStep::profile)
-    }
-
-    pub fn has_proxy(&self) -> bool {
-        self.proxy.is_some()
     }
 
     pub fn validate(&self) -> Result<(), SshError> {

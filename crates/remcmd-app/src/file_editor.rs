@@ -1,3 +1,4 @@
+use crate::text_edit;
 use std::ops::Range;
 
 use gpui::{
@@ -174,14 +175,20 @@ impl FileEditor {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+            self.select_to(
+                text_edit::previous_boundary(&self.content, self.cursor_offset()),
+                cx,
+            );
         }
         self.replace_text_in_range(None, "", window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx);
+            self.select_to(
+                text_edit::next_boundary(&self.content, self.cursor_offset()),
+                cx,
+            );
         }
         self.replace_text_in_range(None, "", window, cx);
     }
@@ -189,7 +196,7 @@ impl FileEditor {
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         self.preferred_column = None;
         let offset = if self.selected_range.is_empty() {
-            self.previous_boundary(self.cursor_offset())
+            text_edit::previous_boundary(&self.content, self.cursor_offset())
         } else {
             self.selected_range.start
         };
@@ -199,7 +206,7 @@ impl FileEditor {
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         self.preferred_column = None;
         let offset = if self.selected_range.is_empty() {
-            self.next_boundary(self.cursor_offset())
+            text_edit::next_boundary(&self.content, self.cursor_offset())
         } else {
             self.selected_range.end
         };
@@ -218,12 +225,18 @@ impl FileEditor {
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.preferred_column = None;
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+        self.select_to(
+            text_edit::previous_boundary(&self.content, self.cursor_offset()),
+            cx,
+        );
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.preferred_column = None;
-        self.select_to(self.next_boundary(self.cursor_offset()), cx);
+        self.select_to(
+            text_edit::next_boundary(&self.content, self.cursor_offset()),
+            cx,
+        );
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -493,44 +506,14 @@ impl FileEditor {
         self.reveal_cursor = false;
     }
 
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for character in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += character.len_utf16();
-            utf8_offset += character.len_utf8();
-        }
-        utf8_offset
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        self.content[..offset].encode_utf16().count()
-    }
-
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+        text_edit::offset_to_utf16(&self.content, range.start)
+            ..text_edit::offset_to_utf16(&self.content, range.end)
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(index, _)| (index < offset).then_some(index))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .find_map(|(index, _)| (index > offset).then_some(index))
-            .unwrap_or(self.content.len())
+        text_edit::offset_from_utf16(&self.content, range.start)
+            ..text_edit::offset_from_utf16(&self.content, range.end)
     }
 }
 
@@ -662,7 +645,10 @@ impl EntityInputHandler for FileEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
+        Some(text_edit::offset_to_utf16(
+            &self.content,
+            self.index_for_mouse_position(point),
+        ))
     }
 }
 

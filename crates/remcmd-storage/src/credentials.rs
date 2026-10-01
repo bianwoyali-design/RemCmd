@@ -13,6 +13,14 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
+    const AUTH: [Self; 2] = [Self::Password, Self::PrivateKeyPassphrase];
+    const ALL: [Self; 4] = [
+        Self::Password,
+        Self::PrivateKeyPassphrase,
+        Self::ProxyPassword,
+        Self::ProxyCommand,
+    ];
+
     fn account_suffix(self) -> &'static str {
         match self {
             Self::Password => "password",
@@ -79,24 +87,11 @@ pub fn delete_credential(
 }
 
 pub fn delete_profile_credentials(profile_id: &str) -> Result<(), CredentialStoreError> {
-    delete_profile_with(&SystemCredentialBackend, profile_id)
+    delete_kinds_with(&SystemCredentialBackend, profile_id, &CredentialKind::ALL)
 }
 
 pub fn delete_profile_auth_credentials(profile_id: &str) -> Result<(), CredentialStoreError> {
-    let mut first_error = None;
-    for kind in [
-        CredentialKind::Password,
-        CredentialKind::PrivateKeyPassphrase,
-    ] {
-        match delete_with(&SystemCredentialBackend, profile_id, kind) {
-            Err(error) if first_error.is_none() => first_error = Some(error),
-            Ok(()) | Err(_) => {}
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    delete_kinds_with(&SystemCredentialBackend, profile_id, &CredentialKind::AUTH)
 }
 
 fn credential_account(profile_id: &str, kind: CredentialKind) -> String {
@@ -139,27 +134,18 @@ pub(crate) fn delete_with(
     backend.delete(&credential_account(profile_id, kind))
 }
 
-fn delete_profile_with(
+fn delete_kinds_with(
     backend: &impl CredentialBackend,
     profile_id: &str,
+    kinds: &[CredentialKind],
 ) -> Result<(), CredentialStoreError> {
     let mut first_error = None;
-    for kind in [
-        CredentialKind::Password,
-        CredentialKind::PrivateKeyPassphrase,
-        CredentialKind::ProxyPassword,
-        CredentialKind::ProxyCommand,
-    ] {
-        match delete_with(backend, profile_id, kind) {
-            Err(error) if first_error.is_none() => first_error = Some(error),
-            Ok(()) | Err(_) => {}
+    for &kind in kinds {
+        if let Err(error) = delete_with(backend, profile_id, kind) {
+            first_error.get_or_insert(error);
         }
     }
-
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    first_error.map_or(Ok(()), Err)
 }
 
 pub(crate) struct SystemCredentialBackend;
@@ -286,23 +272,18 @@ mod tests {
     fn deleting_a_profile_removes_every_credential_kind() {
         let backend = MemoryBackend::default();
         let secret = SecretString::new("test-only-secret".into());
-        for kind in [
-            CredentialKind::Password,
-            CredentialKind::PrivateKeyPassphrase,
-            CredentialKind::ProxyPassword,
-            CredentialKind::ProxyCommand,
-        ] {
+        for kind in CredentialKind::ALL {
             save_with(&backend, "server-1", kind, &secret).unwrap();
         }
 
-        delete_profile_with(&backend, "server-1").unwrap();
+        delete_kinds_with(&backend, "server-1", &CredentialKind::AUTH).unwrap();
+        assert_eq!(backend.entries.lock().unwrap().len(), 2);
+        for kind in &CredentialKind::ALL[2..] {
+            assert!(load_with(&backend, "server-1", *kind).unwrap().is_some());
+        }
+        delete_kinds_with(&backend, "server-1", &CredentialKind::ALL).unwrap();
 
-        for kind in [
-            CredentialKind::Password,
-            CredentialKind::PrivateKeyPassphrase,
-            CredentialKind::ProxyPassword,
-            CredentialKind::ProxyCommand,
-        ] {
+        for kind in CredentialKind::ALL {
             assert!(load_with(&backend, "server-1", kind).unwrap().is_none());
         }
     }

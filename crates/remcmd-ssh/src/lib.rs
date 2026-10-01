@@ -5,11 +5,14 @@ mod host_key;
 mod performance;
 mod plan;
 mod proxy;
+mod remote_files;
+pub mod remote_path;
 mod scp;
 mod session;
 mod sftp;
 mod shell;
 mod shell_integration;
+pub mod transfer;
 mod transport;
 
 pub use auth::{AuthMethod, AuthMethodKind};
@@ -23,10 +26,12 @@ pub use plan::{
     ConnectionPlan, ConnectionStage, ConnectionStep, ProxyCommandPreview, RuntimeProxy,
     proxy_command_content_digest,
 };
+pub use remote_files::FileCommand;
 pub use session::{SessionState, SshSession};
 pub use sftp::{
     MAX_REMOTE_FILE_BYTES, RemoteDirectory, RemoteDirectoryTree, RemoteFile, RemoteFileEntry,
-    RemoteFileKind, SftpOperation, SftpTransferDirection, TransferRateLimiter,
+    RemoteFileKind, SftpOperation, SftpTransferDirection,
 };
 pub use shell::{PtySize, ShellEvent, SshShell, SshShellReader, SshShellWriter};
+pub use transfer::TransferRateLimiter;
 pub use transport::SshTransport;
