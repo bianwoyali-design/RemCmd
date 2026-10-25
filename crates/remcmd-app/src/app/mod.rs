@@ -154,6 +154,7 @@ gpui::actions!(
         SplitVertical,
         CloseActivePane,
         CloseActiveTab,
+        CloseTerminalOrWindow,
         ShowPreviousTab,
         ShowNextTab,
         ResetActiveTerminal,

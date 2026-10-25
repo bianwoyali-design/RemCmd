@@ -1,12 +1,12 @@
 use super::{
     ActivePanel, AnyElement, AnyView, App, CancelProfileEditor, CheckForUpdates, CloseActivePane,
-    CloseActiveTab, CloseWindow, CommandTooltip, ConnectSelectedProfile, Context,
-    DisconnectActiveSession, ExitTarget, IconName, IntoElement, KeyBinding, Localizer, Menu,
-    MenuItem, MinimizeWindow, NewConnection, NewLocalTerminal, NewRemoteTerminal, Quit, RemCmdApp,
-    RemCmdMainWindow, ResetActiveTerminal, RightSidebarView, SaveProfileEditor, SharedString,
-    ShowAbout, ShowFilesView, ShowHome, ShowNextTab, ShowPerformanceSidebar, ShowPreviousTab,
-    ShowSettings, ShowSftpSidebar, ShowTerminalView, SplitAxis, SplitHorizontal, SplitVertical,
-    TerminalTabView, ToggleBottomPanel, ToggleConnectionSearch, ToggleFullscreen,
+    CloseActiveTab, CloseTerminalOrWindow, CloseWindow, CommandTooltip, ConnectSelectedProfile,
+    Context, DisconnectActiveSession, ExitTarget, IconName, IntoElement, KeyBinding, Localizer,
+    Menu, MenuItem, MinimizeWindow, NewConnection, NewLocalTerminal, NewRemoteTerminal, Quit,
+    RemCmdApp, RemCmdMainWindow, ResetActiveTerminal, RightSidebarView, SaveProfileEditor,
+    SharedString, ShowAbout, ShowFilesView, ShowHome, ShowNextTab, ShowPerformanceSidebar,
+    ShowPreviousTab, ShowSettings, ShowSftpSidebar, ShowTerminalView, SplitAxis, SplitHorizontal,
+    SplitVertical, TerminalTabView, ToggleBottomPanel, ToggleConnectionSearch, ToggleFullscreen,
     ToggleLeftSidebar, Window, WindowControlArea, ZoomWindow, div, file_editor, icon_with_color,
     platform_chrome_height, px, text_field, wordmark,
 };
@@ -964,7 +964,7 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
         KeyBinding::new("cmd-shift-d", SplitVertical, None),
         KeyBinding::new("alt-cmd-w", CloseActivePane, None),
         // Like Terminal and Safari: cmd-w closes the terminal, cmd-shift-w the window.
-        KeyBinding::new("cmd-w", CloseActiveTab, None),
+        KeyBinding::new("cmd-w", CloseTerminalOrWindow, None),
         KeyBinding::new("cmd-{", ShowPreviousTab, None),
         KeyBinding::new("cmd-}", ShowNextTab, None),
         KeyBinding::new("ctrl-shift-tab", ShowPreviousTab, None),
@@ -1050,6 +1050,14 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
         dispatch_main_window_action(cx, |this, window, cx| this.close_active_pane(window, cx));
     });
     cx.on_action(|_: &CloseActiveTab, cx| {
+        dispatch_main_window_action(cx, |this, _, cx| {
+            if let Some(tab_id) = this.active_tab_id {
+                this.close_tab(tab_id, cx);
+            }
+        });
+    });
+    // Kept separate from the Close Terminal menu item, which must never close the window.
+    cx.on_action(|_: &CloseTerminalOrWindow, cx| {
         dispatch_main_window_action(cx, |this, window, cx| {
             match this.active_tab_id {
                 Some(tab_id) if this.active_panel == ActivePanel::Connection => {
