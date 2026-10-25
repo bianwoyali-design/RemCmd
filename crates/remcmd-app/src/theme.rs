@@ -31,6 +31,9 @@ pub struct Theme {
 
     pub accent: Hsla,
     pub accent_hover: Hsla,
+    /// Accent for filled controls; always keeps `on_accent` (white) readable on top.
+    pub accent_fill: Hsla,
+    pub accent_fill_hover: Hsla,
     pub on_accent: Hsla,
     pub danger: Hsla,
     pub danger_hover: Hsla,
@@ -58,6 +61,7 @@ pub struct Theme {
     pub button_primary_bg: Hsla,
     pub button_primary_pressed_bg: Hsla,
     pub button_secondary_bg: Hsla,
+    pub button_secondary_hover_bg: Hsla,
     pub button_secondary_pressed_bg: Hsla,
     pub settings_group_bg: Hsla,
     pub settings_separator: Hsla,
@@ -69,8 +73,8 @@ pub struct Theme {
     pub titlebar_tab_pressed_bg: Hsla,
     pub titlebar_tab_border: Hsla,
     pub titlebar_tab_shadow: Hsla,
+    pub titlebar_tab_group_bg: Hsla,
     pub titlebar_tab_group_border: Hsla,
-    pub titlebar_tab_group_shadow: Hsla,
     pub titlebar_add_border: Hsla,
     pub titlebar_add_shadow: Hsla,
     pub titlebar_tab_separator: Hsla,
@@ -99,6 +103,8 @@ impl Theme {
 
             accent: opaque(0x0159d1),
             accent_hover: opaque(0x126be0),
+            accent_fill: opaque(0x0159d1),
+            accent_fill_hover: opaque(0x0150bd),
             on_accent: opaque(0xffffff),
             danger: opaque(0xdc2626),
             danger_hover: opaque(0xef4444),
@@ -125,22 +131,23 @@ impl Theme {
             control_pressed_bg: alpha(0xffffff33),
             button_primary_bg: opaque(0x0159d1),
             button_primary_pressed_bg: opaque(0x0149ad),
-            button_secondary_bg: alpha(0xffffff18),
-            button_secondary_pressed_bg: alpha(0xffffff32),
+            button_secondary_bg: opaque(0x343437),
+            button_secondary_hover_bg: opaque(0x3d3d40),
+            button_secondary_pressed_bg: opaque(0x48484b),
             settings_group_bg: alpha(0xffffff0d),
             settings_separator: alpha(0xffffff14),
             settings_picker_bg: alpha(0xffffff14),
 
-            titlebar_tab_selected_bg: alpha(0xffffff1f),
-            titlebar_tab_selected_hover_bg: alpha(0xffffff2b),
-            titlebar_tab_hover_bg: alpha(0xffffff12),
-            titlebar_tab_pressed_bg: alpha(0xffffff38),
-            titlebar_tab_border: alpha(0xffffff24),
-            titlebar_tab_shadow: alpha(0x00000052),
-            titlebar_tab_group_border: alpha(0xffffff18),
-            titlebar_tab_group_shadow: alpha(0x00000040),
-            titlebar_add_border: alpha(0xffffff33),
-            titlebar_add_shadow: alpha(0x00000052),
+            titlebar_tab_selected_bg: opaque(0x3a3a3d),
+            titlebar_tab_selected_hover_bg: opaque(0x434346),
+            titlebar_tab_hover_bg: alpha(0xffffff10),
+            titlebar_tab_pressed_bg: alpha(0xffffff1f),
+            titlebar_tab_border: alpha(0xffffff1a),
+            titlebar_tab_shadow: alpha(0x00000066),
+            titlebar_tab_group_bg: opaque(0x232325),
+            titlebar_tab_group_border: alpha(0xffffff14),
+            titlebar_add_border: alpha(0xffffff1f),
+            titlebar_add_shadow: alpha(0x00000066),
             titlebar_tab_separator: alpha(0xffffff24),
 
             input_bg: alpha(0xffffff18),
@@ -165,6 +172,8 @@ impl Theme {
 
             accent: opaque(0x0159d1),
             accent_hover: opaque(0x014fb8),
+            accent_fill: opaque(0x0159d1),
+            accent_fill_hover: opaque(0x014fb8),
             on_accent: opaque(0xffffff),
             danger: opaque(0xdc2626),
             danger_hover: opaque(0xb91c1c),
@@ -191,22 +200,23 @@ impl Theme {
             control_pressed_bg: alpha(0x0000001f),
             button_primary_bg: opaque(0x0159d1),
             button_primary_pressed_bg: opaque(0x014398),
-            button_secondary_bg: alpha(0x0000000d),
-            button_secondary_pressed_bg: alpha(0x00000024),
+            button_secondary_bg: opaque(0xffffff),
+            button_secondary_hover_bg: opaque(0xf5f5f6),
+            button_secondary_pressed_bg: opaque(0xe9e9eb),
             settings_group_bg: alpha(0x0000000a),
             settings_separator: alpha(0x00000014),
             settings_picker_bg: alpha(0x0000000f),
 
-            titlebar_tab_selected_bg: alpha(0xffffffc7),
-            titlebar_tab_selected_hover_bg: alpha(0xffffffdc),
+            titlebar_tab_selected_bg: opaque(0xffffff),
+            titlebar_tab_selected_hover_bg: opaque(0xfafafa),
             titlebar_tab_hover_bg: alpha(0x0000000a),
-            titlebar_tab_pressed_bg: alpha(0x00000012),
-            titlebar_tab_border: alpha(0x00000018),
-            titlebar_tab_shadow: alpha(0x00000024),
-            titlebar_tab_group_border: alpha(0xffffffb0),
-            titlebar_tab_group_shadow: alpha(0x0000001f),
-            titlebar_add_border: alpha(0x00000024),
-            titlebar_add_shadow: alpha(0x0000002e),
+            titlebar_tab_pressed_bg: alpha(0x00000014),
+            titlebar_tab_border: alpha(0x00000014),
+            titlebar_tab_shadow: alpha(0x0000001f),
+            titlebar_tab_group_bg: opaque(0xf1f1f3),
+            titlebar_tab_group_border: alpha(0x0000000d),
+            titlebar_add_border: alpha(0x00000017),
+            titlebar_add_shadow: alpha(0x0000001f),
             titlebar_tab_separator: alpha(0x0000001f),
 
             input_bg: alpha(0x0000000d),
@@ -249,8 +259,9 @@ impl Theme {
     fn apply_preferences(&mut self, preferences: crate::platform_preferences::PlatformPreferences) {
         self.reduce_motion = preferences.reduce_motion;
         self.reduce_transparency = preferences.reduce_transparency;
-        if let Some(mut accent) = preferences.accent {
+        if let Some(system_accent) = preferences.accent {
             // Preserve the system hue while keeping small accent labels readable.
+            let mut accent = system_accent;
             for _ in 0..50 {
                 if contrast_ratio(accent, self.panel_bg) >= 4.5 {
                     break;
@@ -261,31 +272,27 @@ impl Theme {
             self.accent_hover = accent;
             self.accent_hover.l =
                 (accent.l + if self.is_light() { -0.06 } else { 0.06 }).clamp(0.0, 1.0);
-            self.button_primary_bg = accent;
-            self.button_primary_pressed_bg = self.accent_hover;
-            self.on_accent = if contrast_ratio(accent, opaque(0xffffff))
-                >= contrast_ratio(accent, opaque(0x000000))
-            {
-                opaque(0xffffff)
-            } else {
-                opaque(0x000000)
-            };
-            self.selection_bg = accent;
+
+            // Like AppKit, filled controls keep white labels; darken the fill only as needed.
+            let mut fill = system_accent;
+            for _ in 0..50 {
+                if contrast_ratio(fill, opaque(0xffffff)) >= 4.5 {
+                    break;
+                }
+                fill.l = (fill.l - 0.02).max(0.0);
+            }
+            self.accent_fill = fill;
+            self.accent_fill_hover = fill;
+            self.accent_fill_hover.l = (fill.l - 0.05).max(0.0);
+            self.button_primary_bg = fill;
+            self.button_primary_pressed_bg = self.accent_fill_hover;
+            self.on_accent = opaque(0xffffff);
+            self.selection_bg = system_accent;
             self.selection_bg.a = 0.28;
         }
         if preferences.reduce_transparency {
             self.sidebar_bg.a = 1.0;
             self.floating_glass_bg.a = 1.0;
-            self.titlebar_tab_selected_bg = if self.is_light() {
-                opaque(0xffffff)
-            } else {
-                opaque(0x454545)
-            };
-            self.titlebar_tab_selected_hover_bg = if self.is_light() {
-                opaque(0xf4f4f4)
-            } else {
-                opaque(0x515151)
-            };
         }
         if preferences.increase_contrast {
             self.text_faint = self.text_muted;
@@ -388,11 +395,8 @@ pub fn icon_button(
             .border_color(theme.transparent)
             .focus(move |style| style.border_color(focus_color))
             .cursor_pointer()
-            .hover(move |this| this.bg(theme.control_hover_bg).border_color(theme.border))
-            .active(move |this| {
-                this.bg(theme.control_pressed_bg)
-                    .border_color(theme.border_strong)
-            });
+            .hover(move |this| this.bg(theme.control_hover_bg))
+            .active(move |this| this.bg(theme.control_pressed_bg));
     } else {
         el = el.opacity(0.5);
     }
@@ -416,14 +420,14 @@ pub fn text_button(
         TextButtonTone::Primary => (
             theme.on_accent,
             theme.button_primary_bg,
-            theme.accent_hover,
+            theme.accent_fill_hover,
             theme.button_primary_pressed_bg,
-            theme.accent_hover,
+            theme.transparent,
         ),
         TextButtonTone::Secondary => (
             theme.text_primary,
             theme.button_secondary_bg,
-            theme.control_hover_bg,
+            theme.button_secondary_hover_bg,
             theme.button_secondary_pressed_bg,
             theme.border,
         ),
@@ -444,18 +448,19 @@ pub fn text_button(
         .items_center()
         .justify_center()
         .min_h(px(CONTROL_HEIGHT))
-        .px_3()
-        .rounded(px(CONTROL_RADIUS))
+        .px_4()
+        .rounded_full()
         .border_1()
         .border_color(edge)
         .bg(background)
+        // Fills are opaque, so this reads as a crisp drop rather than a tint.
         .shadow(vec![BoxShadow {
             color: Hsla {
-                a: theme.shadow.a * 0.5,
+                a: theme.shadow.a * 0.6,
                 ..theme.shadow
             },
-            offset: point(px(0.0), px(1.0)),
-            blur_radius: px(3.0),
+            offset: point(px(0.0), px(0.5)),
+            blur_radius: px(1.5),
             spread_radius: px(0.0),
         }])
         .text_color(text)
@@ -474,14 +479,7 @@ pub fn text_button(
             })
             .cursor_pointer()
             .hover(move |this| this.bg(hover_background))
-            .active(move |this| {
-                this.bg(pressed_background).shadow(vec![BoxShadow {
-                    color: theme.shadow,
-                    offset: point(px(0.0), px(0.0)),
-                    blur_radius: px(1.0),
-                    spread_radius: px(0.0),
-                }])
-            });
+            .active(move |this| this.bg(pressed_background).shadow(Vec::new()));
     } else {
         el = el.opacity(0.5);
     }
@@ -505,7 +503,9 @@ mod tests {
                     accent: Some(opaque(color)),
                 });
                 assert!(contrast_ratio(theme.accent, theme.panel_bg) >= 4.5);
-                assert!(contrast_ratio(theme.accent, theme.on_accent) >= 4.5);
+                assert!(contrast_ratio(theme.accent_fill, theme.on_accent) >= 4.5);
+                assert!(contrast_ratio(theme.button_primary_bg, theme.on_accent) >= 4.5);
+                assert_eq!(theme.on_accent, opaque(0xffffff));
                 assert_eq!(theme.sidebar_bg.a, 1.0);
                 assert_eq!(theme.floating_glass_bg.a, 1.0);
                 assert_eq!(theme.titlebar_tab_selected_bg.a, 1.0);

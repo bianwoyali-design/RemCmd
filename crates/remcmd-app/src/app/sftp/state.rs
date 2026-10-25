@@ -1,5 +1,5 @@
 use super::super::{
-    App, Entity, FileEditor, Localizer, Pixels, RemoteDirectory, RemoteFileEntry, RemoteFileKind,
+    App, Entity, FileEditor, Localizer, RemoteDirectory, RemoteFileEntry, RemoteFileKind,
     ScrollHandle, SessionId, SftpOperation, SftpTransferDirection, TextField,
     UniformListScrollHandle,
 };
@@ -459,12 +459,6 @@ pub(in crate::app) struct SftpFileState {
     pub(in crate::app) editable: bool,
     pub(in crate::app) read_request_id: Option<u64>,
     pub(in crate::app) write_request_id: Option<u64>,
-}
-
-pub(in crate::app) struct SftpContextMenu {
-    pub(in crate::app) session_id: SessionId,
-    pub(in crate::app) placement: SftpBrowserPlacement,
-    pub(in crate::app) position: gpui::Point<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -963,6 +957,17 @@ pub(in crate::app) fn remote_breadcrumbs(path: &str) -> Vec<(String, String)> {
     breadcrumbs
 }
 
+/// Formats a remote modification time in the local time zone for list columns.
+pub(in crate::app) fn format_remote_modified(seconds: u32) -> String {
+    chrono::DateTime::from_timestamp(i64::from(seconds), 0)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 pub(in crate::app) fn format_remote_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -1092,6 +1097,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/home/test/notes.txt", "/home/test/projects"]
         );
+    }
+
+    #[test]
+    fn remote_modified_time_uses_a_sortable_minute_format() {
+        let formatted = format_remote_modified(1_791_400_800);
+        assert_eq!(formatted.len(), 16);
+        assert_eq!(&formatted[4..5], "-");
+        assert_eq!(&formatted[13..14], ":");
     }
 
     #[test]

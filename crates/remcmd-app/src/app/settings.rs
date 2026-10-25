@@ -1,5 +1,3 @@
-#[cfg(target_os = "macos")]
-use super::native_material;
 use super::{
     ActivePanel, AnyElement, AppSettings, CancelSettingsSelector, Context, CredentialPromptKind,
     FontWeight, IconName, IconTone, LanguageMode, Localizer, Range, RemCmdApp, ScrollHandle,
@@ -7,6 +5,8 @@ use super::{
     UniformListScrollHandle, Window, application_menus, deferred, div, icon, icon_with_color,
     point, px, save_settings, set_global_theme, uniform_list,
 };
+#[cfg(target_os = "macos")]
+use super::{SelectMenuOption, native_material};
 use gpui::prelude::*;
 use gpui::{Animation, AnimationExt, ease_out_quint};
 use std::time::Duration;
@@ -20,10 +20,6 @@ impl RemCmdApp {
         self.language_mode = language_mode;
         self.localizer = Localizer::new(language_mode);
 
-        let sidebar_placeholder = self.tr("sidebar-search-placeholder");
-        self.sidebar_search.update(cx, |field, cx| {
-            field.set_placeholder(sidebar_placeholder, cx);
-        });
         if let Some(editor) = self.editor.as_ref() {
             for (field, key) in [
                 (editor.name.clone(), "field-name"),
@@ -265,12 +261,20 @@ impl RemCmdApp {
     pub(super) fn toggle_settings_selector(
         &mut self,
         selector: SettingsSelector,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.open_settings_selector == Some(selector) {
             self.open_settings_selector = None;
         } else {
+            #[cfg(target_os = "macos")]
+            if self.pop_up_native_settings_menu(selector, window, cx) {
+                self.open_settings_selector = None;
+                cx.notify();
+                return;
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = window;
             self.settings_selector_scroll_handle = ScrollHandle::new();
             self.settings_virtual_selector_scroll_handle = UniformListScrollHandle::new();
             let (selected_index, option_count) = if selector == SettingsSelector::TerminalFont {
@@ -305,6 +309,42 @@ impl RemCmdApp {
             self.open_settings_selector = Some(selector);
         }
         cx.notify();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pop_up_native_settings_menu(
+        &mut self,
+        selector: SettingsSelector,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let options = if selector == SettingsSelector::TerminalFont {
+            self.terminal_font_families
+                .iter()
+                .map(|family| {
+                    let family = family.clone();
+                    let checked = family == self.terminal_font_family;
+                    SelectMenuOption::new(family.clone(), checked, move |this, _, cx| {
+                        this.set_terminal_font_family(family.clone(), cx);
+                    })
+                })
+                .collect()
+        } else {
+            let current = self.settings_value(selector);
+            selector
+                .options()
+                .iter()
+                .map(|option| {
+                    let value = option.value;
+                    SelectMenuOption::new(
+                        self.settings_option_label(option),
+                        value == current,
+                        move |this, window, cx| this.apply_settings_value(value, window, cx),
+                    )
+                })
+                .collect()
+        };
+        self.pop_up_select_menu(selector.element_id(), options, false, window, cx)
     }
 
     pub(super) fn navigate_settings_menu(
@@ -414,7 +454,7 @@ impl RemCmdApp {
         self.dismiss_credential_prompt(cx);
         self.bottom_panel_open = false;
         self.bottom_panel_resize = None;
-        self.terminal_context_menu = None;
+        self.context_menu = None;
         self.active_panel = ActivePanel::Settings;
         self.open_settings_selector = None;
         self.settings_focus_handle.focus(window);
@@ -692,47 +732,49 @@ impl RemCmdApp {
         let menu_width = selector.menu_width();
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let option_count = selector.options().len();
-        let menu_height = select_menu_height(option_count);
-        let menu = self
-            .glass_floating_surface()
-            .id(SharedString::from(format!(
-                "{}-menu",
-                selector.element_id()
-            )))
-            .absolute()
-            .top(px(26.0))
-            .right_0()
-            .w(px(menu_width))
-            .h(px(menu_height))
-            .flex()
-            .flex_col()
-            .p_1()
-            .text_sm()
-            .occlude();
-        let menu = if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
-            menu.overflow_hidden().child(
-                uniform_list(
-                    SharedString::from(format!("{}-virtual-options", selector.element_id())),
-                    option_count,
-                    cx.processor(move |this, range: Range<usize>, _, cx| {
-                        this.render_virtual_settings_selector_rows(selector, range, cx)
-                    }),
+        let menu = is_open.then(|| {
+            let menu = self
+                .glass_floating_surface()
+                .id(SharedString::from(format!(
+                    "{}-menu",
+                    selector.element_id()
+                )))
+                .absolute()
+                .top(px(26.0))
+                .right_0()
+                .w(px(menu_width))
+                .h(px(select_menu_height(option_count)))
+                .flex()
+                .flex_col()
+                .p_1()
+                .text_sm()
+                .occlude();
+            if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
+                menu.overflow_hidden().child(
+                    uniform_list(
+                        SharedString::from(format!("{}-virtual-options", selector.element_id())),
+                        option_count,
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            this.render_virtual_settings_selector_rows(selector, range, cx)
+                        }),
+                    )
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .track_scroll(self.settings_virtual_selector_scroll_handle.clone()),
                 )
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .track_scroll(self.settings_virtual_selector_scroll_handle.clone()),
-            )
-        } else {
-            let mut menu = menu
-                .overflow_y_scroll()
-                .track_scroll(&self.settings_selector_scroll_handle);
-            for (index, option) in selector.options().iter().copied().enumerate() {
-                menu = menu
-                    .child(self.render_settings_selector_row(selector, index, option, false, cx));
+            } else {
+                let mut menu = menu
+                    .overflow_y_scroll()
+                    .track_scroll(&self.settings_selector_scroll_handle);
+                for (index, option) in selector.options().iter().copied().enumerate() {
+                    menu = menu.child(
+                        self.render_settings_selector_row(selector, index, option, false, cx),
+                    );
+                }
+                menu
             }
-            menu
-        };
+        });
 
         let button_hover = self.theme.control_hover_bg;
         let button_pressed = self.theme.control_pressed_bg;
@@ -809,13 +851,13 @@ impl RemCmdApp {
                 this.activate_settings_picker(selector, event, window, cx);
             }));
 
-        div()
+        let container = div()
             .relative()
             .flex()
             .flex_none()
             .max_w(px(max_control_width))
             .child(button)
-            .when(is_open, |this| {
+            .when_some(menu, |this, menu| {
                 this.child(
                     deferred(
                         menu.with_animation(
@@ -827,7 +869,8 @@ impl RemCmdApp {
                     )
                     .with_priority(10),
                 )
-            })
+            });
+        self.track_select_menu_anchor(selector.element_id(), container)
     }
 
     pub(super) fn render_settings_selector_row(
@@ -854,8 +897,8 @@ impl RemCmdApp {
                 hover_group.clone(),
             )
         };
-        let option_hover = self.theme.accent;
-        let option_pressed = self.theme.accent_hover;
+        let option_hover = self.theme.accent_fill;
+        let option_pressed = self.theme.accent_fill_hover;
         let on_accent = self.theme.on_accent;
 
         let row = div()
@@ -923,46 +966,48 @@ impl RemCmdApp {
         let max_control_width = selector.control_width().min(available_width);
         let control_group: SharedString = format!("{}-control", selector.element_id()).into();
         let option_count = self.terminal_font_families.len();
-        let menu_height = select_menu_height(option_count);
-        let menu = self
-            .glass_floating_surface()
-            .id(SharedString::from(format!(
-                "{}-menu",
-                selector.element_id()
-            )))
-            .absolute()
-            .top(px(26.0))
-            .right_0()
-            .w(px(selector.menu_width()))
-            .h(px(menu_height))
-            .flex()
-            .flex_col()
-            .p_1()
-            .text_sm()
-            .occlude();
-        let menu = if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
-            menu.overflow_hidden().child(
-                uniform_list(
-                    "settings-terminal-font-virtual-options",
-                    option_count,
-                    cx.processor(move |this, range: Range<usize>, _, cx| {
-                        this.render_virtual_terminal_font_selector_rows(range, cx)
-                    }),
+        let menu = is_open.then(|| {
+            let menu = self
+                .glass_floating_surface()
+                .id(SharedString::from(format!(
+                    "{}-menu",
+                    selector.element_id()
+                )))
+                .absolute()
+                .top(px(26.0))
+                .right_0()
+                .w(px(selector.menu_width()))
+                .h(px(select_menu_height(option_count)))
+                .flex()
+                .flex_col()
+                .p_1()
+                .text_sm()
+                .occlude();
+            if option_count > SELECT_MENU_MAX_VISIBLE_ROWS {
+                menu.overflow_hidden().child(
+                    uniform_list(
+                        "settings-terminal-font-virtual-options",
+                        option_count,
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            this.render_virtual_terminal_font_selector_rows(range, cx)
+                        }),
+                    )
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .track_scroll(self.settings_virtual_selector_scroll_handle.clone()),
                 )
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .track_scroll(self.settings_virtual_selector_scroll_handle.clone()),
-            )
-        } else {
-            let mut menu = menu
-                .overflow_y_scroll()
-                .track_scroll(&self.settings_selector_scroll_handle);
-            for (index, family) in self.terminal_font_families.iter().cloned().enumerate() {
-                menu = menu.child(self.render_terminal_font_selector_row(index, family, false, cx));
+            } else {
+                let mut menu = menu
+                    .overflow_y_scroll()
+                    .track_scroll(&self.settings_selector_scroll_handle);
+                for (index, family) in self.terminal_font_families.iter().cloned().enumerate() {
+                    menu = menu
+                        .child(self.render_terminal_font_selector_row(index, family, false, cx));
+                }
+                menu
             }
-            menu
-        };
+        });
 
         let button_hover = self.theme.control_hover_bg;
         let button_pressed = self.theme.control_pressed_bg;
@@ -1038,13 +1083,16 @@ impl RemCmdApp {
                 this.activate_settings_picker(selector, event, window, cx);
             }));
 
-        div()
+        let container = div()
             .relative()
             .flex()
             .flex_none()
             .max_w(px(max_control_width))
             .child(button)
-            .when(is_open, |this| this.child(deferred(menu).with_priority(10)))
+            .when_some(menu, |this, menu| {
+                this.child(deferred(menu).with_priority(10))
+            });
+        self.track_select_menu_anchor(selector.element_id(), container)
     }
 
     pub(super) fn render_terminal_font_selector_row(
@@ -1069,8 +1117,8 @@ impl RemCmdApp {
             self.render_select_menu_label(family.clone(), hover_group.clone())
         };
         let selected_family = family;
-        let option_hover = self.theme.accent;
-        let option_pressed = self.theme.accent_hover;
+        let option_hover = self.theme.accent_fill;
+        let option_pressed = self.theme.accent_fill_hover;
         let on_accent = self.theme.on_accent;
 
         let row = div()

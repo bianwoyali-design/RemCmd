@@ -7,7 +7,7 @@ use super::{
     SessionId, SessionMessage, SessionMessageArg, SessionState, SftpAvailability,
     SftpBrowserPlacement, SftpBrowserState, SftpOperation, ShellEvent, SshConnection, SshError,
     SshErrorKind, SshRuntime, SubmitCredential, TERMINAL_COLUMNS, TERMINAL_EVENT_BATCH_LIMIT,
-    TERMINAL_ROWS, TerminalSession, TerminalTabView, TextButtonTone, TextField,
+    TERMINAL_ROWS, TerminalSession, TerminalTabView, TextButtonTone, TextField, TextFieldEvent,
     UI_MONOSPACE_FONT_FAMILY, Window, delete_credential, delete_profile_credentials, div,
     load_credential, px, save_credential, save_profiles, sftp_browser_placement_for_request,
     text_button,
@@ -34,7 +34,7 @@ impl RemCmdApp {
             CredentialPromptKind::ProxyPassword => self.tr("field-proxy-password"),
         };
         let input = cx.new(|cx| TextField::new_secure(cx, placeholder));
-        cx.observe(&input, |this, input, cx| {
+        cx.subscribe(&input, |this, input, _: &TextFieldEvent, cx| {
             if let Some(prompt) = this.credential_prompt.as_mut()
                 && prompt.input == input
                 && prompt.error.take().is_some()
@@ -1852,12 +1852,12 @@ impl RemCmdApp {
                             .rounded_sm()
                             .border_1()
                             .border_color(if prompt.remember {
-                                self.theme.accent
+                                self.theme.accent_fill
                             } else {
                                 self.theme.border_strong
                             })
                             .bg(if prompt.remember {
-                                self.theme.accent
+                                self.theme.accent_fill
                             } else {
                                 self.theme.surface_bg
                             })

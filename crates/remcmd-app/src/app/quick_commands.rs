@@ -1,8 +1,10 @@
+#[cfg(target_os = "macos")]
+use super::SelectMenuOption;
 use super::{
     AnyElement, CancelQuickCommand, Context, CursorStyle, Entity, FontWeight, IconName, IconTone,
     IntoElement, MouseButton, RemCmdApp, SessionId, SessionState, SharedString, SubmitQuickCommand,
-    TerminalSession, TerminalSessionKind, TextButtonTone, TextField, Window, content_top_inset,
-    deferred, div, icon, px, text_button,
+    TerminalSession, TerminalSessionKind, TextButtonTone, TextField, TextFieldEvent, Window,
+    content_top_inset, deferred, div, icon, px, text_button,
 };
 use gpui::prelude::*;
 use std::collections::HashSet;
@@ -28,7 +30,8 @@ impl RemCmdApp {
             return;
         }
         let input = cx.new(|cx| TextField::new(cx, "", self.tr("field-command")));
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&input, |_, _, _: &TextFieldEvent, cx| cx.notify())
+            .detach();
         self.quick_command_prompt = Some(QuickCommandPrompt {
             input,
             selected_profile_ids: self.connected_ssh_profile_ids().into_iter().collect(),
@@ -111,7 +114,39 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn toggle_quick_command_targets(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_quick_command_targets(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        if let Some(prompt) = self
+            .quick_command_prompt
+            .as_ref()
+            .filter(|prompt| !prompt.target_menu_open)
+        {
+            let options = self
+                .connected_ssh_profile_ids()
+                .into_iter()
+                .filter_map(|profile_id| {
+                    let profile = self
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == profile_id)?;
+                    let checked = prompt.selected_profile_ids.contains(&profile_id);
+                    Some(SelectMenuOption::new(
+                        profile.name.clone(),
+                        checked,
+                        move |this, _, cx| this.toggle_quick_command_target(profile_id.clone(), cx),
+                    ))
+                })
+                .collect();
+            if self.pop_up_select_menu("quick_command_targets", options, true, window, cx) {
+                return;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
         if let Some(prompt) = self.quick_command_prompt.as_mut() {
             prompt.target_menu_open = !prompt.target_menu_open;
             cx.notify();
@@ -490,17 +525,20 @@ impl RemCmdApp {
                     .child(target_label),
             )
             .child(picker)
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
-                this.toggle_quick_command_targets(cx);
+                this.toggle_quick_command_targets(window, cx);
             }));
 
-        let mut selector = div()
-            .relative()
-            .flex()
-            .flex_none()
-            .max_w(px(180.0))
-            .child(selector_button);
+        let mut selector = self.track_select_menu_anchor(
+            "quick_command_targets",
+            div()
+                .relative()
+                .flex()
+                .flex_none()
+                .max_w(px(180.0))
+                .child(selector_button),
+        );
         if prompt.target_menu_open {
             let mut menu = self
                 .glass_floating_surface()
@@ -516,8 +554,8 @@ impl RemCmdApp {
                 .p_1()
                 .text_sm()
                 .occlude();
-            let option_hover = self.theme.accent;
-            let option_pressed = self.theme.accent_hover;
+            let option_hover = self.theme.accent_fill;
+            let option_pressed = self.theme.accent_fill_hover;
             let on_accent = self.theme.on_accent;
             for (index, profile_id) in connected_profile_ids.iter().enumerate() {
                 let Some(profile) = self

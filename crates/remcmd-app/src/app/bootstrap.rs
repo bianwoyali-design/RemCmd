@@ -160,6 +160,16 @@ pub(super) fn bind_quick_command_keys(cx: &mut App) {
     ]);
 }
 
+pub(super) fn bind_spotlight_keys(cx: &mut App) {
+    use super::{CloseSpotlight, ConfirmSpotlight, RevealSpotlight};
+    cx.bind_keys([
+        KeyBinding::new("enter", ConfirmSpotlight, Some("Spotlight")),
+        // Cmd-Enter on macOS, Ctrl-Enter elsewhere.
+        KeyBinding::new("secondary-enter", RevealSpotlight, Some("Spotlight")),
+        KeyBinding::new("escape", CloseSpotlight, Some("Spotlight")),
+    ]);
+}
+
 pub(super) fn bind_profile_editor_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-s", SaveProfileEditor, Some("ProfileEditor")),
@@ -196,6 +206,7 @@ pub(super) fn launch(cx: &mut App) {
     bind_settings_selector_keys(cx);
     bind_sftp_create_prompt_keys(cx);
     bind_quick_command_keys(cx);
+    bind_spotlight_keys(cx);
     bind_profile_editor_keys(cx);
     let main_window = open_main_window(cx);
     let language_mode = main_window

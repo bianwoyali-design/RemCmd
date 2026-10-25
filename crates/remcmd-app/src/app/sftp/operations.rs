@@ -2,7 +2,7 @@ use super::super::{
     ClipboardItem, ConnectionHandle, Context, FileEditor, FileEditorEvent, MAX_REMOTE_FILE_BYTES,
     PathPromptOptions, PromptButton, PromptLevel, RemCmdApp, RemoteDirectoryTree, RemoteFile,
     RemoteFileEntry, RemoteFileKind, SessionId, SessionState, SftpOperation, SftpTransferDirection,
-    SshErrorKind, SshRuntime, TerminalTabView, TextField, Timer, Window,
+    SshErrorKind, SshRuntime, TerminalTabView, TextField, TextFieldEvent, Timer, Window,
 };
 use super::state::{
     PendingSftpDownloadTree, RemoteTextFormat, SFTP_ERROR_HINT_DURATION, SftpAvailability,
@@ -353,9 +353,9 @@ impl RemCmdApp {
                     FileEditor::new_read_only(cx, text.clone())
                 }
             });
-            cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             cx.subscribe(&editor, move |this, _, event, cx| match event {
                 FileEditorEvent::SaveRequested => this.save_remote_file(session_id, cx),
+                FileEditorEvent::Changed => cx.notify(),
             })
             .detach();
             editor
@@ -783,7 +783,7 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) {
         let entries = self.selected_sftp_entries(session_id, placement);
-        self.sftp_context_menu = None;
+        self.context_menu = None;
         self.choose_sftp_downloads(session_id, placement, entries, cx);
     }
 
@@ -799,7 +799,7 @@ impl RemCmdApp {
             .into_iter()
             .next()
             .filter(|entry| entry.kind == RemoteFileKind::File);
-        self.sftp_context_menu = None;
+        self.context_menu = None;
         if let Some(entry) = entry {
             self.open_remote_file(entry.path, editable, cx);
         }
@@ -819,7 +819,7 @@ impl RemCmdApp {
         if !paths.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
         }
-        self.sftp_context_menu = None;
+        self.context_menu = None;
         cx.notify();
     }
 
@@ -848,7 +848,7 @@ impl RemCmdApp {
             args.set("count", paths.len());
             self.tr_with("sftp-delete-many", &args)
         };
-        self.sftp_context_menu = None;
+        self.context_menu = None;
         let answer = window.prompt(
             PromptLevel::Critical,
             &message,
@@ -898,9 +898,10 @@ impl RemCmdApp {
             SftpCreateKind::Directory => self.tr("sftp-folder-name"),
         };
         let input = cx.new(|cx| TextField::new(cx, "", placeholder));
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&input, |_, _, _: &TextFieldEvent, cx| cx.notify())
+            .detach();
         input.focus_handle(cx).focus(window);
-        self.sftp_context_menu = None;
+        self.context_menu = None;
         self.sftp_create_prompt = Some(SftpCreatePrompt {
             session_id,
             placement,

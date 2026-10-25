@@ -554,7 +554,7 @@ impl RemCmdApp {
                             .border_1()
                             .border_color(self.theme.border_strong)
                             .bg(if self.updates.settings.automatic {
-                                self.theme.accent
+                                self.theme.accent_fill
                             } else {
                                 self.theme.transparent
                             })

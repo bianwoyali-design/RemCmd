@@ -2,13 +2,13 @@
 use super::img;
 use super::{
     Animation, AnyElement, AnyView, App, Bounds, BoxShadow, ConnectionProfile, Context,
-    CursorStyle, FontWeight, Hsla, IconName, IconTone, IntoElement, LOCAL_PROFILE_ID, Localizer,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ProfileContextMenu,
-    RemCmdApp, Render, SessionState, SftpBrowserPlacement, SharedString, SplitAxis, TabLayout,
-    TerminalSession, TerminalTab, TerminalTabView, TextButtonTone, Theme, Timer, TitlebarOptions,
-    WINDOWS_CHROME_HEIGHT, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
-    app_icon, clamp_bottom_panel_height, div, ease_in_out, ease_out_quint, icon, icon_button,
-    icon_with_color, point, profile_auth_label, px, size, text_button, wordmark,
+    ContextMenuEntry, CursorStyle, FontWeight, Hsla, IconName, IconTone, IntoElement,
+    LOCAL_PROFILE_ID, Localizer, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    RemCmdApp, Render, SessionState, SftpBrowserPlacement, SharedString, SplitAxis, TabId,
+    TabLayout, TerminalSession, TerminalTab, TerminalTabView, TextButtonTone, Theme, Timer,
+    TitlebarOptions, WINDOWS_CHROME_HEIGHT, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, app_icon, clamp_bottom_panel_height, div, ease_in_out, ease_out_quint, icon,
+    icon_button, icon_with_color, point, profile_auth_label, px, size, text_button, wordmark,
 };
 use gpui::AnimationExt;
 use gpui::prelude::*;
@@ -328,16 +328,11 @@ impl RemCmdApp {
         &mut self,
         profile_id: String,
         event: &MouseDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.sftp_context_menu = None;
-        self.terminal_context_menu = None;
-        self.profile_context_menu = Some(ProfileContextMenu {
-            profile_id,
-            position: event.position,
-        });
-        cx.stop_propagation();
-        cx.notify();
+        let entries = self.profile_context_menu_entries(&profile_id);
+        self.open_context_menu(None, entries, event.position, window, cx);
     }
 
     pub(super) fn render_icon_button(
@@ -370,6 +365,17 @@ impl RemCmdApp {
             })
             .into()
         })
+    }
+
+    /// A navigation symbol tinted with the accent color, as in Finder's sidebar.
+    pub(super) fn render_sidebar_nav_icon(&self, icon_name: IconName) -> gpui::Div {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(20.0))
+            .child(icon(icon_name, self.theme, IconTone::Accent, 16.0))
     }
 
     pub(super) fn render_sidebar_icon(&self, icon_name: IconName, size: f32) -> gpui::Div {
@@ -568,21 +574,24 @@ impl RemCmdApp {
             )
     }
 
+    /// A single soft drop under opaque titlebar capsules; the border supplies the edge.
     pub(super) fn titlebar_control_shadow(&self) -> Vec<BoxShadow> {
-        vec![
-            BoxShadow {
-                color: self.theme.titlebar_add_shadow,
-                offset: point(px(0.0), px(0.5)),
-                blur_radius: px(1.0),
-                spread_radius: px(-0.25),
-            },
-            BoxShadow {
-                color: self.theme.titlebar_add_shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(3.0),
-                spread_radius: px(-1.5),
-            },
-        ]
+        vec![BoxShadow {
+            color: self.theme.titlebar_add_shadow,
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(2.0),
+            spread_radius: px(0.0),
+        }]
+    }
+
+    /// Lifts the selected segment out of its recessed track.
+    pub(super) fn titlebar_selected_tab_shadow(&self) -> Vec<BoxShadow> {
+        vec![BoxShadow {
+            color: self.theme.titlebar_tab_shadow,
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(2.0),
+            spread_radius: px(0.0),
+        }]
     }
 
     pub(super) fn render_right_sidebar_titlebar(
@@ -607,13 +616,7 @@ impl RemCmdApp {
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_tab_group_border)
-            .bg(self.theme.transparent)
-            .shadow(vec![BoxShadow {
-                color: self.theme.titlebar_tab_group_shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(8.0),
-                spread_radius: px(-4.0),
-            }]);
+            .bg(self.theme.titlebar_tab_group_bg);
 
         for (view, label, icon_name) in [
             (
@@ -661,12 +664,7 @@ impl RemCmdApp {
                         this.border_1()
                             .border_color(self.theme.titlebar_tab_border)
                             .bg(self.theme.titlebar_tab_selected_bg)
-                            .shadow(vec![BoxShadow {
-                                color: self.theme.titlebar_tab_shadow,
-                                offset: point(px(0.0), px(1.0)),
-                                blur_radius: px(3.0),
-                                spread_radius: px(-1.0),
-                            }])
+                            .shadow(self.titlebar_selected_tab_shadow())
                     })
                     .child(icon(icon_name, self.theme, IconTone::Default, 14.0))
                     .child(div().min_w(px(0.0)).truncate().text_sm().child(label))
@@ -963,13 +961,7 @@ impl RemCmdApp {
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_tab_group_border)
-            .bg(self.theme.transparent)
-            .shadow(vec![BoxShadow {
-                color: self.theme.titlebar_tab_group_shadow,
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(8.0),
-                spread_radius: px(-4.0),
-            }])
+            .bg(self.theme.titlebar_tab_group_bg)
             .overflow_x_scroll()
             .track_scroll(&self.titlebar_tabs_scroll_handle);
         let close_terminal_tooltip = self.tr("common-close-terminal");
@@ -990,23 +982,11 @@ impl RemCmdApp {
             } else {
                 self.theme.titlebar_tab_hover_bg
             };
-            let status = self
-                .pane(tab.active_pane_id)
-                .and_then(|pane| self.session(pane.session_id))
-                .map(|session| session.connection_state)
-                .unwrap_or(SessionState::Disconnected);
-            let status_color = match status {
-                SessionState::Connected => self.theme.status_ok,
-                SessionState::Failed => self.theme.error_text,
-                SessionState::Connecting
-                | SessionState::Authenticating
-                | SessionState::Disconnecting => self.theme.status_warn,
-                SessionState::Disconnected => self.theme.text_faint,
-            };
+            let status_color = self.tab_status_color(tab);
             let pressed_background = self.theme.titlebar_tab_pressed_bg;
             let selected_background = self.theme.titlebar_tab_selected_bg;
             let tab_border = self.theme.titlebar_tab_border;
-            let tab_shadow = self.theme.titlebar_tab_shadow;
+            let tab_shadow = self.titlebar_selected_tab_shadow();
             let (start_tab_basis, end_tab_basis, start_tab_min_width, end_tab_min_width) =
                 if is_active {
                     (
@@ -1215,12 +1195,7 @@ impl RemCmdApp {
                             .border_1()
                             .border_color(tab_border)
                             .bg(selected_background)
-                            .shadow(vec![BoxShadow {
-                                color: tab_shadow,
-                                offset: point(px(0.0), px(1.0)),
-                                blur_radius: px(3.0),
-                                spread_radius: px(-1.0),
-                            }])
+                            .shadow(tab_shadow.clone())
                             .with_animation(
                                 SharedString::from(format!("titlebar-tab-selection-{}", tab_id.0)),
                                 Animation::new(
@@ -1240,6 +1215,19 @@ impl RemCmdApp {
                         cx.notify();
                     }
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.open_tab_context_menu(tab_id, event, window, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_tab(tab_id, cx);
+                    }),
+                )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.activate_tab_in_window(tab_id, window, cx) {
                         cx.notify();
@@ -1347,7 +1335,6 @@ impl RemCmdApp {
     }
 
     pub(super) fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let query = self.sidebar_search.read(cx).text().trim().to_lowercase();
         let list_hover_background = self.theme.list_hover_bg;
         let pressed_background = self.theme.control_pressed_bg;
         let mut connection_tree = div()
@@ -1386,15 +1373,16 @@ impl RemCmdApp {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(10.0))
-                    .h(px(36.0))
+                    .gap(px(8.0))
+                    .h(px(32.0))
                     .px_2()
                     .rounded_md()
+                    .text_sm()
                     .bg(home_background)
                     .cursor_pointer()
                     .hover(move |this| this.bg(home_hover))
                     .active(move |this| this.bg(pressed_background))
-                    .child(self.render_sidebar_icon(IconName::Home, 17.0))
+                    .child(self.render_sidebar_nav_icon(IconName::Home))
                     .child(self.tr("sidebar-home"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.show_home(window, cx);
@@ -1413,14 +1401,15 @@ impl RemCmdApp {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(10.0))
-                    .h(px(36.0))
+                    .gap(px(8.0))
+                    .h(px(32.0))
                     .px_2()
                     .rounded_md()
+                    .text_sm()
                     .cursor_pointer()
                     .hover(move |this| this.bg(list_hover_background))
                     .active(move |this| this.bg(pressed_background))
-                    .child(self.render_sidebar_icon(IconName::Terminal, 17.0))
+                    .child(self.render_sidebar_nav_icon(IconName::Terminal))
                     .child(self.tr("sidebar-local-terminal"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_local_terminal(window, cx);
@@ -1450,14 +1439,15 @@ impl RemCmdApp {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(10.0))
-                    .h(px(36.0))
+                    .gap(px(8.0))
+                    .h(px(32.0))
                     .px_2()
                     .rounded_md()
+                    .text_sm()
                     .cursor_pointer()
                     .hover(move |this| this.bg(list_hover_background))
                     .active(move |this| this.bg(pressed_background))
-                    .child(self.render_sidebar_icon(IconName::NewConnection, 17.0))
+                    .child(self.render_sidebar_nav_icon(IconName::NewConnection))
                     .child(self.tr("sidebar-new-connection"))
                     .on_click(cx.listener(|this, _, _, cx| this.add_profile(cx))),
             );
@@ -1467,9 +1457,26 @@ impl RemCmdApp {
         } else {
             IconName::Expand
         };
+        // Like Finder's section headers, the disclosure chevron appears on hover and
+        // stays visible while the section is collapsed.
+        let section_chevron = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(18.0))
+            .child(icon_with_color(section_icon, self.theme.text_muted, 13.0));
+        let section_chevron = if self.connections_expanded {
+            section_chevron
+                .opacity(0.0)
+                .group_hover("sidebar-connections-header", |style| style.opacity(1.0))
+        } else {
+            section_chevron
+        };
         connection_tree = connection_tree.child(
             div()
                 .id("toggle_connections")
+                .group("sidebar-connections-header")
                 .relative()
                 .child(crate::accessibility::node(
                     "toggle-connections",
@@ -1480,34 +1487,23 @@ impl RemCmdApp {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(10.0))
-                .h(px(32.0))
-                .mt_2()
-                .px_2()
+                .justify_between()
+                .h(px(28.0))
+                .mt_3()
+                .pl_2()
+                .pr_1()
                 .rounded_md()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(self.theme.text_muted)
                 .cursor_pointer()
-                .hover(move |this| this.bg(list_hover_background))
-                .active(move |this| this.bg(pressed_background))
-                .child(self.render_sidebar_icon(section_icon, 15.0))
                 .child(self.tr("sidebar-connections"))
+                .child(section_chevron)
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_connections(cx))),
         );
 
-        let mut visible_profiles = 0usize;
         if self.connections_expanded {
             for profile in &self.profiles {
-                if !query.is_empty()
-                    && !profile.name.to_lowercase().contains(&query)
-                    && !profile.host.to_lowercase().contains(&query)
-                    && !profile.address().to_lowercase().contains(&query)
-                {
-                    continue;
-                }
-                visible_profiles += 1;
-
                 let select_profile_id = profile.id.clone();
                 let new_terminal_profile_id = profile.id.clone();
                 let context_profile_id = profile.id.clone();
@@ -1534,6 +1530,14 @@ impl RemCmdApp {
                 }
                 let is_selected = self.active_panel == ActivePanel::Server
                     && self.selected_profile_id.as_ref() == Some(&profile.id);
+                let row_group = SharedString::from(format!("sidebar-profile-{}", profile.id));
+                let new_terminal_button = if is_selected {
+                    new_terminal_button
+                } else {
+                    new_terminal_button
+                        .opacity(0.0)
+                        .group_hover(row_group.clone(), |style| style.opacity(1.0))
+                };
                 let background = if is_selected {
                     self.theme.list_selected_bg
                 } else {
@@ -1547,6 +1551,7 @@ impl RemCmdApp {
                 connection_tree = connection_tree.child(
                     div()
                         .id(SharedString::from(format!("profile-{}", profile.id)))
+                        .group(row_group)
                         .relative()
                         .child(crate::accessibility::node(
                             "profile",
@@ -1555,8 +1560,8 @@ impl RemCmdApp {
                         .flex()
                         .flex_none()
                         .items_center()
-                        .gap(px(10.0))
-                        .h(px(34.0))
+                        .gap(px(8.0))
+                        .h(px(30.0))
                         .pl_2()
                         .pr_1()
                         .rounded_md()
@@ -1564,7 +1569,7 @@ impl RemCmdApp {
                         .cursor_pointer()
                         .hover(move |this| this.bg(hover))
                         .active(move |this| this.bg(pressed_background))
-                        .child(self.render_sidebar_icon(IconName::Server, 18.0))
+                        .child(self.render_sidebar_nav_icon(IconName::Server))
                         .child(
                             div()
                                 .flex_1()
@@ -1576,10 +1581,11 @@ impl RemCmdApp {
                         .child(new_terminal_button)
                         .on_mouse_down(
                             MouseButton::Right,
-                            cx.listener(move |this, event, _, cx| {
+                            cx.listener(move |this, event, window, cx| {
                                 this.open_profile_context_menu(
                                     context_profile_id.clone(),
                                     event,
+                                    window,
                                     cx,
                                 );
                             }),
@@ -1599,17 +1605,6 @@ impl RemCmdApp {
                     }
                 }
             }
-        }
-
-        if self.connections_expanded && visible_profiles == 0 {
-            connection_tree = connection_tree.child(
-                div()
-                    .ml(px(32.0))
-                    .mt_2()
-                    .text_sm()
-                    .text_color(self.theme.text_faint)
-                    .child(self.tr("sidebar-no-match")),
-            );
         }
 
         let settings_selected = matches!(
@@ -1668,6 +1663,7 @@ impl RemCmdApp {
                             .pr_2()
                             .rounded_md()
                             .bg(settings_background)
+                            .text_sm()
                             .cursor_pointer()
                             .hover(move |this| this.bg(settings_hover))
                             .active(move |this| this.bg(pressed_background))
@@ -1711,7 +1707,7 @@ impl RemCmdApp {
                         .child(self.render_sidebar_wordmark())
                         .child(
                             self.render_icon_button(
-                                "toggle_sidebar_search",
+                                "open_spotlight",
                                 IconName::Search,
                                 self.tr("menu-search-connections"),
                                 IconTone::Default,
@@ -1719,29 +1715,67 @@ impl RemCmdApp {
                             )
                             .on_click(cx.listener(
                                 |this, _, window, cx| {
-                                    this.toggle_sidebar_search(window, cx);
+                                    this.toggle_spotlight(window, cx);
                                 },
                             )),
                         ),
                 )
             })
-            .when(
-                cfg!(target_os = "windows") || self.sidebar_search_visible,
-                |this| {
-                    this.child(
-                        div()
-                            .flex_none()
-                            .mt(px(if cfg!(target_os = "windows") {
-                                6.0
-                            } else {
-                                8.0
-                            }))
-                            .child(self.sidebar_search.clone()),
-                    )
-                },
-            )
+            // The Windows title bar carries the wordmark, so the sidebar shows a
+            // search-field-shaped button that opens Spotlight instead of the header row.
+            .when(cfg!(target_os = "windows"), |this| {
+                this.child(self.render_sidebar_spotlight_button(cx))
+            })
             .child(connection_tree)
             .child(settings_footer)
+    }
+
+    fn render_sidebar_spotlight_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = self.theme.input_focused_bg;
+        div()
+            .id("open_spotlight_field")
+            .relative()
+            .child(crate::accessibility::node(
+                "open_spotlight_field",
+                crate::accessibility::Node::button(self.tr("menu-search-connections"), true),
+            ))
+            .tab_index(0)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .mt(px(6.0))
+            .h(px(30.0))
+            .px_3()
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(self.theme.input_border)
+            .bg(self.theme.input_bg)
+            .focus(|style| style.border_color(self.theme.accent))
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover))
+            .child(icon_with_color(
+                IconName::Search,
+                self.theme.text_muted,
+                14.0,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_sm()
+                    .text_color(self.theme.input_placeholder)
+                    .child(self.tr("menu-search-connections")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(self.theme.text_faint)
+                    .child("Ctrl+F"),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_spotlight(window, cx)))
     }
 
     pub(super) fn render_sidebar_terminal_tab(
@@ -1764,9 +1798,32 @@ impl RemCmdApp {
         } else {
             self.theme.list_hover_bg
         };
+        let hover_group = SharedString::from(format!("sidebar-tab-hover-{}", tab_id.0));
+        let close_button = self
+            .render_icon_button(
+                SharedString::from(format!("close-sidebar-tab-{}", tab_id.0)),
+                IconName::Cancel,
+                self.tr("common-close-terminal"),
+                IconTone::Default,
+                true,
+            )
+            .size(px(22.0))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_tab(tab_id, cx);
+            }));
+        // Like Safari's sidebar tabs, the close control appears for the selected or hovered row.
+        let close_button = if is_active {
+            close_button
+        } else {
+            close_button
+                .opacity(0.0)
+                .group_hover(hover_group.clone(), |style| style.opacity(1.0))
+        };
 
         div()
             .id(SharedString::from(format!("sidebar-tab-{}", tab_id.0)))
+            .group(hover_group)
             .relative()
             .child(crate::accessibility::node(
                 "terminal-tab",
@@ -1779,7 +1836,7 @@ impl RemCmdApp {
             .flex_none()
             .items_center()
             .gap_2()
-            .h(px(32.0))
+            .h(px(30.0))
             .ml(px(20.0))
             .pl_2()
             .pr_1()
@@ -1788,35 +1845,123 @@ impl RemCmdApp {
             .cursor_pointer()
             .hover(move |this| this.bg(hover))
             .active(move |this| this.bg(pressed_background))
-            .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(18.0))
+                    .child(self.render_sidebar_icon(IconName::Terminal, 16.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .bottom_0()
+                            .size(px(5.0))
+                            .rounded_full()
+                            .bg(self.tab_status_color(tab)),
+                    ),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .truncate()
                     .text_sm()
-                    .text_color(self.theme.text_muted)
+                    .text_color(if is_active {
+                        self.theme.text_primary
+                    } else {
+                        self.theme.text_muted
+                    })
                     .child(terminal_title),
             )
-            .child(
-                self.render_icon_button(
-                    SharedString::from(format!("close-sidebar-tab-{}", tab_id.0)),
-                    IconName::Cancel,
-                    self.tr("common-close-terminal"),
-                    IconTone::Default,
-                    true,
-                )
-                .size(px(24.0))
-                .on_click(cx.listener(move |this, _, _, cx| {
+            .child(close_button)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_tab_context_menu(tab_id, event, window, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.close_tab(tab_id, cx);
-                })),
+                }),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 if this.activate_tab_in_window(tab_id, window, cx) {
                     cx.notify();
                 }
             }))
+    }
+
+    pub(super) fn tab_status_color(&self, tab: &TerminalTab) -> Hsla {
+        let status = self
+            .pane(tab.active_pane_id)
+            .and_then(|pane| self.session(pane.session_id))
+            .map(|session| session.connection_state)
+            .unwrap_or(SessionState::Disconnected);
+        match status {
+            SessionState::Connected => self.theme.status_ok,
+            SessionState::Failed => self.theme.error_text,
+            SessionState::Connecting
+            | SessionState::Authenticating
+            | SessionState::Disconnecting => self.theme.status_warn,
+            SessionState::Disconnected => self.theme.text_faint,
+        }
+    }
+
+    pub(super) fn open_tab_context_menu(
+        &mut self,
+        tab_id: TabId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile_id) = self.tab(tab_id).map(|tab| tab.profile_id.clone()) else {
+            return;
+        };
+        let can_open_terminal = profile_id == LOCAL_PROFILE_ID
+            || (self.credential_lookup_task.is_none()
+                && !self
+                    .credential_mutations_in_progress
+                    .contains_key(&profile_id));
+        let has_other_tabs = self.tabs.len() > 1;
+        let entries = vec![
+            ContextMenuEntry::item(
+                "tab-context-new-terminal",
+                IconName::Add,
+                self.tr("profile-context-new-terminal"),
+                can_open_terminal,
+                move |this, window, cx| {
+                    if profile_id == LOCAL_PROFILE_ID {
+                        this.open_local_terminal(window, cx);
+                    } else {
+                        this.select_profile(profile_id.clone(), window, cx);
+                        this.connect_selected_profile_in_new_session(window, cx);
+                    }
+                },
+            ),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::item(
+                "tab-context-close",
+                IconName::Cancel,
+                self.tr("menu-close-terminal"),
+                true,
+                move |this, _, cx| this.close_tab(tab_id, cx),
+            ),
+            ContextMenuEntry::item(
+                "tab-context-close-others",
+                IconName::Cancel,
+                self.tr("tab-context-close-others"),
+                has_other_tabs,
+                move |this, window, cx| this.close_other_tabs(tab_id, window, cx),
+            ),
+        ];
+        self.open_context_menu(None, entries, event.position, window, cx);
     }
 
     pub(super) fn glass_sidebar_surface(&self) -> gpui::Div {
@@ -2260,7 +2405,7 @@ impl RemCmdApp {
         } else {
             self.tr("common-connect")
         };
-        let action_hover = self.theme.accent_hover;
+        let action_hover = self.theme.accent_fill_hover;
         let action_pressed = self.theme.button_primary_pressed_bg;
         let mut connect = div()
             .id("server-overview-connect")
@@ -2276,7 +2421,7 @@ impl RemCmdApp {
             .h(px(40.0))
             .px_5()
             .rounded_lg()
-            .bg(self.theme.accent)
+            .bg(self.theme.accent_fill)
             .text_color(self.theme.on_accent)
             .font_weight(FontWeight::MEDIUM)
             .when(can_connect, |this| {
@@ -2733,7 +2878,9 @@ impl RemCmdApp {
         let label = label.into();
         let (hover, pressed) = match tone {
             IconTone::Danger => (self.theme.danger, self.theme.danger_hover),
-            IconTone::Accent | IconTone::Default => (self.theme.accent, self.theme.accent_hover),
+            IconTone::Accent | IconTone::Default => {
+                (self.theme.accent_fill, self.theme.accent_fill_hover)
+            }
         };
         let on_accent = self.theme.on_accent;
         let base_color = match tone {

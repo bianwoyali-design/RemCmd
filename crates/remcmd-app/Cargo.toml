@@ -51,6 +51,7 @@ name = "remcmd"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 directories.workspace = true
 fluent-bundle.workspace = true
 gpui.workspace = true
@@ -75,6 +76,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSAppearance",
     "NSBitmapImageRep",
+    "NSCell",
     "NSColor",
     "NSColorSpace",
     "NSWorkspace",
@@ -89,6 +91,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSGraphics",
     "NSImage",
     "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
     "NSOpenPanel",
     "NSPanel",
     "NSResponder",
@@ -101,6 +105,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSData",
     "NSDictionary",
     "NSObject",
+    "NSProcessInfo",
     "NSValue",
     "NSString",
     "NSURL",
