@@ -11,17 +11,20 @@ use crate::terminal_input::{
     should_translate_alternate_scroll,
 };
 use crate::terminal_view::{TerminalPalette, palette_color};
-use crate::text_field::{self, TextField, bind_text_field_keys};
+use crate::text_field::{self, TextField, TextFieldEvent, bind_text_field_keys};
 use crate::theme::{IconTone, TextButtonTone, Theme, icon_button, set_global_theme, text_button};
 
 mod bootstrap;
 mod connection_flow;
+mod context_menu;
 mod diagnostics;
 mod keyboard;
 mod lifecycle;
 mod menus;
 #[cfg(target_os = "macos")]
 mod native_material;
+#[cfg(target_os = "macos")]
+mod native_menu;
 mod openssh_import;
 mod performance;
 mod profiles;
@@ -29,6 +32,7 @@ mod quick_commands;
 mod settings;
 mod sftp;
 mod shell;
+mod spotlight;
 mod terminal_session;
 mod updates;
 mod workspace;
@@ -39,12 +43,15 @@ use connection_flow::{
     ConnectionCredential, CredentialPrompt, CredentialPromptKind, PendingConnectionPreparation,
     ProxyCommandApprovalPrompt, connection_stage_label, localized_connection_error_parts,
 };
+use context_menu::{ContextMenu, ContextMenuEntry};
+#[cfg(target_os = "macos")]
+use context_menu::{SelectMenuAnchors, SelectMenuOption};
 use lifecycle::ExitTarget;
 #[cfg(target_os = "macos")]
 pub(crate) use lifecycle::request_application_exit;
 use menus::{WINDOWS_CHROME_HEIGHT, WindowsMenu, application_menus, configure_application_menu};
 use performance::ServerPerformanceState;
-use profiles::{ProfileAuthKind, ProfileContextMenu, ProfileEditor, profile_auth_label};
+use profiles::{ProfileAuthKind, ProfileEditor, profile_auth_label};
 use quick_commands::{BOTTOM_PANEL_DEFAULT_HEIGHT, QuickCommandPrompt, clamp_bottom_panel_height};
 use settings::{
     SettingsSelector, UI_MONOSPACE_FONT_FAMILY, normalize_terminal_font_families,
@@ -52,7 +59,7 @@ use settings::{
 };
 use sftp::{
     SIDEBAR_SFTP_REQUEST_ID_START, SftpAvailability, SftpBrowserPlacement, SftpBrowserState,
-    SftpContextMenu, SftpCreateKind, SftpCreatePrompt, SftpTransferQueue, format_remote_size,
+    SftpCreateKind, SftpCreatePrompt, SftpTransferQueue, format_remote_size,
     sftp_browser_placement_for_request,
 };
 use shell::{
@@ -64,8 +71,8 @@ use shell::{
 use shell::{TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y};
 use terminal_session::{
     ActiveTerminal, LOCAL_PROFILE_ID, SessionMessage, SessionMessageArg, TERMINAL_COLUMNS,
-    TERMINAL_EVENT_BATCH_LIMIT, TERMINAL_REDRAW_INTERVAL, TERMINAL_ROWS, TerminalContextMenu,
-    TerminalSession, TerminalSessionKind,
+    TERMINAL_EVENT_BATCH_LIMIT, TERMINAL_REDRAW_INTERVAL, TERMINAL_ROWS, TerminalSession,
+    TerminalSessionKind,
 };
 use workspace::{SessionId, TabId, TerminalPane, TerminalTab, TerminalTabView};
 
@@ -128,6 +135,10 @@ gpui::actions!(settings_selector, [CancelSettingsSelector]);
 gpui::actions!(sftp_create_prompt, [SubmitSftpCreate, CancelSftpCreate]);
 gpui::actions!(quick_command, [SubmitQuickCommand, CancelQuickCommand]);
 gpui::actions!(
+    spotlight,
+    [ConfirmSpotlight, RevealSpotlight, CloseSpotlight]
+);
+gpui::actions!(
     app_menu,
     [
         ShowHome,
@@ -143,6 +154,8 @@ gpui::actions!(
         SplitVertical,
         CloseActivePane,
         CloseActiveTab,
+        ShowPreviousTab,
+        ShowNextTab,
         ResetActiveTerminal,
         ShowTerminalView,
         ShowFilesView,
@@ -188,8 +201,6 @@ struct RemCmdApp {
     panes: Vec<TerminalPane>,
     active_pane_id: Option<PaneId>,
     next_pane_id: u64,
-    sidebar_search: Entity<TextField>,
-    sidebar_search_visible: bool,
     connections_expanded: bool,
     sidebar_width: f32,
     left_sidebar_open: bool,
@@ -219,9 +230,10 @@ struct RemCmdApp {
     transfer_settings: TransferSettings,
     transfer_rate_limiter: Arc<TransferRateLimiter>,
     next_transfer_session_cursor: usize,
-    profile_context_menu: Option<ProfileContextMenu>,
-    sftp_context_menu: Option<SftpContextMenu>,
-    terminal_context_menu: Option<TerminalContextMenu>,
+    context_menu: Option<ContextMenu>,
+    #[cfg(target_os = "macos")]
+    select_menu_anchors: SelectMenuAnchors,
+    spotlight: Option<spotlight::Spotlight>,
     windows_menu_open: Option<WindowsMenu>,
     sftp_create_prompt: Option<SftpCreatePrompt>,
     quick_command_prompt: Option<QuickCommandPrompt>,
@@ -350,17 +362,18 @@ impl RemCmdApp {
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             this.refresh_system_theme(window, cx);
         });
-        let sidebar_search = cx
-            .new(|cx| TextField::new_search(cx, "", localizer.text("sidebar-search-placeholder")));
-        cx.observe(&sidebar_search, |_, _, cx| cx.notify()).detach();
         let diagnostic_module_filter =
             cx.new(|cx| TextField::new(cx, "", localizer.text("diagnostics-filter-module")));
-        cx.observe(&diagnostic_module_filter, |_, _, cx| cx.notify())
-            .detach();
+        cx.subscribe(&diagnostic_module_filter, |_, _, _: &TextFieldEvent, cx| {
+            cx.notify()
+        })
+        .detach();
         let diagnostic_text_filter =
             cx.new(|cx| TextField::new(cx, "", localizer.text("diagnostics-filter-text")));
-        cx.observe(&diagnostic_text_filter, |_, _, cx| cx.notify())
-            .detach();
+        cx.subscribe(&diagnostic_text_filter, |_, _, _: &TextFieldEvent, cx| {
+            cx.notify()
+        })
+        .detach();
         let settings_focus_handle = cx.focus_handle();
         let quick_terminal_focus_handle = cx.focus_handle();
 
@@ -391,8 +404,6 @@ impl RemCmdApp {
             panes: Vec::new(),
             active_pane_id: None,
             next_pane_id: 1,
-            sidebar_search,
-            sidebar_search_visible: false,
             connections_expanded: true,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             left_sidebar_open: true,
@@ -422,9 +433,10 @@ impl RemCmdApp {
             transfer_settings,
             transfer_rate_limiter,
             next_transfer_session_cursor: 0,
-            profile_context_menu: None,
-            sftp_context_menu: None,
-            terminal_context_menu: None,
+            context_menu: None,
+            #[cfg(target_os = "macos")]
+            select_menu_anchors: SelectMenuAnchors::default(),
+            spotlight: None,
             windows_menu_open: None,
             sftp_create_prompt: None,
             quick_command_prompt: None,
@@ -680,92 +692,11 @@ impl Render for RemCmdApp {
                     ),
             );
         }
-        if self.profile_context_menu.is_some() {
-            root = root
-                .child(
-                    div()
-                        .id("profile_context_menu_dismiss_layer")
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .bg(self.theme.transparent)
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.profile_context_menu = None;
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _, _, cx| {
-                                this.profile_context_menu = None;
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(deferred(self.render_profile_context_menu(window, cx)).with_priority(20));
+        if let Some(layer) = self.render_context_menu_layer(window, cx) {
+            root = root.children(layer);
         }
-        if self.sftp_context_menu.is_some() {
-            root = root
-                .child(
-                    div()
-                        .id("sftp_context_menu_dismiss_layer")
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .bg(self.theme.transparent)
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.sftp_context_menu = None;
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _, _, cx| {
-                                this.sftp_context_menu = None;
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(deferred(self.render_sftp_context_menu(window, cx)).with_priority(20));
-        }
-        if self.terminal_context_menu.is_some() {
-            root = root
-                .child(
-                    div()
-                        .id("terminal_context_menu_dismiss_layer")
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .bg(self.theme.transparent)
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.terminal_context_menu = None;
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _, _, cx| {
-                                this.terminal_context_menu = None;
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(deferred(self.render_terminal_context_menu(window, cx)).with_priority(20));
+        if let Some(layer) = self.render_spotlight_layer(window, cx) {
+            root = root.child(layer);
         }
 
         if self.proxy_command_approval_prompt.is_some() {

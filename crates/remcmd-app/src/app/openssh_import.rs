@@ -325,7 +325,7 @@ impl RemCmdApp {
                                         .border_1()
                                         .border_color(self.theme.border_strong)
                                         .bg(if selected {
-                                            self.theme.accent
+                                            self.theme.accent_fill
                                         } else {
                                             self.theme.control_bg
                                         })

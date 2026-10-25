@@ -2,6 +2,41 @@
 
 All notable changes to RemCmd are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- A Spotlight-style search panel on macOS, Windows, and Linux that finds open
+  terminals, saved connections, and common actions. Open it with Cmd/Ctrl+F or
+  the sidebar search control; Return connects to a server and Cmd/Ctrl+Return
+  opens its details instead.
+- Previous and next terminal commands (Cmd+Shift+[ / Cmd+Shift+] and
+  Ctrl+Tab / Ctrl+Shift+Tab), and a Close Other Terminals tab menu item.
+- Name, Date Modified, and Size columns in the SFTP file list.
+
+### Changed
+
+- On macOS, right-click menus and the pop-up pickers in Settings, the profile
+  editor, and quick commands use native AppKit menus. Windows and Linux keep
+  their existing menus.
+- On macOS, Cmd+W closes the current terminal and Cmd+Shift+W closes the
+  window, matching Terminal and Safari.
+- Closing a terminal selects its neighbour in the same sidebar group.
+- The sidebar uses consistent row sizes, accent-tinted symbols, a Finder-style
+  Connections header, and shows each connection's new-terminal button on hover
+  or selection.
+- Refreshed control, tab, and accent colours in light and dark themes.
+
+### Removed
+
+- The inline sidebar connection search, replaced by the Spotlight panel.
+
+### Performance
+
+- A focused text field or the remote file editor no longer redraws the whole
+  window on every caret blink; the window now redraws only when text changes.
+- Closed Settings pickers no longer build their option lists on every frame.
+
 ## [0.1.0] - 2026-09-08
 
 ### Added

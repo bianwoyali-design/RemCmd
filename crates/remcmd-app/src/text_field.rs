@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, App, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, Element,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun, Timer,
-    UTF16Selection, UnderlineStyle, Window, actions, div, ease_in_out, fill, point, prelude::*, px,
-    relative, size,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style,
+    TextRun, Timer, UTF16Selection, UnderlineStyle, Window, actions, div, ease_in_out, fill, point,
+    prelude::*, px, relative, size,
 };
 use secrecy::zeroize::Zeroize;
 use unicode_segmentation::UnicodeSegmentation;
@@ -68,12 +68,29 @@ fn secure_content_offset(content: &str, display_offset: usize) -> usize {
         .unwrap_or(content.len())
 }
 
+/// Emitted when a field's text changes.
+///
+/// Subscribe to this rather than observing the field: the field also notifies for caret
+/// blinks and selection changes, which should not re-render the views that contain it.
+pub enum TextFieldEvent {
+    Changed,
+}
+
+impl EventEmitter<TextFieldEvent> for TextField {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextFieldStyle {
+    Standard,
+    Search,
+    Spotlight,
+}
+
 pub struct TextField {
     focus_handle: FocusHandle,
     content: String,
     placeholder: SharedString,
     is_secure: bool,
-    search_style: bool,
+    style: TextFieldStyle,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -100,7 +117,14 @@ impl TextField {
         placeholder: impl Into<SharedString>,
     ) -> Self {
         let mut field = Self::new(cx, value, placeholder);
-        field.search_style = true;
+        field.style = TextFieldStyle::Search;
+        field
+    }
+
+    /// A borderless, large-type field for a Spotlight-style search panel.
+    pub fn new_spotlight(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
+        let mut field = Self::new(cx, "", placeholder);
+        field.style = TextFieldStyle::Spotlight;
         field
     }
 
@@ -121,7 +145,7 @@ impl TextField {
             content,
             placeholder,
             is_secure,
-            search_style: false,
+            style: TextFieldStyle::Standard,
             selected_range: cursor..cursor,
             selection_reversed: false,
             marked_range: None,
@@ -157,6 +181,7 @@ impl TextField {
         self.selection_reversed = false;
         self.marked_range = None;
         self.cursor_visible = true;
+        cx.emit(TextFieldEvent::Changed);
         cx.notify();
         content
     }
@@ -167,6 +192,7 @@ impl TextField {
         self.selection_reversed = false;
         self.marked_range = None;
         self.cursor_visible = true;
+        cx.emit(TextFieldEvent::Changed);
         cx.notify();
     }
 
@@ -178,6 +204,7 @@ impl TextField {
         self.selection_reversed = false;
         self.marked_range = None;
         self.cursor_visible = true;
+        cx.emit(TextFieldEvent::Changed);
         cx.notify();
     }
 
@@ -457,6 +484,7 @@ impl EntityInputHandler for TextField {
         self.selection_reversed = false;
         self.marked_range.take();
         self.cursor_visible = true;
+        cx.emit(TextFieldEvent::Changed);
         cx.notify();
     }
 
@@ -490,6 +518,7 @@ impl EntityInputHandler for TextField {
 
         self.cursor_visible = true;
 
+        cx.emit(TextFieldEvent::Changed);
         cx.notify();
     }
 
@@ -778,7 +807,20 @@ impl Render for TextField {
                 theme.input_bg,
             )
         };
-        let focus_ring = theme.input_focus_ring;
+        let mut focus_ring = theme.input_focus_ring;
+        // The Spotlight field sits directly on its panel's glass, without a box or focus ring.
+        let spotlight = self.style == TextFieldStyle::Spotlight;
+        let (start_border, end_border, start_bg, end_bg) = if spotlight {
+            focus_ring = theme.transparent;
+            (
+                theme.transparent,
+                theme.transparent,
+                theme.transparent,
+                theme.transparent,
+            )
+        } else {
+            (start_border, end_border, start_bg, end_bg)
+        };
 
         let input = cx.entity().downgrade();
         let mut accessibility = crate::accessibility::Node::button(self.placeholder.clone(), true);
@@ -828,11 +870,11 @@ impl Render for TextField {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .line_height(px(18.0))
-            .text_size(px(14.0))
+            .line_height(px(if spotlight { 28.0 } else { 18.0 }))
+            .text_size(px(if spotlight { 22.0 } else { 14.0 }))
             .text_color(theme.input_text)
             .w_full()
-            .rounded(px(if self.search_style {
+            .rounded(px(if self.style == TextFieldStyle::Search {
                 14.0
             } else {
                 crate::theme::CONTROL_RADIUS
@@ -841,9 +883,9 @@ impl Render for TextField {
             .overflow_hidden()
             .child(
                 div()
-                    .h(px(28.0))
+                    .h(px(if spotlight { 36.0 } else { 28.0 }))
                     .w_full()
-                    .px_3()
+                    .when(!spotlight, |this| this.px_3())
                     .py_1()
                     .child(TextElement { input: cx.entity() }),
             )

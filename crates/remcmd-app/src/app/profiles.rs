@@ -1,10 +1,12 @@
 #[cfg(not(target_os = "macos"))]
 use super::PathPromptOptions;
+#[cfg(target_os = "macos")]
+use super::SelectMenuOption;
 use super::{
     ActivePanel, AnyElement, AuthConfig, ConnectionProfile, ConnectionRoute, Context,
-    CredentialKind, DiagnosticLevel, DiagnosticsGlobal, Entity, FontWeight, IconName, IconTone,
-    IntoElement, Localizer, Pixels, ProxyConfig, RemCmdApp, SecretString, SessionState,
-    SharedString, SshRuntime, TextButtonTone, TextField, Window, deferred,
+    ContextMenuEntry, CredentialKind, DiagnosticLevel, DiagnosticsGlobal, Entity, FontWeight,
+    IconName, IconTone, IntoElement, Localizer, ProxyConfig, RemCmdApp, SecretString, SessionState,
+    SharedString, SshRuntime, TextButtonTone, TextField, TextFieldEvent, Window, deferred,
     delete_profile_auth_credentials, div, icon, load_credential, proxy_command_content_digest, px,
     save_profiles, save_profiles_with_route_secrets, session_state_key, text_button,
 };
@@ -68,7 +70,8 @@ impl RemCmdApp {
         };
         let jump_search =
             cx.new(|cx| TextField::new_search(cx, "", self.tr("sidebar-search-placeholder")));
-        cx.observe(&jump_search, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&jump_search, |_, _, _: &TextFieldEvent, cx| cx.notify())
+            .detach();
 
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Edit,
@@ -146,7 +149,8 @@ impl RemCmdApp {
         let number = self.next_profile_number;
         let jump_search =
             cx.new(|cx| TextField::new_search(cx, "", self.tr("sidebar-search-placeholder")));
-        cx.observe(&jump_search, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&jump_search, |_, _, _: &TextFieldEvent, cx| cx.notify())
+            .detach();
         self.editor = Some(ProfileEditor {
             mode: ProfileEditorMode::Create,
             profile_id: format!("demo-{number}"),
@@ -180,7 +184,7 @@ impl RemCmdApp {
     ) {
         self.dismiss_credential_prompt(cx);
         self.active_panel = ActivePanel::Server;
-        self.profile_context_menu = None;
+        self.context_menu = None;
         self.open_settings_selector = None;
         self.bottom_panel_open = false;
         self.bottom_panel_resize = None;
@@ -200,27 +204,8 @@ impl RemCmdApp {
         self.selected_profile_id = Some(profile_id);
         self.active_panel = ActivePanel::Server;
         self.active_session_id = None;
-        self.profile_context_menu = None;
+        self.context_menu = None;
         self.load_editor_for_selected_profile(cx);
-        cx.notify();
-    }
-
-    pub(super) fn toggle_sidebar_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if cfg!(target_os = "windows") {
-            if !self.left_sidebar_open {
-                self.toggle_left_sidebar(cx);
-            }
-            self.sidebar_search.focus_handle(cx).focus(window);
-            return;
-        }
-
-        self.sidebar_search_visible = !self.sidebar_search_visible;
-        if self.sidebar_search_visible {
-            self.sidebar_search.focus_handle(cx).focus(window);
-        } else {
-            self.sidebar_search
-                .update(cx, |search, cx| search.clear(cx));
-        }
         cx.notify();
     }
 
@@ -288,7 +273,7 @@ impl RemCmdApp {
             self.editor = None;
             self.profile_auth_selector_open = false;
         }
-        self.profile_context_menu = None;
+        self.context_menu = None;
         self.persist_profiles();
         self.delete_stored_credentials(selected_id, None, None, cx);
 
@@ -383,13 +368,13 @@ impl RemCmdApp {
     pub(super) fn navigate_profile_auth(
         &mut self,
         event: &gpui::KeyDownEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
         if !event.keystroke.modifiers.modified() && matches!(key, "up" | "down" | "home" | "end") {
             if !self.profile_auth_selector_open {
-                self.toggle_profile_auth_selector(cx);
+                self.toggle_profile_auth_selector(window, cx);
             } else {
                 self.profile_auth_cursor = super::keyboard::menu_index(
                     self.profile_auth_cursor,
@@ -402,7 +387,31 @@ impl RemCmdApp {
         }
     }
 
-    pub(super) fn toggle_profile_auth_selector(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_profile_auth_selector(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        if !self.profile_auth_selector_open {
+            let selected = self.editor.as_ref().map(|editor| editor.auth_kind);
+            let options = ProfileAuthKind::OPTIONS
+                .iter()
+                .map(|(auth_kind, _)| {
+                    let auth_kind = *auth_kind;
+                    SelectMenuOption::new(
+                        self.tr(profile_auth_kind_key(auth_kind)),
+                        selected == Some(auth_kind),
+                        move |this, window, cx| this.select_auth_method(auth_kind, window, cx),
+                    )
+                })
+                .collect();
+            if self.pop_up_select_menu("profile-auth-selector", options, false, window, cx) {
+                return;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
         self.profile_auth_cursor = self
             .editor
             .as_ref()
@@ -764,95 +773,47 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn render_profile_context_menu(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(menu_state) = self.profile_context_menu.as_ref() else {
-            return div().into_any_element();
-        };
-        let Some(profile) = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == menu_state.profile_id)
-        else {
-            return div().into_any_element();
-        };
-        let profile_id = profile.id.clone();
+    pub(super) fn profile_context_menu_entries(&self, profile_id: &str) -> Vec<ContextMenuEntry> {
         let has_live_session = self.sessions.iter().any(|session| {
             session.profile_id == profile_id && session.connection_state.can_disconnect()
         });
         let can_open_terminal = self.credential_lookup_task.is_none()
             && !self
                 .credential_mutations_in_progress
-                .contains_key(&profile_id);
-        let viewport = window.viewport_size();
-        let left = f32::from(menu_state.position.x)
-            .min((f32::from(viewport.width) - 196.0).max(8.0))
-            .max(8.0);
-        let top = f32::from(menu_state.position.y)
-            .min((f32::from(viewport.height) - 142.0).max(8.0))
-            .max(8.0);
+                .contains_key(profile_id);
 
-        let terminal_profile_id = profile_id.clone();
-        let mut new_terminal = self.render_context_menu_item(
-            "profile-context-new-terminal",
-            IconName::Connect,
-            self.tr("profile-context-new-terminal"),
-            IconTone::Default,
-            can_open_terminal,
-        );
-        if can_open_terminal {
-            new_terminal = new_terminal.on_click(cx.listener(move |this, _, window, cx| {
-                this.profile_context_menu = None;
-                this.selected_profile_id = Some(terminal_profile_id.clone());
-                this.active_panel = ActivePanel::Server;
-                this.connect_selected_profile_in_new_session(window, cx);
-            }));
-        }
-
-        let edit_profile_id = profile_id.clone();
-        let mut edit = self.render_context_menu_item(
-            "profile-context-edit",
-            IconName::Edit,
-            self.tr("profile-context-edit"),
-            IconTone::Default,
-            true,
-        );
-        edit = edit.on_click(cx.listener(move |this, _, _, cx| {
-            this.edit_profile(edit_profile_id.clone(), cx);
-        }));
-
-        let delete_profile_id = profile_id;
-        let mut delete = self.render_context_menu_item(
-            "profile-context-delete",
-            IconName::Delete,
-            self.tr("profile-context-delete"),
-            IconTone::Danger,
-            !has_live_session,
-        );
-        if !has_live_session {
-            delete = delete.on_click(cx.listener(move |this, _, _, cx| {
-                this.delete_profile(delete_profile_id.clone(), cx);
-            }));
-        }
-
-        self.glass_floating_surface()
-            .id("profile_context_menu")
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(188.0))
-            .flex()
-            .flex_col()
-            .p_1()
-            .occlude()
-            .child(new_terminal)
-            .child(edit)
-            .child(self.render_context_menu_separator())
-            .child(delete)
-            .into_any_element()
+        let terminal_profile_id = profile_id.to_owned();
+        let edit_profile_id = profile_id.to_owned();
+        let delete_profile_id = profile_id.to_owned();
+        vec![
+            ContextMenuEntry::item(
+                "profile-context-new-terminal",
+                IconName::Connect,
+                self.tr("profile-context-new-terminal"),
+                can_open_terminal,
+                move |this, window, cx| {
+                    this.selected_profile_id = Some(terminal_profile_id.clone());
+                    this.active_panel = ActivePanel::Server;
+                    this.connect_selected_profile_in_new_session(window, cx);
+                },
+            ),
+            ContextMenuEntry::item(
+                "profile-context-edit",
+                IconName::Edit,
+                self.tr("profile-context-edit"),
+                true,
+                move |this, _, cx| this.edit_profile(edit_profile_id.clone(), cx),
+            ),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::item(
+                "profile-context-delete",
+                IconName::Delete,
+                self.tr("profile-context-delete"),
+                !has_live_session,
+                move |this, _, cx| this.delete_profile(delete_profile_id.clone(), cx),
+            )
+            .danger(),
+        ]
     }
 
     pub(super) fn render_profile_editor_overlay(
@@ -1217,11 +1178,14 @@ impl RemCmdApp {
                     let auth = ProfileAuthKind::OPTIONS[this.profile_auth_cursor].0;
                     this.select_auth_method(auth, window, cx);
                 } else {
-                    this.toggle_profile_auth_selector(cx);
+                    this.toggle_profile_auth_selector(window, cx);
                 }
             }));
 
-        let mut selector = div().relative().flex().flex_none().child(button);
+        let mut selector = self.track_select_menu_anchor(
+            "profile-auth-selector",
+            div().relative().flex().flex_none().child(button),
+        );
         if self.profile_auth_selector_open {
             let mut menu = self
                 .glass_floating_surface()
@@ -1235,8 +1199,8 @@ impl RemCmdApp {
                 .p_1()
                 .text_sm()
                 .occlude();
-            let option_hover = self.theme.accent;
-            let option_pressed = self.theme.accent_hover;
+            let option_hover = self.theme.accent_fill;
+            let option_pressed = self.theme.accent_fill_hover;
             let on_accent = self.theme.on_accent;
             for (index, (auth_kind, _)) in ProfileAuthKind::OPTIONS.iter().copied().enumerate() {
                 let is_selected = auth_kind == selected;
@@ -1406,7 +1370,7 @@ impl RemCmdApp {
                     .rounded_md()
                     .text_xs()
                     .bg(if selected {
-                        self.theme.accent
+                        self.theme.accent_fill
                     } else {
                         self.theme.control_bg
                     })
@@ -1545,7 +1509,7 @@ impl RemCmdApp {
                             .border_1()
                             .border_color(self.theme.border_strong)
                             .bg(if order.is_some() {
-                                self.theme.accent
+                                self.theme.accent_fill
                             } else {
                                 self.theme.transparent
                             })
@@ -1628,11 +1592,6 @@ impl RemCmdApp {
 }
 
 pub(super) const PROFILE_FORM_LABEL_WIDTH: f32 = 128.0;
-
-pub(super) struct ProfileContextMenu {
-    pub(super) profile_id: String,
-    pub(super) position: gpui::Point<Pixels>,
-}
 
 #[derive(Clone)]
 pub(super) struct ProfileEditor {

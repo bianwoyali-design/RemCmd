@@ -57,6 +57,9 @@ actions!(
 #[derive(Clone, Copy, Debug)]
 pub enum FileEditorEvent {
     SaveRequested,
+    /// The text changed. Subscribe to this rather than observing the editor, which also
+    /// notifies for caret blinks and selection changes.
+    Changed,
 }
 
 #[derive(Clone)]
@@ -143,6 +146,7 @@ impl FileEditor {
         self.reveal_cursor = false;
         self.cursor_visible = true;
         self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
+        cx.emit(FileEditorEvent::Changed);
         cx.notify();
     }
 
@@ -162,6 +166,7 @@ impl FileEditor {
         self.preferred_column = None;
         self.reveal_cursor = true;
         self.cursor_visible = true;
+        cx.emit(FileEditorEvent::Changed);
         cx.notify();
     }
 
@@ -583,6 +588,7 @@ impl EntityInputHandler for FileEditor {
         self.preferred_column = None;
         self.reveal_cursor = true;
         self.cursor_visible = true;
+        cx.emit(FileEditorEvent::Changed);
         cx.notify();
     }
 
@@ -616,6 +622,7 @@ impl EntityInputHandler for FileEditor {
         self.preferred_column = None;
         self.reveal_cursor = true;
         self.cursor_visible = true;
+        cx.emit(FileEditorEvent::Changed);
         cx.notify();
     }
 

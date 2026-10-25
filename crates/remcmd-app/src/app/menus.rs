@@ -1,14 +1,14 @@
 use super::{
-    AnyElement, AnyView, App, CancelProfileEditor, CheckForUpdates, CloseActivePane,
+    ActivePanel, AnyElement, AnyView, App, CancelProfileEditor, CheckForUpdates, CloseActivePane,
     CloseActiveTab, CloseWindow, CommandTooltip, ConnectSelectedProfile, Context,
     DisconnectActiveSession, ExitTarget, IconName, IntoElement, KeyBinding, Localizer, Menu,
     MenuItem, MinimizeWindow, NewConnection, NewLocalTerminal, NewRemoteTerminal, Quit, RemCmdApp,
     RemCmdMainWindow, ResetActiveTerminal, RightSidebarView, SaveProfileEditor, SharedString,
-    ShowAbout, ShowFilesView, ShowHome, ShowPerformanceSidebar, ShowSettings, ShowSftpSidebar,
-    ShowTerminalView, SplitAxis, SplitHorizontal, SplitVertical, TerminalTabView,
-    ToggleBottomPanel, ToggleConnectionSearch, ToggleFullscreen, ToggleLeftSidebar, Window,
-    WindowControlArea, ZoomWindow, div, file_editor, icon_with_color, platform_chrome_height, px,
-    text_field, wordmark,
+    ShowAbout, ShowFilesView, ShowHome, ShowNextTab, ShowPerformanceSidebar, ShowPreviousTab,
+    ShowSettings, ShowSftpSidebar, ShowTerminalView, SplitAxis, SplitHorizontal, SplitVertical,
+    TerminalTabView, ToggleBottomPanel, ToggleConnectionSearch, ToggleFullscreen,
+    ToggleLeftSidebar, Window, WindowControlArea, ZoomWindow, div, file_editor, icon_with_color,
+    platform_chrome_height, px, text_field, wordmark,
 };
 use gpui::prelude::*;
 
@@ -189,8 +189,8 @@ impl RemCmdApp {
         let foreground = self.theme.text_primary;
         let muted = self.theme.text_muted;
         let on_accent = self.theme.on_accent;
-        let hover = self.theme.accent;
-        let pressed = self.theme.accent_hover;
+        let hover = self.theme.accent_fill;
+        let pressed = self.theme.accent_fill_hover;
         let row = div()
             .id(id)
             .relative()
@@ -280,6 +280,9 @@ impl RemCmdApp {
             | WindowsMenuCommand::ResetActiveTerminal
             | WindowsMenuCommand::CloseActivePane
             | WindowsMenuCommand::CloseActiveTab => self.active_session().is_some(),
+            WindowsMenuCommand::ShowPreviousTab | WindowsMenuCommand::ShowNextTab => {
+                !self.tabs.is_empty()
+            }
             _ => true,
         }
     }
@@ -329,10 +332,12 @@ impl RemCmdApp {
                     self.close_tab(tab_id, cx);
                 }
             }
+            WindowsMenuCommand::ShowPreviousTab => self.activate_adjacent_tab(-1, window, cx),
+            WindowsMenuCommand::ShowNextTab => self.activate_adjacent_tab(1, window, cx),
             WindowsMenuCommand::ShowHome => self.show_home(window, cx),
             WindowsMenuCommand::ToggleLeftSidebar => self.toggle_left_sidebar(cx),
             WindowsMenuCommand::ToggleConnectionSearch => {
-                self.toggle_sidebar_search(window, cx);
+                self.toggle_spotlight(window, cx);
             }
             WindowsMenuCommand::ShowSftpSidebar => {
                 self.set_right_sidebar_view(RightSidebarView::Sftp, cx);
@@ -569,6 +574,8 @@ pub(super) enum WindowsMenuCommand {
     ResetActiveTerminal,
     CloseActivePane,
     CloseActiveTab,
+    ShowPreviousTab,
+    ShowNextTab,
     ShowHome,
     ToggleLeftSidebar,
     ToggleConnectionSearch,
@@ -817,6 +824,17 @@ pub(super) fn windows_menu_entries(menu: WindowsMenu) -> Vec<WindowsMenuEntry> {
             },
             Separator,
             Item {
+                label_key: "menu-show-previous-tab",
+                shortcut: "Ctrl+Shift+Tab",
+                command: Command::ShowPreviousTab,
+            },
+            Item {
+                label_key: "menu-show-next-tab",
+                shortcut: "Ctrl+Tab",
+                command: Command::ShowNextTab,
+            },
+            Separator,
+            Item {
                 label_key: "menu-close-window",
                 shortcut: "Ctrl+W",
                 command: Command::CloseWindow,
@@ -913,6 +931,9 @@ pub(super) fn application_menus(localizer: &Localizer) -> Vec<Menu> {
                 MenuItem::action(localizer.text("menu-zoom"), ZoomWindow),
                 MenuItem::action(localizer.text("menu-fullscreen"), ToggleFullscreen),
                 MenuItem::separator(),
+                MenuItem::action(localizer.text("menu-show-previous-tab"), ShowPreviousTab),
+                MenuItem::action(localizer.text("menu-show-next-tab"), ShowNextTab),
+                MenuItem::separator(),
                 MenuItem::action(localizer.text("menu-close-window"), CloseWindow),
             ],
         },
@@ -942,8 +963,13 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
         KeyBinding::new("cmd-d", SplitHorizontal, None),
         KeyBinding::new("cmd-shift-d", SplitVertical, None),
         KeyBinding::new("alt-cmd-w", CloseActivePane, None),
-        KeyBinding::new("cmd-shift-w", CloseActiveTab, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        // Like Terminal and Safari: cmd-w closes the terminal, cmd-shift-w the window.
+        KeyBinding::new("cmd-w", CloseActiveTab, None),
+        KeyBinding::new("cmd-{", ShowPreviousTab, None),
+        KeyBinding::new("cmd-}", ShowNextTab, None),
+        KeyBinding::new("ctrl-shift-tab", ShowPreviousTab, None),
+        KeyBinding::new("ctrl-tab", ShowNextTab, None),
+        KeyBinding::new("cmd-shift-w", CloseWindow, None),
         KeyBinding::new("cmd-r", ResetActiveTerminal, None),
         KeyBinding::new("cmd-1", ShowTerminalView, None),
         KeyBinding::new("cmd-2", ShowFilesView, None),
@@ -1024,10 +1050,28 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
         dispatch_main_window_action(cx, |this, window, cx| this.close_active_pane(window, cx));
     });
     cx.on_action(|_: &CloseActiveTab, cx| {
-        dispatch_main_window_action(cx, |this, _, cx| {
-            if let Some(tab_id) = this.active_tab_id {
-                this.close_tab(tab_id, cx);
+        dispatch_main_window_action(cx, |this, window, cx| {
+            match this.active_tab_id {
+                Some(tab_id) if this.active_panel == ActivePanel::Connection => {
+                    this.close_tab(tab_id, cx);
+                }
+                // On macOS cmd-w closes the window once no terminal is in front.
+                _ if cfg!(target_os = "macos") => {
+                    this.request_exit(ExitTarget::Window, window, cx);
+                }
+                Some(tab_id) => this.close_tab(tab_id, cx),
+                None => {}
             }
+        });
+    });
+    cx.on_action(|_: &ShowPreviousTab, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.activate_adjacent_tab(-1, window, cx);
+        });
+    });
+    cx.on_action(|_: &ShowNextTab, cx| {
+        dispatch_main_window_action(cx, |this, window, cx| {
+            this.activate_adjacent_tab(1, window, cx);
         });
     });
     cx.on_action(|_: &ResetActiveTerminal, cx| {
@@ -1052,7 +1096,7 @@ pub(super) fn configure_application_menu(cx: &mut App, localizer: &Localizer) {
     });
     cx.on_action(|_: &ToggleConnectionSearch, cx| {
         dispatch_main_window_action(cx, |this, window, cx| {
-            this.toggle_sidebar_search(window, cx);
+            this.toggle_spotlight(window, cx);
         });
     });
     cx.on_action(|_: &ShowSftpSidebar, cx| {

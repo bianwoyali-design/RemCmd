@@ -1,10 +1,10 @@
 use super::{
     ActivePanel, AnyElement, Bounds, ClipboardItem, ConnectionCredential, ConnectionHandle,
-    ConnectionStage, Context, CursorStyle, ElementInputHandler, EntityInputHandler, FocusHandle,
-    HostKeyInfo, IconName, IconTone, IntoElement, KeyDownEvent, Keystroke, LocalTerminal,
-    LocalTerminalEvent, LocalTerminalHandle, Localizer, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaneId, PaneLayout, Pixels, PtySize, Range, Rc, RefCell,
-    RemCmdApp, RightSidebarView, SIDEBAR_SFTP_REQUEST_ID_START, ScrollWheelEvent,
+    ConnectionStage, Context, ContextMenuEntry, CursorStyle, ElementInputHandler,
+    EntityInputHandler, FocusHandle, HostKeyInfo, IconName, IconTone, IntoElement, KeyDownEvent,
+    Keystroke, LocalTerminal, LocalTerminalEvent, LocalTerminalHandle, Localizer, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaneId, PaneLayout, Pixels, PtySize, Range, Rc,
+    RefCell, RemCmdApp, RightSidebarView, SIDEBAR_SFTP_REQUEST_ID_START, ScrollWheelEvent,
     ServerPerformanceState, SessionId, SessionState, SftpAvailability, SftpBrowserPlacement,
     SftpBrowserState, SftpTransferQueue, SharedString, SplitAxis, SshError, SshErrorKind, Task,
     TerminalCanvasCache, TerminalCanvasFrame, TerminalCanvasInput, TerminalCellMetrics,
@@ -168,13 +168,8 @@ impl RemCmdApp {
             self.quick_terminal_focus_handle.focus(window);
         }
 
-        self.sftp_context_menu = None;
-        self.terminal_context_menu = Some(TerminalContextMenu {
-            session_id,
-            position: event.position,
-        });
-        cx.stop_propagation();
-        cx.notify();
+        let entries = self.terminal_context_menu_entries(session_id);
+        self.open_context_menu(Some(session_id), entries, event.position, window, cx);
     }
 
     pub(super) fn begin_terminal_selection(
@@ -323,7 +318,7 @@ impl RemCmdApp {
         session.terminal_selection = None;
         session.terminal_selecting = false;
         session.terminal_scroll_accumulator = 0.0;
-        self.terminal_context_menu = None;
+        self.context_menu = None;
         cx.notify();
     }
 
@@ -1208,17 +1203,9 @@ impl RemCmdApp {
             )
     }
 
-    pub(super) fn render_terminal_context_menu(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(menu_state) = self.terminal_context_menu.as_ref() else {
-            return div().into_any_element();
-        };
-        let session_id = menu_state.session_id;
+    fn terminal_context_menu_entries(&self, session_id: SessionId) -> Vec<ContextMenuEntry> {
         let Some(session) = self.session(session_id) else {
-            return div().into_any_element();
+            return Vec::new();
         };
         let can_copy = session
             .terminal_selection
@@ -1230,86 +1217,43 @@ impl RemCmdApp {
             size.rows() > 0 && size.columns() > 0
         });
         let can_reset = session.terminal.is_some();
-        let viewport = window.viewport_size();
-        let left = f32::from(menu_state.position.x)
-            .min((f32::from(viewport.width) - 196.0).max(8.0))
-            .max(8.0);
-        let top = f32::from(menu_state.position.y)
-            .min((f32::from(viewport.height) - 166.0).max(8.0))
-            .max(8.0);
 
-        let mut copy = self.render_context_menu_item(
-            "terminal-context-copy",
-            IconName::Copy,
-            self.tr("common-copy"),
-            IconTone::Default,
-            can_copy,
-        );
-        if can_copy {
-            copy = copy.on_click(cx.listener(move |this, _, _, cx| {
-                this.copy_terminal_selection(session_id, cx);
-                this.terminal_context_menu = None;
-                cx.notify();
-            }));
-        }
-        let mut paste = self.render_context_menu_item(
-            "terminal-context-paste",
-            IconName::Paste,
-            self.tr("common-paste"),
-            IconTone::Default,
-            can_paste,
-        );
-        if can_paste {
-            paste = paste.on_click(cx.listener(move |this, _, _, cx| {
-                this.paste_into_terminal(session_id, cx);
-                this.terminal_context_menu = None;
-                cx.notify();
-            }));
-        }
-        let mut select_all = self.render_context_menu_item(
-            "terminal-context-select-all",
-            IconName::SelectAll,
-            self.tr("common-select-all"),
-            IconTone::Default,
-            can_select_all,
-        );
-        if can_select_all {
-            select_all = select_all.on_click(cx.listener(move |this, _, _, cx| {
-                this.select_all_terminal(session_id, cx);
-                this.terminal_context_menu = None;
-                cx.notify();
-            }));
-        }
-        let mut reset = self.render_context_menu_item(
-            "terminal-context-reset",
-            IconName::Reconnect,
-            self.tr("terminal-reset"),
-            IconTone::Default,
-            can_reset,
-        );
-        if can_reset {
-            reset = reset.on_click(cx.listener(move |this, _, _, cx| {
-                this.reset_terminal(session_id, cx);
-            }));
-        }
-
-        self.glass_floating_surface()
-            .id("terminal_context_menu")
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(188.0))
-            .flex()
-            .flex_col()
-            .p_1()
-            .occlude()
-            .child(copy)
-            .child(paste)
-            .child(self.render_context_menu_separator())
-            .child(select_all)
-            .child(self.render_context_menu_separator())
-            .child(reset)
-            .into_any_element()
+        vec![
+            ContextMenuEntry::item(
+                "terminal-context-copy",
+                IconName::Copy,
+                self.tr("common-copy"),
+                can_copy,
+                move |this, _, cx| {
+                    this.copy_terminal_selection(session_id, cx);
+                },
+            ),
+            ContextMenuEntry::item(
+                "terminal-context-paste",
+                IconName::Paste,
+                self.tr("common-paste"),
+                can_paste,
+                move |this, _, cx| this.paste_into_terminal(session_id, cx),
+            ),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::item(
+                "terminal-context-select-all",
+                IconName::SelectAll,
+                self.tr("common-select-all"),
+                can_select_all,
+                move |this, _, cx| {
+                    this.select_all_terminal(session_id, cx);
+                },
+            ),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::item(
+                "terminal-context-reset",
+                IconName::Reconnect,
+                self.tr("terminal-reset"),
+                can_reset,
+                move |this, _, cx| this.reset_terminal(session_id, cx),
+            ),
+        ]
     }
 }
 
@@ -1760,11 +1704,6 @@ pub(super) struct TerminalLayout {
     pub(super) pty_size: PtySize,
     pub(super) cell_width: f32,
     pub(super) cell_height: f32,
-}
-
-pub(super) struct TerminalContextMenu {
-    pub(super) session_id: SessionId,
-    pub(super) position: gpui::Point<Pixels>,
 }
 
 impl EntityInputHandler for RemCmdApp {

@@ -342,7 +342,7 @@ impl RemCmdApp {
                     .rounded_md()
                     .text_xs()
                     .bg(if selected {
-                        self.theme.accent
+                        self.theme.accent_fill
                     } else {
                         self.theme.control_bg
                     })

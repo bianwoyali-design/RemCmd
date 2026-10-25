@@ -1,6 +1,6 @@
 use super::{
-    ActivePanel, ActiveTerminal, Context, FocusHandle, MOTION_STANDARD_DURATION, PaneId,
-    PaneLayout, RemCmdApp, RightSidebarView, SftpBrowserPlacement, SplitAxis,
+    ActivePanel, ActiveTerminal, Context, FocusHandle, LOCAL_PROFILE_ID, MOTION_STANDARD_DURATION,
+    PaneId, PaneLayout, RemCmdApp, RightSidebarView, SftpBrowserPlacement, SplitAxis,
     TERMINAL_REDRAW_INTERVAL, TabLayout, TerminalModes, TerminalSession, Timer, Window,
     encode_focus, point, px,
 };
@@ -359,11 +359,7 @@ impl RemCmdApp {
             return false;
         };
         let was_active = self.active_tab_id == Some(tab_id);
-        let replacement = index
-            .checked_sub(1)
-            .and_then(|index| self.tabs.get(index))
-            .or_else(|| self.tabs.get(index + 1))
-            .map(|tab| tab.id);
+        let replacement = self.replacement_tab(tab_id);
         self.tabs.remove(index);
 
         if was_active {
@@ -380,6 +376,96 @@ impl RemCmdApp {
         }
         self.sync_performance_monitoring();
         true
+    }
+
+    /// Tabs in presentation order, each paired with its sidebar group.
+    ///
+    /// Vertical tabs are grouped under local terminals and then each profile; the
+    /// stable sort keeps creation order within a group.
+    fn ordered_tabs(&self) -> Vec<(TabId, usize)> {
+        let mut tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let group = if self.tab_layout == TabLayout::Horizontal
+                    || tab.profile_id == LOCAL_PROFILE_ID
+                {
+                    0
+                } else {
+                    self.profiles
+                        .iter()
+                        .position(|profile| profile.id == tab.profile_id)
+                        .map_or(usize::MAX, |index| index + 1)
+                };
+                (tab.id, group)
+            })
+            .collect::<Vec<_>>();
+        tabs.sort_by_key(|(_, group)| *group);
+        tabs
+    }
+
+    /// Picks the tab to show after `tab_id` closes: its next neighbor, preferring the same group.
+    fn replacement_tab(&self, tab_id: TabId) -> Option<TabId> {
+        let ordered = self.ordered_tabs();
+        let index = ordered.iter().position(|(id, _)| *id == tab_id)?;
+        let group = ordered[index].1;
+        let next = ordered.get(index + 1);
+        let previous = index.checked_sub(1).and_then(|index| ordered.get(index));
+        [next, previous]
+            .into_iter()
+            .flatten()
+            .find(|(_, candidate_group)| *candidate_group == group)
+            .or(next.or(previous))
+            .map(|(id, _)| *id)
+    }
+
+    /// Activates the tab `offset` positions from the active tab, wrapping at either end.
+    pub(super) fn activate_adjacent_tab(
+        &mut self,
+        offset: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ordered = self.ordered_tabs();
+        if ordered.is_empty() {
+            return;
+        }
+        let count = ordered.len() as isize;
+        let target = match self
+            .active_tab_id
+            .filter(|_| self.active_panel == ActivePanel::Connection)
+            .and_then(|active| ordered.iter().position(|(id, _)| *id == active))
+        {
+            Some(index) => (index as isize + offset).rem_euclid(count),
+            None if offset < 0 => count - 1,
+            None => 0,
+        };
+        if self.activate_tab_in_window(ordered[target as usize].0, window, cx) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn close_other_tabs(
+        &mut self,
+        keep_tab_id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab_in_window(keep_tab_id, window, cx);
+        let other_tab_ids = self
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .filter(|tab_id| *tab_id != keep_tab_id)
+            .collect::<Vec<_>>();
+        for tab_id in other_tab_ids {
+            self.close_tab(tab_id, cx);
+            if self.tab(tab_id).is_some() {
+                // An unsaved file kept this tab open and is now asking to be saved.
+                break;
+            }
+        }
+        cx.notify();
     }
 
     pub(super) fn remove_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
@@ -435,11 +521,11 @@ impl RemCmdApp {
             self.focused_terminal_session_id = None;
         }
         if self
-            .terminal_context_menu
+            .context_menu
             .as_ref()
-            .is_some_and(|menu| menu.session_id == session_id)
+            .is_some_and(|menu| menu.session_id == Some(session_id))
         {
-            self.terminal_context_menu = None;
+            self.context_menu = None;
         }
 
         self.sync_performance_monitoring();
