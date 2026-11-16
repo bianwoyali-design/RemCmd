@@ -19,7 +19,7 @@ RemCmd is a GPU-accelerated SSH terminal and SFTP client built with Rust and
 GPUI. It combines saved SSH connections, interactive terminal sessions, split
 panes, remote file management, and local terminals in one desktop application.
 
-RemCmd 0.1.0 is prepared as a release candidate. Download the latest published
+RemCmd 0.1.1 is prepared as a release candidate. Download the latest published
 build from the [GitHub Releases page](https://github.com/bianwoyali-design/RemCmd/releases),
 and verify its checksums and source commit before installing.
 
