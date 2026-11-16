@@ -987,9 +987,9 @@ async fn run_connection_plan(
         match command {
             Some(ConnectionCommand::Input(data)) => {
                 if shell_probe_pending || detected_shell.is_some() {
-                    // The hook has not been typed yet. The line now holds the user's
-                    // keystrokes, so hold it back until later output shows a prompt
-                    // the hook can have to itself.
+                    // The hook has not been typed yet, and these keystrokes are about
+                    // to change the line. Drop the pending deadline; the output that
+                    // follows reschedules it if the prompt is still the hook's to use.
                     install_gate.observe_input(&data);
                     shell_integration_deadline = None;
                 }
