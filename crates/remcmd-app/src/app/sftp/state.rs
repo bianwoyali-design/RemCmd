@@ -1,12 +1,14 @@
 use super::super::{
     App, Entity, FileEditor, Localizer, RemoteDirectory, RemoteFileEntry, RemoteFileKind,
-    ScrollHandle, SessionId, SftpOperation, SftpTransferDirection, TextField,
+    ScrollHandle, SessionId, SftpOperation, SftpTransferDirection, SharedString, TextField,
     UniformListScrollHandle,
 };
 use remcmd_ssh::remote_path::{remote_file_name, remote_path_depth, remote_path_is_descendant};
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::PathBuf,
+    rc::Rc,
     time::Duration,
 };
 
@@ -40,7 +42,7 @@ impl SftpBrowserPlacement {
 
 pub(in crate::app) struct SftpBrowserState {
     pub(in crate::app) path: String,
-    pub(in crate::app) entries: Vec<RemoteFileEntry>,
+    entries: Vec<RemoteFileEntry>,
     pub(in crate::app) file: Option<SftpFileState>,
     pub(in crate::app) loading: bool,
     pub(in crate::app) loaded: bool,
@@ -49,8 +51,10 @@ pub(in crate::app) struct SftpBrowserState {
     pub(in crate::app) active_request_id: Option<u64>,
     pub(in crate::app) active_request_path: Option<String>,
     pub(in crate::app) resolved_source_path: Option<String>,
-    pub(in crate::app) tree_entries: HashMap<String, Vec<RemoteFileEntry>>,
-    pub(in crate::app) expanded_paths: HashSet<String>,
+    tree_entries: HashMap<String, Vec<RemoteFileEntry>>,
+    expanded_paths: HashSet<String>,
+    /// Display rows for the list, rebuilt only after the entries or expansion change.
+    list_rows: RefCell<Option<(bool, Rc<[SftpListRow]>)>>,
     pub(in crate::app) tree_requests: HashMap<u64, String>,
     pub(in crate::app) pending_download_trees: HashMap<u64, PendingSftpDownloadTree>,
     pub(in crate::app) selected_paths: Vec<String>,
@@ -63,6 +67,21 @@ pub(in crate::app) struct SftpBrowserState {
 #[derive(Clone)]
 pub(in crate::app) struct SftpTreeRow {
     pub(in crate::app) entry: RemoteFileEntry,
+    pub(in crate::app) depth: usize,
+}
+
+/// A row prepared for painting: shared strings clone without allocating, so a scroll
+/// frame only touches the rows it shows.
+#[derive(Clone)]
+pub(in crate::app) struct SftpListRow {
+    pub(in crate::app) path: SharedString,
+    pub(in crate::app) name: SharedString,
+    pub(in crate::app) size: SharedString,
+    pub(in crate::app) modified: SharedString,
+    pub(in crate::app) kind: RemoteFileKind,
+    pub(in crate::app) symlink: bool,
+    pub(in crate::app) hidden: bool,
+    pub(in crate::app) expanded: bool,
     pub(in crate::app) depth: usize,
 }
 
@@ -86,6 +105,7 @@ impl Default for SftpBrowserState {
             resolved_source_path: None,
             tree_entries: HashMap::new(),
             expanded_paths: HashSet::new(),
+            list_rows: RefCell::new(None),
             tree_requests: HashMap::new(),
             pending_download_trees: HashMap::new(),
             selected_paths: Vec::new(),
@@ -123,6 +143,7 @@ impl SftpBrowserState {
         self.file = None;
         self.tree_entries.clear();
         self.expanded_paths.clear();
+        self.invalidate_list_rows();
         self.tree_requests.clear();
         self.selected_paths.clear();
         self.selection_anchor = None;
@@ -135,9 +156,10 @@ impl SftpBrowserState {
         directory: RemoteDirectory,
     ) -> bool {
         if let Some(requested_path) = self.tree_requests.remove(&request_id) {
-            self.expanded_paths.remove(&requested_path);
-            self.expanded_paths.insert(directory.path.clone());
-            self.tree_entries.insert(directory.path, directory.entries);
+            // Keep children under the row that requested them; a linked directory
+            // canonicalizes to its target path.
+            self.tree_entries.insert(requested_path, directory.entries);
+            self.invalidate_list_rows();
             self.clear_error();
             return true;
         }
@@ -148,6 +170,7 @@ impl SftpBrowserState {
         let breadcrumb_count = remote_breadcrumbs(&directory.path).len();
         self.path = directory.path;
         self.entries = directory.entries;
+        self.invalidate_list_rows();
         self.loading = false;
         self.loaded = true;
         self.clear_error();
@@ -161,6 +184,7 @@ impl SftpBrowserState {
     pub(in crate::app) fn fail_request(&mut self, request_id: u64, error: String) -> bool {
         if let Some(path) = self.tree_requests.remove(&request_id) {
             self.expanded_paths.remove(&path);
+            self.invalidate_list_rows();
             self.set_error(error);
             return true;
         }
@@ -203,6 +227,7 @@ impl SftpBrowserState {
         let request_id = self.next_request_id();
         self.tree_requests.insert(request_id, path.clone());
         self.expanded_paths.insert(path);
+        self.invalidate_list_rows();
         self.clear_error();
         request_id
     }
@@ -281,6 +306,75 @@ impl SftpBrowserState {
             }
         }
         rows
+    }
+
+    fn invalidate_list_rows(&mut self) {
+        self.list_rows.get_mut().take();
+    }
+
+    /// Rows as the list paints them. Cached, so asking every frame is cheap.
+    pub(in crate::app) fn list_rows(&self, tree: bool) -> Rc<[SftpListRow]> {
+        if let Some((cached_tree, rows)) = self.list_rows.borrow().as_ref()
+            && *cached_tree == tree
+        {
+            return rows.clone();
+        }
+        let rows: Rc<[SftpListRow]> = self
+            .visible_rows(tree)
+            .into_iter()
+            .map(|row| {
+                let entry = row.entry;
+                let is_directory = entry.kind == RemoteFileKind::Directory;
+                SftpListRow {
+                    expanded: tree && is_directory && self.expanded_paths.contains(&entry.path),
+                    hidden: entry.name.starts_with('.'),
+                    size: match entry.size {
+                        Some(size) if !is_directory => format_remote_size(size).into(),
+                        _ => "--".into(),
+                    },
+                    modified: entry
+                        .modified
+                        .map_or_else(|| "--".into(), |time| format_remote_modified(time).into()),
+                    path: entry.path.into(),
+                    name: entry.name.into(),
+                    kind: entry.kind,
+                    symlink: entry.symlink,
+                    depth: row.depth,
+                }
+            })
+            .collect();
+        *self.list_rows.borrow_mut() = Some((tree, rows.clone()));
+        rows
+    }
+
+    pub(in crate::app) fn is_expanded(&self, path: &str) -> bool {
+        self.expanded_paths.contains(path)
+    }
+
+    pub(in crate::app) fn has_tree_entries(&self, path: &str) -> bool {
+        self.tree_entries.contains_key(path)
+    }
+
+    pub(in crate::app) fn collapse(&mut self, path: &str) {
+        if self.expanded_paths.remove(path) {
+            self.invalidate_list_rows();
+        }
+    }
+
+    /// Shows children that are already loaded.
+    pub(in crate::app) fn expand_loaded(&mut self, path: String) {
+        if self.expanded_paths.insert(path) {
+            self.invalidate_list_rows();
+        }
+    }
+
+    /// Whether any selected entry can be downloaded, without materializing the selection.
+    pub(in crate::app) fn has_downloadable_selection(&self) -> bool {
+        self.selected_paths.iter().any(|path| {
+            self.entry(path).is_some_and(|entry| {
+                matches!(entry.kind, RemoteFileKind::File | RemoteFileKind::Directory)
+            })
+        })
     }
 
     pub(in crate::app) fn selected_entries(&self) -> Vec<RemoteFileEntry> {
@@ -379,6 +473,7 @@ impl SftpBrowserState {
                 .iter()
                 .any(|path| entry.path == *path || remote_path_is_descendant(path, &entry.path))
         });
+        self.invalidate_list_rows();
     }
 
     pub(in crate::app) fn begin_file_request(&mut self, path: String, editable: bool) -> u64 {
@@ -394,6 +489,7 @@ impl SftpBrowserState {
             editable,
             read_request_id: Some(request_id),
             write_request_id: None,
+            dirty: Cell::new(None),
         });
         request_id
     }
@@ -459,6 +555,9 @@ pub(in crate::app) struct SftpFileState {
     pub(in crate::app) editable: bool,
     pub(in crate::app) read_request_id: Option<u64>,
     pub(in crate::app) write_request_id: Option<u64>,
+    /// Comparing against the original re-encodes the whole file; remember the answer
+    /// until the text or the saved contents change.
+    dirty: Cell<Option<bool>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -841,12 +940,23 @@ impl SftpFileState {
         if !self.editable {
             return false;
         }
-        self.editor
+        if let Some(dirty) = self.dirty.get() {
+            return dirty;
+        }
+        let dirty = self
+            .editor
             .as_ref()
             .zip(self.text_format)
             .is_some_and(|(editor, format)| {
                 format.encode(editor.read(cx).text()).as_slice() != self.original_contents
-            })
+            });
+        self.dirty.set(Some(dirty));
+        dirty
+    }
+
+    /// Call after the editor text or `original_contents` changes.
+    pub(in crate::app) fn invalidate_dirty(&self) {
+        self.dirty.set(None);
     }
 
     pub(in crate::app) fn edited_contents(&self, cx: &App) -> Option<Vec<u8>> {
@@ -1050,6 +1160,67 @@ mod tests {
     }
 
     #[test]
+    fn cached_list_rows_follow_expansion_and_removal() {
+        let mut browser = SftpBrowserState {
+            entries: vec![
+                remote_entry("/home/test/projects", RemoteFileKind::Directory),
+                remote_entry("/home/test/.profile", RemoteFileKind::File),
+            ],
+            ..SftpBrowserState::default()
+        };
+        browser.tree_entries.insert(
+            "/home/test/projects".into(),
+            vec![remote_entry(
+                "/home/test/projects/todo.txt",
+                RemoteFileKind::File,
+            )],
+        );
+        let names = |browser: &SftpBrowserState| {
+            browser
+                .list_rows(true)
+                .iter()
+                .map(|row| (row.name.to_string(), row.depth, row.expanded))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(&browser),
+            vec![("projects".into(), 0, false), (".profile".into(), 0, false)]
+        );
+        // Asking again reuses the rows instead of rebuilding them.
+        assert!(Rc::ptr_eq(
+            &browser.list_rows(true),
+            &browser.list_rows(true)
+        ));
+
+        browser.expand_loaded("/home/test/projects".into());
+        assert_eq!(
+            names(&browser),
+            vec![
+                ("projects".into(), 0, true),
+                ("todo.txt".into(), 1, false),
+                (".profile".into(), 0, false),
+            ]
+        );
+        let rows = browser.list_rows(true);
+        assert!(rows[2].hidden);
+        assert_eq!(
+            (rows[1].size.as_ref(), rows[0].size.as_ref()),
+            ("12 B", "--")
+        );
+
+        browser.collapse("/home/test/projects");
+        assert_eq!(names(&browser).len(), 2);
+
+        browser.remove_paths(&["/home/test/.profile".into()]);
+        assert_eq!(names(&browser), vec![("projects".into(), 0, false)]);
+        // The flat file view never shows tree children or disclosure state.
+        browser.expand_loaded("/home/test/projects".into());
+        assert_eq!(browser.list_rows(false).len(), 1);
+        assert!(!browser.list_rows(false)[0].expanded);
+    }
+
+    #[test]
     fn sftp_tree_selection_supports_ranges_and_secondary_toggle() {
         let mut browser = SftpBrowserState {
             entries: vec![
@@ -1125,6 +1296,7 @@ mod tests {
             name: remote_file_name(path).into(),
             path: path.into(),
             kind,
+            symlink: false,
             size: (kind == RemoteFileKind::File).then_some(12),
             modified: None,
         }

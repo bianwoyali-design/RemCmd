@@ -195,18 +195,12 @@ impl RemCmdApp {
         path: String,
         cx: &mut Context<Self>,
     ) {
-        let expanded = self.session(session_id).is_some_and(|session| {
-            session
-                .sftp_browser(placement)
-                .expanded_paths
-                .contains(&path)
-        });
+        let expanded = self
+            .session(session_id)
+            .is_some_and(|session| session.sftp_browser(placement).is_expanded(&path));
         if expanded {
             if let Some(session) = self.session_mut(session_id) {
-                session
-                    .sftp_browser_mut(placement)
-                    .expanded_paths
-                    .remove(&path);
+                session.sftp_browser_mut(placement).collapse(&path);
             }
             cx.notify();
             return;
@@ -221,27 +215,16 @@ impl RemCmdApp {
         path: String,
         cx: &mut Context<Self>,
     ) {
-        let cached = self.session(session_id).is_some_and(|session| {
-            session
-                .sftp_browser(placement)
-                .tree_entries
-                .contains_key(&path)
-        });
-        let expanded = self.session(session_id).is_some_and(|session| {
-            session
-                .sftp_browser(placement)
-                .expanded_paths
-                .contains(&path)
+        let (cached, expanded) = self.session(session_id).map_or((false, false), |session| {
+            let browser = session.sftp_browser(placement);
+            (browser.has_tree_entries(&path), browser.is_expanded(&path))
         });
         if expanded {
             return;
         }
         if cached {
             if let Some(session) = self.session_mut(session_id) {
-                session
-                    .sftp_browser_mut(placement)
-                    .expanded_paths
-                    .insert(path);
+                session.sftp_browser_mut(placement).expand_loaded(path);
             }
             cx.notify();
             return;
@@ -355,7 +338,15 @@ impl RemCmdApp {
             });
             cx.subscribe(&editor, move |this, _, event, cx| match event {
                 FileEditorEvent::SaveRequested => this.save_remote_file(session_id, cx),
-                FileEditorEvent::Changed => cx.notify(),
+                FileEditorEvent::Changed => {
+                    if let Some(file) = this
+                        .session(session_id)
+                        .and_then(|session| session.sftp.file.as_ref())
+                    {
+                        file.invalidate_dirty();
+                    }
+                    cx.notify();
+                }
             })
             .detach();
             editor
@@ -370,6 +361,7 @@ impl RemCmdApp {
             state.original_contents = file.contents;
             state.text_format = decoded.map(|(format, _)| format);
             state.editor = editor;
+            state.invalidate_dirty();
             state.loading = false;
             state.error = None;
             state.read_request_id = None;
@@ -446,6 +438,7 @@ impl RemCmdApp {
         };
         state.path = file.path;
         state.original_contents = file.contents;
+        state.invalidate_dirty();
         state.saving = false;
         state.error = None;
         state.write_request_id = None;

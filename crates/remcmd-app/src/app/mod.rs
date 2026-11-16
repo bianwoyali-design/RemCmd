@@ -21,6 +21,7 @@ mod diagnostics;
 mod keyboard;
 mod lifecycle;
 mod menus;
+mod motion;
 #[cfg(target_os = "macos")]
 mod native_material;
 #[cfg(target_os = "macos")]
@@ -29,6 +30,7 @@ mod openssh_import;
 mod performance;
 mod profiles;
 mod quick_commands;
+mod scrollbar;
 mod settings;
 mod sftp;
 mod shell;
@@ -71,8 +73,7 @@ use shell::{
 use shell::{TRAFFIC_LIGHT_INSET_X, TRAFFIC_LIGHT_INSET_Y};
 use terminal_session::{
     ActiveTerminal, LOCAL_PROFILE_ID, SessionMessage, SessionMessageArg, TERMINAL_COLUMNS,
-    TERMINAL_EVENT_BATCH_LIMIT, TERMINAL_REDRAW_INTERVAL, TERMINAL_ROWS, TerminalSession,
-    TerminalSessionKind,
+    TERMINAL_EVENT_BATCH_LIMIT, TERMINAL_ROWS, TerminalSession, TerminalSessionKind,
 };
 use workspace::{SessionId, TabId, TerminalPane, TerminalTab, TerminalTabView};
 
@@ -188,15 +189,12 @@ struct RemCmdApp {
     next_session_id: u64,
     tabs: Vec<TerminalTab>,
     active_tab_id: Option<TabId>,
-    previous_active_tab_id: Option<TabId>,
-    titlebar_tab_transition_id: u64,
     hovered_titlebar_tab_id: Option<TabId>,
     hovered_titlebar_close_id: Option<TabId>,
     titlebar_tabs_scroll_handle: ScrollHandle,
-    titlebar_tabs_scroll_transition_id: u64,
-    titlebar_tabs_scroll_start: gpui::Point<Pixels>,
-    titlebar_tabs_scroll_active: bool,
-    titlebar_tabs_scroll_cleanup_task: Option<Task<()>>,
+    /// Reconciled while rendering, which only borrows the application.
+    titlebar_tab_strip: RefCell<motion::TabStripMotion>,
+    right_sidebar_view_motion: RefCell<motion::Spring>,
     terminal_redraw_task: Option<Task<()>>,
     next_tab_id: u64,
     panes: Vec<TerminalPane>,
@@ -391,15 +389,11 @@ impl RemCmdApp {
             next_session_id: 1,
             tabs: Vec::new(),
             active_tab_id: None,
-            previous_active_tab_id: None,
-            titlebar_tab_transition_id: 0,
             hovered_titlebar_tab_id: None,
             hovered_titlebar_close_id: None,
             titlebar_tabs_scroll_handle: ScrollHandle::new(),
-            titlebar_tabs_scroll_transition_id: 0,
-            titlebar_tabs_scroll_start: point(px(0.0), px(0.0)),
-            titlebar_tabs_scroll_active: false,
-            titlebar_tabs_scroll_cleanup_task: None,
+            titlebar_tab_strip: RefCell::default(),
+            right_sidebar_view_motion: RefCell::new(motion::Spring::settled(0.0)),
             terminal_redraw_task: None,
             next_tab_id: 1,
             panes: Vec::new(),
@@ -636,7 +630,7 @@ impl Render for RemCmdApp {
         );
         root = root.child(self.render_titlebar_tabs(window, cx));
         if self.right_sidebar_rendered {
-            root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, cx));
+            root = root.child(self.render_right_sidebar_titlebar(right_sidebar_width, window, cx));
         }
         if cfg!(target_os = "windows") {
             root = root.child(self.render_windows_chrome(window, cx));

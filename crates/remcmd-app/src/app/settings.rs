@@ -471,10 +471,20 @@ impl RemCmdApp {
     }
 
     pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
-        let panel_width = (f32::from(window.viewport_size().width)
-            - self.effective_sidebar_width(window)
-            - self.effective_right_sidebar_width(window))
-        .max(0.0);
+        // Only sidebars that are showing take width away from the panel.
+        let left_sidebar_width = if self.left_sidebar_open {
+            self.effective_sidebar_width(window)
+        } else {
+            0.0
+        };
+        let right_sidebar_width = if self.right_sidebar_open {
+            self.effective_right_sidebar_width(window)
+        } else {
+            0.0
+        };
+        let panel_width =
+            (f32::from(window.viewport_size().width) - left_sidebar_width - right_sidebar_width)
+                .max(0.0);
         let padding = ((panel_width - 680.0) / 2.0).max(16.0);
         let content_width = (panel_width - padding * 2.0).max(80.0);
         let appearance_group = div()
@@ -572,7 +582,6 @@ impl RemCmdApp {
                     .child(self.tr("settings-appearance")),
             )
             .child(appearance_group)
-            .child(self.render_update_entry(cx))
             .child(
                 div()
                     .w_full()
@@ -600,60 +609,52 @@ impl RemCmdApp {
                     .mb_2()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr("settings-diagnostics")),
+                    .child(self.tr("settings-more")),
             )
             .child(
+                // Pages that open from Settings share one group, like the rows above.
                 div()
-                    .id("open-diagnostics")
-                    .tab_index(0)
-                    .focus(|style| style.bg(self.theme.list_selected_bg))
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .min_h(px(38.0))
-                    .px(px(10.0))
-                    .rounded_lg()
-                    .bg(self.theme.settings_group_bg)
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|this| this.bg(self.theme.control_hover_bg))
-                    .child(self.tr("diagnostics-title"))
-                    .child(icon(IconName::Expand, self.theme, IconTone::Default, 15.0))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.show_diagnostics(window, cx);
-                    })),
-            )
-            .child(
-                div()
+                    .flex_col()
                     .w_full()
-                    .mt_6()
-                    .mb_2()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr("import-title")),
-            )
-            .child(
-                div()
-                    .id("open-openssh-import")
-                    .tab_index(0)
-                    .focus(|style| style.bg(self.theme.list_selected_bg))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .min_h(px(38.0))
-                    .px(px(10.0))
                     .rounded_lg()
                     .bg(self.theme.settings_group_bg)
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|this| this.bg(self.theme.control_hover_bg))
-                    .child(self.tr("import-openssh"))
-                    .child(icon(IconName::Expand, self.theme, IconTone::Default, 15.0))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.show_openssh_import(window, cx);
-                    })),
+                    .child(
+                        self.render_settings_link_row(
+                            "open-updates",
+                            self.tr(if self.updates.has_release() {
+                                "updates-available-entry"
+                            } else {
+                                "updates-title"
+                            }),
+                            true,
+                        )
+                        .rounded_t_lg()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_updates(window, cx);
+                        })),
+                    )
+                    .child(
+                        self.render_settings_link_row(
+                            "open-diagnostics",
+                            self.tr("diagnostics-title"),
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_diagnostics(window, cx);
+                        })),
+                    )
+                    .child(
+                        self.render_settings_link_row(
+                            "open-openssh-import",
+                            self.tr("import-openssh"),
+                            false,
+                        )
+                        .rounded_b_lg()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_openssh_import(window, cx);
+                        })),
+                    ),
             )
             .when_some(self.settings_error.as_ref(), |this, error| {
                 this.child(
@@ -671,6 +672,47 @@ impl RemCmdApp {
             .track_focus(&self.settings_focus_handle)
             .on_action(cx.listener(Self::on_cancel_settings_selector))
             .child(content)
+    }
+
+    /// A row that opens another page, drawn like the option rows it sits beside.
+    fn render_settings_link_row(
+        &self,
+        id: &'static str,
+        label: String,
+        divided: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .relative()
+            .child(crate::accessibility::node(
+                id,
+                crate::accessibility::Node::button(label.clone(), true),
+            ))
+            .tab_index(0)
+            .focus(|style| style.bg(self.theme.list_selected_bg))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .min_h(px(38.0))
+            .px(px(10.0))
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|this| this.bg(self.theme.control_hover_bg))
+            .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+            .child(icon(IconName::Expand, self.theme, IconTone::Default, 15.0))
+            .when(divided, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(10.0))
+                        .right(px(10.0))
+                        .h(px(1.0))
+                        .bg(self.theme.settings_separator),
+                )
+            })
     }
 
     pub(super) fn render_settings_row(

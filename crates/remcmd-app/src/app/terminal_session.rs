@@ -985,18 +985,13 @@ impl RemCmdApp {
                 )
             })
         });
-        let mut accessibility = crate::accessibility::Node::text(
-            self.tr("terminal-view"),
-            render_state
-                .as_ref()
-                .map(|(snapshot, _, _, _)| {
-                    (0..snapshot.size.rows())
-                        .filter_map(|row| snapshot.row_text(row))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default(),
-        );
+        let accessibility_text = session
+            .and_then(|session| session.terminal.as_ref())
+            .zip(render_state.as_ref())
+            .map(|(terminal, (snapshot, _, _, _))| terminal.accessibility_text(snapshot))
+            .unwrap_or_default();
+        let mut accessibility =
+            crate::accessibility::Node::text(self.tr("terminal-view"), accessibility_text);
         accessibility.role = crate::accessibility::Role::TextArea;
         accessibility.focus_handle = Some(focus_handle.clone());
         let accessibility_focus = focus_handle.clone();
@@ -1559,6 +1554,8 @@ pub(super) struct ActiveTerminal {
     pub(super) was_connected: bool,
     pub(super) render_damage: RefCell<TerminalDamage>,
     pub(super) render_snapshot: RefCell<Option<Rc<TerminalSnapshot>>>,
+    /// Screen text for assistive clients, rebuilt only when the snapshot changes.
+    accessibility_text: RefCell<Option<(Rc<TerminalSnapshot>, SharedString)>>,
     pub(super) canvas_cache: Rc<RefCell<TerminalCanvasCache>>,
 }
 
@@ -1582,6 +1579,7 @@ impl ActiveTerminal {
             was_connected: false,
             render_damage: RefCell::new(TerminalDamage::Full),
             render_snapshot: RefCell::new(None),
+            accessibility_text: RefCell::new(None),
             canvas_cache: Rc::new(RefCell::new(TerminalCanvasCache::default())),
         }
     }
@@ -1620,6 +1618,23 @@ impl ActiveTerminal {
         });
 
         (snapshot, damage)
+    }
+
+    pub(super) fn accessibility_text(&self, snapshot: &Rc<TerminalSnapshot>) -> SharedString {
+        let mut cache = self.accessibility_text.borrow_mut();
+        if let Some((cached, text)) = cache.as_ref()
+            && Rc::ptr_eq(cached, snapshot)
+        {
+            return text.clone();
+        }
+        let text = SharedString::from(
+            (0..snapshot.size.rows())
+                .filter_map(|row| snapshot.row_text(row))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        *cache = Some((snapshot.clone(), text.clone()));
+        text
     }
 
     pub(super) fn scroll(&mut self, scroll: TerminalScroll) {

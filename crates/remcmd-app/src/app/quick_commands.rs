@@ -279,9 +279,55 @@ impl RemCmdApp {
             return panel;
         }
 
-        let mut actions = div().flex().flex_none().items_center().gap_1();
+        // Collapsing belongs to the whole panel, so it sits on the panel's first row.
+        let collapse = self
+            .render_icon_button(
+                "collapse_bottom_panel",
+                IconName::Collapse,
+                self.tr("terminal-collapse-panel"),
+                IconTone::Default,
+                true,
+            )
+            .size(px(28.0))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.bottom_panel_open = false;
+                this.bottom_panel_resize = None;
+                cx.notify();
+            }));
+        let command_bar = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(BOTTOM_PANEL_COMMAND_BAR_HEIGHT))
+            .pl(px(BOTTOM_PANEL_INSET))
+            .pr_2()
+            .border_b_1()
+            .border_color(self.theme.border)
+            .child(self.render_quick_command_prompt(cx))
+            .child(self.render_toolbar_divider())
+            .child(collapse);
+
+        let mut terminal_header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(BOTTOM_PANEL_HEADER_HEIGHT))
+            .pl(px(BOTTOM_PANEL_INSET))
+            .pr_2()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(self.theme.text_muted)
+            .child(self.render_sidebar_icon(IconName::Terminal, 15.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(self.tr("terminal-label")),
+            );
         if self.quick_terminal_session_id.is_some() {
-            actions = actions.child(
+            terminal_header = terminal_header.child(
                 self.render_icon_button(
                     "dispose_quick_terminal",
                     IconName::Delete,
@@ -295,47 +341,10 @@ impl RemCmdApp {
                 })),
             );
         }
-        actions = actions.child(
-            self.render_icon_button(
-                "collapse_bottom_panel",
-                IconName::Collapse,
-                self.tr("terminal-collapse-panel"),
-                IconTone::Default,
-                true,
-            )
-            .size(px(28.0))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.bottom_panel_open = false;
-                this.bottom_panel_resize = None;
-                cx.notify();
-            })),
-        );
-
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .h(px(BOTTOM_PANEL_HEADER_HEIGHT))
-            .px_2()
-            .border_b_1()
-            .border_color(self.theme.border)
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(self.render_sidebar_icon(IconName::Terminal, 15.0))
-                    .child(self.tr("terminal-label")),
-            )
-            .child(actions);
 
         panel = panel
             .h(px(self.bottom_panel_height))
-            .min_h(px(BOTTOM_PANEL_HEADER_HEIGHT))
+            .min_h(px(BOTTOM_PANEL_COMMAND_BAR_HEIGHT))
             .mx(px(-16.0))
             .mb(px(-16.0))
             .mt_2()
@@ -356,8 +365,8 @@ impl RemCmdApp {
                         cx.listener(Self::begin_bottom_panel_resize),
                     ),
             )
-            .child(self.render_quick_command_prompt(cx))
-            .child(header)
+            .child(command_bar)
+            .child(terminal_header)
             .child(self.render_quick_terminal_panel(cx));
 
         panel
@@ -407,8 +416,7 @@ impl RemCmdApp {
             .flex_1()
             .min_h(px(0.0))
             .flex_col()
-            .p_2()
-            .pt_0()
+            // The terminal runs edge to edge, like the one in the main area above.
             .child(terminal)
             .when(ended, |this| {
                 this.child(
@@ -418,10 +426,19 @@ impl RemCmdApp {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .pt_2()
+                        .px(px(BOTTOM_PANEL_INSET))
+                        .py_2()
+                        .border_t_1()
+                        .border_color(self.theme.border)
                         .text_sm()
                         .text_color(self.theme.text_muted)
-                        .child(message.unwrap_or_else(|| self.tr("terminal-local-ended")))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(message.unwrap_or_else(|| self.tr("terminal-local-ended"))),
+                        )
                         .child(
                             text_button(
                                 "restart_quick_terminal",
@@ -619,13 +636,11 @@ impl RemCmdApp {
         div()
             .id("quick_command_panel")
             .flex()
-            .flex_none()
+            .flex_1()
+            .min_w(px(0.0))
             .items_center()
             .gap_2()
-            .h(px(42.0))
-            .px_3()
-            .border_b_1()
-            .border_color(self.theme.border)
+            .pr_1()
             .key_context("QuickCommandPrompt")
             .on_action(
                 cx.listener(|this, _: &SubmitQuickCommand, _, cx| this.submit_quick_command(cx)),
@@ -657,7 +672,12 @@ pub(super) const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
 
 pub(super) const BOTTOM_PANEL_MAX_HEIGHT: f32 = 520.0;
 
-pub(super) const BOTTOM_PANEL_HEADER_HEIGHT: f32 = 34.0;
+pub(super) const BOTTOM_PANEL_COMMAND_BAR_HEIGHT: f32 = 42.0;
+
+pub(super) const BOTTOM_PANEL_HEADER_HEIGHT: f32 = 30.0;
+
+/// Leading inset shared by the command bar, the terminal header, and terminal text.
+const BOTTOM_PANEL_INSET: f32 = 12.0;
 
 pub(super) struct QuickCommandPrompt {
     pub(super) input: Entity<TextField>,

@@ -1,5 +1,6 @@
 #[cfg(target_os = "macos")]
 use super::img;
+use super::motion::TabStripInput;
 use super::{
     Animation, AnyElement, AnyView, App, Bounds, BoxShadow, ConnectionProfile, Context,
     ContextMenuEntry, CursorStyle, FontWeight, Hsla, IconName, IconTone, IntoElement,
@@ -12,10 +13,13 @@ use super::{
 };
 use gpui::AnimationExt;
 use gpui::prelude::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TITLEBAR_TAB_ICON_ONLY_WIDTH: f32 = 44.0;
 const TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH: f32 = 56.0;
+const TITLEBAR_TAB_GROUP_PADDING: f32 = 3.0;
+const TITLEBAR_TAB_ICON_SIZE: f32 = 20.0;
+const TITLEBAR_TAB_CLOSE_INSET: f32 = 9.0;
 
 impl RemCmdApp {
     pub(super) fn effective_sidebar_width(&self, window: &Window) -> f32 {
@@ -367,6 +371,16 @@ impl RemCmdApp {
         })
     }
 
+    /// A hairline between groups of related toolbar buttons.
+    pub(super) fn render_toolbar_divider(&self) -> gpui::Div {
+        div()
+            .flex_none()
+            .w(px(1.0))
+            .h(px(16.0))
+            .mx(px(4.0))
+            .bg(self.theme.border)
+    }
+
     /// A navigation symbol tinted with the accent color, as in Finder's sidebar.
     pub(super) fn render_sidebar_nav_icon(&self, icon_name: IconName) -> gpui::Div {
         div()
@@ -597,12 +611,30 @@ impl RemCmdApp {
     pub(super) fn render_right_sidebar_titlebar(
         &self,
         width: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let titlebar_width = width;
         let open = self.right_sidebar_open;
         let start_width = if open { 0.0 } else { titlebar_width };
         let end_width = if open { titlebar_width } else { 0.0 };
+        // The selection slides between segments like a native segmented control.
+        let selection_progress = {
+            let now = Instant::now();
+            let target = match self.right_sidebar_view {
+                RightSidebarView::Sftp => 0.0,
+                RightSidebarView::Performance => 1.0,
+            };
+            let mut motion = self.right_sidebar_view_motion.borrow_mut();
+            motion.retarget(target, now);
+            if self.theme.reduce_motion {
+                motion.snap(target);
+            }
+            if motion.tick(now) {
+                window.request_animation_frame();
+            }
+            motion.value(now).clamp(0.0, 1.0)
+        };
         let mut tabs = div()
             .id("right_sidebar_titlebar_tabs")
             .relative()
@@ -616,7 +648,29 @@ impl RemCmdApp {
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_tab_group_border)
-            .bg(self.theme.titlebar_tab_group_bg);
+            .bg(self.theme.titlebar_tab_group_bg)
+            .child(
+                // Spans the two segments so the selection can be placed as a fraction.
+                div()
+                    .absolute()
+                    .left(px(TITLEBAR_TAB_GROUP_PADDING))
+                    .right(px(TITLEBAR_TAB_GROUP_PADDING))
+                    .top(px(TITLEBAR_TAB_GROUP_PADDING - 1.0))
+                    .h(px(TITLEBAR_TAB_HEIGHT))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(gpui::relative(selection_progress * 0.5))
+                            .w(gpui::relative(0.5))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(self.theme.titlebar_tab_border)
+                            .bg(self.theme.titlebar_tab_selected_bg)
+                            .shadow(self.titlebar_selected_tab_shadow()),
+                    ),
+            );
 
         for (view, label, icon_name) in [
             (
@@ -631,11 +685,7 @@ impl RemCmdApp {
             ),
         ] {
             let selected = self.right_sidebar_view == view;
-            let hover = if selected {
-                self.theme.titlebar_tab_selected_hover_bg
-            } else {
-                self.theme.titlebar_tab_hover_bg
-            };
+            let hover = self.theme.titlebar_tab_hover_bg;
             let pressed = self.theme.titlebar_tab_pressed_bg;
             tabs = tabs.child(
                 div()
@@ -658,13 +708,10 @@ impl RemCmdApp {
                     .px_2()
                     .rounded_full()
                     .cursor_pointer()
-                    .hover(move |this| this.bg(hover))
-                    .active(move |this| this.bg(pressed))
-                    .when(selected, |this| {
-                        this.border_1()
-                            .border_color(self.theme.titlebar_tab_border)
-                            .bg(self.theme.titlebar_tab_selected_bg)
-                            .shadow(self.titlebar_selected_tab_shadow())
+                    // The sliding selection sits beneath the segments; keep it uncovered.
+                    .when(!selected, |this| {
+                        this.hover(move |this| this.bg(hover))
+                            .active(move |this| this.bg(pressed))
                     })
                     .child(icon(icon_name, self.theme, IconTone::Default, 14.0))
                     .child(div().min_w(px(0.0)).truncate().text_sm().child(label))
@@ -921,14 +968,53 @@ impl RemCmdApp {
             return self.animate_titlebar_right_edge(titlebar, expanded_right_titlebar_width);
         }
 
-        let tab_labels = self
-            .tabs
+        let now = Instant::now();
+        let reduce_motion = self.theme.reduce_motion;
+        let connection_active = self.active_panel == ActivePanel::Connection;
+        let mut strip = self.titlebar_tab_strip.borrow_mut();
+        strip.sync(
+            self.tabs
+                .iter()
+                .map(|tab| TabStripInput {
+                    id: tab.id,
+                    label: self.terminal_tab_title(tab).into(),
+                    status_color: self.tab_status_color(tab),
+                    active: connection_active && self.active_tab_id == Some(tab.id),
+                })
+                .collect(),
+            now,
+            reduce_motion,
+        );
+        let scroll_handle = &self.titlebar_tabs_scroll_handle;
+        let strip_viewport = scroll_handle.bounds();
+        if let Some(offset_x) = strip.scroll_offset(
+            now,
+            reduce_motion,
+            scroll_handle.offset().x,
+            scroll_handle.max_offset().width,
+            |index| {
+                let tab = scroll_handle.bounds_for_item(index)?;
+                let inset = px(TITLEBAR_TAB_GROUP_PADDING);
+                Some(if tab.left() < strip_viewport.left() + inset {
+                    tab.left() - strip_viewport.left() - inset
+                } else if tab.right() > strip_viewport.right() - inset {
+                    tab.right() - strip_viewport.right() + inset
+                } else {
+                    px(0.0)
+                })
+            },
+        ) {
+            scroll_handle.set_offset(point(offset_x, scroll_handle.offset().y));
+        }
+        if strip.is_animating() {
+            window.request_animation_frame();
+        }
+
+        let items = strip.items();
+        let selected_tab_min_width = items
             .iter()
-            .map(|tab| self.terminal_tab_title(tab))
-            .collect::<Vec<_>>();
-        let selected_tab_min_width = tab_labels
-            .iter()
-            .map(|label| estimated_titlebar_label_width(label) + 68.0)
+            .filter(|item| !item.closing)
+            .map(|item| estimated_titlebar_label_width(&item.label) + 68.0)
             .fold(TITLEBAR_TAB_ICON_ONLY_WIDTH, f32::max);
         let track_width = (f32::from(window.viewport_size().width)
             - leading_width
@@ -937,19 +1023,21 @@ impl RemCmdApp {
             - 8.0
             - TITLEBAR_ACTION_GROUP_WIDTH)
             .max(0.0);
-        let tab_count = self.tabs.len();
         let inactive_count = self.tabs.len().saturating_sub(1);
-        let separator_width = self.tabs.len().saturating_sub(1) as f32;
         let inactive_width = if inactive_count == 0 {
             track_width
         } else {
-            ((track_width - 6.0 - separator_width - selected_tab_min_width).max(0.0)
+            ((track_width - TITLEBAR_TAB_GROUP_PADDING * 2.0 - selected_tab_min_width).max(0.0)
                 / inactive_count as f32)
                 .max(TITLEBAR_TAB_ICON_ONLY_WIDTH)
         };
         let hide_inactive_labels = inactive_width < TITLEBAR_TAB_ELLIPSIS_MIN_WIDTH;
+        // Collapsing and opening tabs count for the share of the strip they still occupy,
+        // so the selected tab's width changes smoothly as tabs come and go.
+        let open_tab_count = items.iter().map(|item| item.presence(now)).sum::<f32>();
         let selected_tab_basis =
-            titlebar_active_tab_basis(track_width, tab_count, selected_tab_min_width);
+            titlebar_active_tab_basis(track_width, open_tab_count, selected_tab_min_width);
+        let single_item = items.len() == 1;
         let mut tabs = div()
             .id("titlebar_terminal_tabs")
             .flex()
@@ -957,78 +1045,54 @@ impl RemCmdApp {
             .min_w(px(0.0))
             .h(px(TITLEBAR_TAB_GROUP_HEIGHT))
             .items_center()
-            .p(px(3.0))
+            .p(px(TITLEBAR_TAB_GROUP_PADDING))
             .rounded_full()
             .border_1()
             .border_color(self.theme.titlebar_tab_group_border)
             .bg(self.theme.titlebar_tab_group_bg)
             .overflow_x_scroll()
-            .track_scroll(&self.titlebar_tabs_scroll_handle);
+            .track_scroll(scroll_handle)
+            // The strip itself fades with its first and last tab.
+            .when(single_item, |this| this.opacity(items[0].presence(now)));
         let close_terminal_tooltip = self.tr("common-close-terminal");
 
-        for (tab_index, (tab, label)) in self.tabs.iter().zip(tab_labels).enumerate() {
-            let tab_id = tab.id;
-            let is_active =
-                self.active_panel == ActivePanel::Connection && self.active_tab_id == Some(tab_id);
-            let is_deactivating = self.active_panel == ActivePanel::Connection
-                && self.previous_active_tab_id == Some(tab_id)
-                && self.active_tab_id != Some(tab_id);
-            let is_hovered = self.hovered_titlebar_tab_id == Some(tab_id);
-            let is_close_hovered = self.hovered_titlebar_close_id == Some(tab_id);
+        for (item_index, item) in items.iter().enumerate() {
+            let tab_id = item.id;
+            let presence = item.presence(now);
+            let activeness = item.activeness(now);
+            let interactive = !item.closing;
+            let is_active = interactive && connection_active && self.active_tab_id == Some(tab_id);
+            let is_hovered = interactive && self.hovered_titlebar_tab_id == Some(tab_id);
+            let is_close_hovered = interactive && self.hovered_titlebar_close_id == Some(tab_id);
             let show_close = is_active || is_hovered;
-            let icon_only = !is_active && hide_inactive_labels;
-            let hover_background = if is_active {
-                self.theme.titlebar_tab_selected_hover_bg
+            // Crowded strips show background tabs as icons; the label grows in on selection.
+            let show_label = !hide_inactive_labels || activeness > 0.02;
+            let label_opacity = if hide_inactive_labels {
+                activeness
             } else {
-                self.theme.titlebar_tab_hover_bg
+                1.0
             };
-            let status_color = self.tab_status_color(tab);
+            let hover_background = self.theme.titlebar_tab_hover_bg;
             let pressed_background = self.theme.titlebar_tab_pressed_bg;
-            let selected_background = self.theme.titlebar_tab_selected_bg;
-            let tab_border = self.theme.titlebar_tab_border;
-            let tab_shadow = self.titlebar_selected_tab_shadow();
-            let (start_tab_basis, end_tab_basis, start_tab_min_width, end_tab_min_width) =
-                if is_active {
-                    (
-                        0.0,
-                        selected_tab_basis,
-                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
-                        selected_tab_min_width,
-                    )
-                } else if is_deactivating {
-                    (
-                        selected_tab_basis,
-                        0.0,
-                        selected_tab_min_width,
-                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
-                    )
-                } else {
-                    (
-                        0.0,
-                        0.0,
-                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
-                        TITLEBAR_TAB_ICON_ONLY_WIDTH,
-                    )
-                };
 
-            if tab_index > 0 {
-                let previous_is_active = self.active_panel == ActivePanel::Connection
-                    && self.active_tab_id == Some(self.tabs[tab_index - 1].id);
-                let separator = if is_active || previous_is_active {
-                    self.theme.transparent
+            // The icon gives way to the label as a tab is selected. On a background tab it
+            // also yields to the close button, but only where the two would collide.
+            let icon_progress = 1.0 - activeness;
+            let content_width = TITLEBAR_TAB_ICON_SIZE
+                + if show_label {
+                    6.0 + estimated_titlebar_label_width(&item.label)
                 } else {
-                    self.theme.titlebar_tab_separator
+                    0.0
                 };
-                tabs = tabs.child(div().flex_none().w(px(1.0)).h(px(18.0)).bg(separator));
-            }
-
+            let icon_left = ((inactive_width - content_width) / 2.0).max(8.0);
+            let hide_icon = show_close && icon_left < TITLEBAR_TAB_CLOSE_INSET + 18.0 + 4.0;
             let terminal_icon = div()
                 .relative()
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(px(20.0))
+                .size(px(TITLEBAR_TAB_ICON_SIZE))
                 .child(icon(
                     IconName::Terminal,
                     self.theme,
@@ -1042,135 +1106,46 @@ impl RemCmdApp {
                         .bottom_0()
                         .size(px(5.0))
                         .rounded_full()
-                        .bg(status_color),
+                        .bg(item.status_color),
                 )
                 .with_animation(
-                    SharedString::from(format!("titlebar-tab-terminal-{}-{show_close}", tab_id.0)),
+                    SharedString::from(format!("titlebar-tab-terminal-{}-{hide_icon}", tab_id.0)),
                     Animation::new(self.theme.motion_duration(MOTION_FAST_DURATION))
                         .with_easing(ease_out_quint()),
-                    move |this, delta| this.opacity(if show_close { 1.0 - delta } else { delta }),
+                    move |this, delta| this.opacity(if hide_icon { 1.0 - delta } else { delta }),
                 );
-            let tab_content = if is_active {
-                div()
-                    .w_full()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .px(px(34.0))
-                    .text_center()
-                    .text_sm()
-                    .whitespace_nowrap()
-                    .child(label)
-            } else if icon_only {
-                div()
-                    .flex()
-                    .w_full()
-                    .items_center()
-                    .justify_center()
-                    .child(terminal_icon)
-            } else {
-                div()
-                    .flex()
-                    .w_full()
-                    .min_w(px(0.0))
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(8.0))
-                    .child(terminal_icon)
-                    .child(
+            let tab_content = div()
+                .flex()
+                .w_full()
+                .min_w(px(0.0))
+                .items_center()
+                .justify_center()
+                .gap(px(if show_label { 6.0 * icon_progress } else { 0.0 }))
+                .px(px(8.0 + 26.0 * activeness))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .justify_center()
+                        .w(px(TITLEBAR_TAB_ICON_SIZE * icon_progress))
+                        .h(px(TITLEBAR_TAB_ICON_SIZE))
+                        .overflow_hidden()
+                        .opacity(icon_progress)
+                        .child(terminal_icon),
+                )
+                .when(show_label, |this| {
+                    this.child(
                         div()
-                            .flex_1()
                             .min_w(px(0.0))
                             .truncate()
                             .text_sm()
-                            .child(label),
+                            .opacity(label_opacity)
+                            .child(item.label.clone()),
                     )
-            };
-            let content_start_opacity = if is_active {
-                0.5
-            } else if is_deactivating {
-                0.68
-            } else {
-                1.0
-            };
-            let content_animation_id = if is_active || is_deactivating {
-                format!(
-                    "titlebar-tab-content-{}-{}",
-                    tab_id.0, self.titlebar_tab_transition_id
-                )
-            } else {
-                format!("titlebar-tab-content-{}-stable", tab_id.0)
-            };
-            let tab_content = tab_content.with_animation(
-                SharedString::from(content_animation_id),
-                Animation::new(self.theme.motion_duration(MOTION_EMPHASIZED_DURATION))
-                    .with_easing(ease_in_out),
-                move |this, delta| {
-                    this.opacity(content_start_opacity + (1.0 - content_start_opacity) * delta)
-                },
-            );
+                });
 
-            let tooltip_theme = self.theme;
-            let close_tooltip = close_terminal_tooltip.clone();
-            let close_hover_background = self.theme.titlebar_tab_hover_bg;
-            let close_pressed_background = self.theme.titlebar_tab_pressed_bg;
-            let mut close_control = div()
-                .id(SharedString::from(format!(
-                    "close-titlebar-tab-{}",
-                    tab_id.0
-                )))
-                .absolute()
-                .top(px(6.0))
-                .left(px(9.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(18.0))
-                .rounded_full()
-                .bg(if is_close_hovered {
-                    close_hover_background
-                } else {
-                    self.theme.transparent
-                })
-                .cursor_pointer()
-                .hover(move |this| this.bg(close_hover_background))
-                .active(move |this| this.bg(close_pressed_background))
-                .child(self.render_titlebar_close_symbol())
-                .tooltip(move |_, cx| -> AnyView {
-                    cx.new(|_| CommandTooltip {
-                        label: close_tooltip.clone().into(),
-                        theme: tooltip_theme,
-                    })
-                    .into()
-                })
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    let hovered_close_id = if *hovered { Some(tab_id) } else { None };
-                    if this.hovered_titlebar_close_id != hovered_close_id {
-                        this.hovered_titlebar_close_id = hovered_close_id;
-                        cx.notify();
-                    }
-                }));
-            if show_close {
-                close_control = close_control.on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.close_tab(tab_id, cx);
-                }));
-            }
-            let close_control = close_control.with_animation(
-                SharedString::from(format!("titlebar-tab-close-{}-{show_close}", tab_id.0)),
-                Animation::new(self.theme.motion_duration(MOTION_FAST_DURATION))
-                    .with_easing(ease_out_quint()),
-                move |this, delta| this.opacity(if show_close { delta } else { 1.0 - delta }),
-            );
-
-            let tab_element = div()
-                .id(SharedString::from(format!("titlebar-tab-{}", tab_id.0)))
-                .child(crate::accessibility::node(
-                    "titlebar-tab",
-                    crate::accessibility::Node {
-                        selected: is_active,
-                        ..crate::accessibility::Node::button(self.terminal_tab_title(tab), true)
-                    },
-                ))
+            let mut tab_element = div()
+                .id(("titlebar-tab", tab_id.0))
                 .relative()
                 .flex()
                 .w_full()
@@ -1180,10 +1155,10 @@ impl RemCmdApp {
                 .h(px(TITLEBAR_TAB_HEIGHT))
                 .rounded_full()
                 .bg(self.theme.transparent)
-                .cursor_pointer()
-                .hover(move |this| this.bg(hover_background))
-                .active(move |this| this.bg(pressed_background))
-                .when(is_active, move |this| {
+                .opacity(presence)
+                // Clipping would cut the selection's shadow, so only clip while resizing.
+                .when(presence < 0.999, |this| this.overflow_hidden())
+                .when(activeness > 0.01, |this| {
                     this.child(
                         div()
                             .absolute()
@@ -1193,81 +1168,134 @@ impl RemCmdApp {
                             .bottom_0()
                             .rounded_full()
                             .border_1()
-                            .border_color(tab_border)
-                            .bg(selected_background)
-                            .shadow(tab_shadow.clone())
-                            .with_animation(
-                                SharedString::from(format!("titlebar-tab-selection-{}", tab_id.0)),
-                                Animation::new(
-                                    self.theme.motion_duration(MOTION_EMPHASIZED_DURATION),
-                                )
-                                .with_easing(ease_in_out),
-                                |this, delta| this.opacity(0.72 + 0.28 * delta),
-                            ),
+                            .border_color(self.theme.titlebar_tab_border)
+                            .bg(self.theme.titlebar_tab_selected_bg)
+                            .shadow(self.titlebar_selected_tab_shadow())
+                            .opacity(activeness),
                     )
-                })
-                .child(close_control)
-                .child(tab_content)
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    let hovered_tab_id = if *hovered { Some(tab_id) } else { None };
-                    if this.hovered_titlebar_tab_id != hovered_tab_id {
-                        this.hovered_titlebar_tab_id = hovered_tab_id;
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.open_tab_context_menu(tab_id, event, window, cx);
-                    }),
-                )
-                .on_mouse_up(
-                    MouseButton::Middle,
-                    cx.listener(move |this, _, _, cx| {
+                });
+
+            if interactive {
+                let tooltip_theme = self.theme;
+                let close_tooltip = close_terminal_tooltip.clone();
+                let mut close_control = div()
+                    .id(("close-titlebar-tab", tab_id.0))
+                    .absolute()
+                    .top(px(6.0))
+                    .left(px(TITLEBAR_TAB_CLOSE_INSET))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(18.0))
+                    .rounded_full()
+                    .bg(if is_close_hovered {
+                        hover_background
+                    } else {
+                        self.theme.transparent
+                    })
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover_background))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(self.render_titlebar_close_symbol())
+                    .tooltip(move |_, cx| -> AnyView {
+                        cx.new(|_| CommandTooltip {
+                            label: close_tooltip.clone().into(),
+                            theme: tooltip_theme,
+                        })
+                        .into()
+                    })
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        let hovered_close_id = if *hovered { Some(tab_id) } else { None };
+                        if this.hovered_titlebar_close_id != hovered_close_id {
+                            this.hovered_titlebar_close_id = hovered_close_id;
+                            cx.notify();
+                        }
+                    }));
+                if show_close {
+                    close_control = close_control.on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.close_tab(tab_id, cx);
-                    }),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if this.activate_tab_in_window(tab_id, window, cx) {
-                        cx.notify();
-                    }
-                }));
-
-            let tab_element = tab_element.with_animation(
-                SharedString::from(format!("titlebar-tab-entry-{}", tab_id.0)),
-                Animation::new(self.theme.motion_duration(MOTION_STANDARD_DURATION))
-                    .with_easing(ease_out_quint()),
-                |this, delta| {
-                    this.left(px((1.0 - delta) * 10.0))
-                        .opacity(0.72 + 0.28 * delta)
-                },
-            );
-            let layout_animation_id = if is_active || is_deactivating {
-                format!(
-                    "titlebar-tab-layout-{}-{}",
-                    tab_id.0, self.titlebar_tab_transition_id
-                )
-            } else {
-                format!("titlebar-tab-layout-{}-stable", tab_id.0)
-            };
-            let tab_slot = div()
-                .flex()
-                .flex_1()
-                .min_w(px(TITLEBAR_TAB_ICON_ONLY_WIDTH))
-                .h(px(TITLEBAR_TAB_HEIGHT))
-                .child(tab_element)
-                .with_animation(
-                    SharedString::from(layout_animation_id),
-                    Animation::new(self.theme.motion_duration(MOTION_EMPHASIZED_DURATION))
-                        .with_easing(ease_in_out),
-                    move |this, delta| {
-                        let basis = start_tab_basis + (end_tab_basis - start_tab_basis) * delta;
-                        let min_width =
-                            start_tab_min_width + (end_tab_min_width - start_tab_min_width) * delta;
-                        this.flex_basis(px(basis)).min_w(px(min_width))
-                    },
+                    }));
+                }
+                let close_control = close_control.with_animation(
+                    SharedString::from(format!("titlebar-tab-close-{}-{show_close}", tab_id.0)),
+                    Animation::new(self.theme.motion_duration(MOTION_FAST_DURATION))
+                        .with_easing(ease_out_quint()),
+                    move |this, delta| this.opacity(if show_close { delta } else { 1.0 - delta }),
                 );
+
+                tab_element = tab_element
+                    .child(crate::accessibility::node(
+                        "titlebar-tab",
+                        crate::accessibility::Node {
+                            selected: is_active,
+                            ..crate::accessibility::Node::button(item.label.clone(), true)
+                        },
+                    ))
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover_background))
+                    .active(move |this| this.bg(pressed_background))
+                    .child(close_control)
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        let hovered_tab_id = if *hovered { Some(tab_id) } else { None };
+                        if this.hovered_titlebar_tab_id != hovered_tab_id {
+                            this.hovered_titlebar_tab_id = hovered_tab_id;
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_tab_context_menu(tab_id, event, window, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(tab_id, cx);
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.activate_tab_in_window(tab_id, window, cx) {
+                            cx.notify();
+                        }
+                    }));
+            }
+            let tab_element = tab_element.child(tab_content);
+
+            // Hairlines sit on the seam between two background tabs.
+            let separator_opacity = item_index.checked_sub(1).map_or(0.0, |previous| {
+                let previous = &items[previous];
+                (1.0 - activeness.max(previous.activeness(now)))
+                    * presence.min(previous.presence(now))
+            });
+            let mut tab_slot = div()
+                .relative()
+                .flex()
+                .h(px(TITLEBAR_TAB_HEIGHT))
+                .flex_basis(px(selected_tab_basis * activeness * presence))
+                .min_w(px((TITLEBAR_TAB_ICON_ONLY_WIDTH
+                    + (selected_tab_min_width - TITLEBAR_TAB_ICON_ONLY_WIDTH)
+                        * activeness)
+                    * presence))
+                .when(separator_opacity > 0.01, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .left(px(-0.5))
+                            .top(px((TITLEBAR_TAB_HEIGHT - 18.0) / 2.0))
+                            .w(px(1.0))
+                            .h(px(18.0))
+                            .bg(self.theme.titlebar_tab_separator)
+                            .opacity(separator_opacity),
+                    )
+                })
+                .child(tab_element);
+            // A tab claims free space in proportion to how far it has opened.
+            let slot_style = tab_slot.style();
+            slot_style.flex_grow = Some(if single_item { 1.0 } else { presence });
+            slot_style.flex_shrink = Some(1.0);
             tabs = tabs.child(tab_slot);
         }
 
@@ -1279,32 +1307,12 @@ impl RemCmdApp {
             .items_center()
             .gap(px(8.0))
             .px(px(TITLEBAR_EDGE_INSET));
-        if !self.tabs.is_empty() {
-            if self.titlebar_tabs_scroll_active {
-                let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
-                let scroll_start = self.titlebar_tabs_scroll_start;
-                let transition_id = self.titlebar_tabs_scroll_transition_id;
-                controls = controls.child(
-                    tabs.with_animation(
-                        SharedString::from(format!("titlebar-tabs-scroll-{transition_id}")),
-                        Animation::new(self.theme.motion_duration(MOTION_STANDARD_DURATION))
-                            .with_easing(ease_out_quint()),
-                        move |this, delta| {
-                            let target_x = -scroll_handle.max_offset().width;
-                            scroll_handle.set_offset(point(
-                                scroll_start.x + (target_x - scroll_start.x) * delta,
-                                scroll_start.y,
-                            ));
-                            this
-                        },
-                    ),
-                );
-            } else {
-                controls = controls.child(tabs);
-            }
-        } else {
+        if items.is_empty() {
             controls = controls.child(self.render_titlebar_drag_area().flex_1());
+        } else {
+            controls = controls.child(tabs);
         }
+        drop(strip);
 
         let center = div()
             .flex()
@@ -2618,7 +2626,13 @@ impl RemCmdApp {
                     .border_b_1()
                     .border_color(self.theme.border)
                     .child(self.render_workspace_controls(cx))
+                    .when(
+                        self.active_tab_view() == TerminalTabView::Terminal,
+                        |this| this.child(self.render_toolbar_divider()),
+                    )
                     .child(self.render_pane_controls(cx))
+                    // Connection state keeps its place at the trailing edge in every view.
+                    .child(div().flex_1())
                     .child(self.render_connection_controls(cx)),
             );
 
@@ -2990,8 +3004,6 @@ pub(super) const MOTION_FAST_DURATION: Duration = Duration::from_millis(120);
 
 pub(super) const MOTION_STANDARD_DURATION: Duration = Duration::from_millis(180);
 
-pub(super) const MOTION_EMPHASIZED_DURATION: Duration = Duration::from_millis(240);
-
 pub(super) const SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
 
 pub(super) const SIDEBAR_MIN_WIDTH: f32 = 220.0;
@@ -3255,21 +3267,25 @@ pub(super) fn workspace_tab_title(
     format!("{server_name} - {path}")
 }
 
+/// Extra width the selected tab claims before the strip's free space is shared out.
+///
+/// `tab_count` is fractional while a tab opens or collapses, so the result moves
+/// continuously instead of stepping when the number of tabs changes.
 pub(super) fn titlebar_active_tab_basis(
     track_width: f32,
-    tab_count: usize,
+    tab_count: f32,
     expanded_width: f32,
 ) -> f32 {
-    if tab_count <= 1 {
+    if tab_count <= 1.0 {
         return 0.0;
     }
 
-    let separator_width = tab_count.saturating_sub(1) as f32;
-    let available_width = (track_width - 6.0 - separator_width).max(0.0);
-    let equal_width = available_width / tab_count as f32;
-    let required_growth = (expanded_width - equal_width).max(0.0) * tab_count as f32
-        / tab_count.saturating_sub(1) as f32;
-    required_growth.max(TITLEBAR_ACTIVE_TAB_GROWTH)
+    let available_width = (track_width - TITLEBAR_TAB_GROUP_PADDING * 2.0).max(0.0);
+    let equal_width = available_width / tab_count;
+    let required_growth = (expanded_width - equal_width).max(0.0) * tab_count / (tab_count - 1.0);
+    required_growth
+        .min(available_width)
+        .max(TITLEBAR_ACTIVE_TAB_GROWTH)
 }
 
 pub(super) fn about_window_options(cx: &App, _localizer: &Localizer) -> WindowOptions {

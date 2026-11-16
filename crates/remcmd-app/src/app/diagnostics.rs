@@ -442,12 +442,21 @@ impl RemCmdApp {
                         .child(
                             div()
                                 .w(px(180.0))
+                                .min_w(px(80.0))
                                 .child(self.diagnostic_module_filter.clone()),
                         )
-                        .child(div().flex_1().child(self.diagnostic_text_filter.clone()))
+                        // The fields give way so the toggle at the end is never cut off.
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(80.0))
+                                .child(self.diagnostic_text_filter.clone()),
+                        )
                         .child(
                             div()
                                 .id("diagnostics-debug-toggle")
+                                .flex_none()
+                                .whitespace_nowrap()
                                 .px_2()
                                 .py_1()
                                 .rounded_md()

@@ -1,8 +1,7 @@
 use super::{
-    ActivePanel, ActiveTerminal, Context, FocusHandle, LOCAL_PROFILE_ID, MOTION_STANDARD_DURATION,
-    PaneId, PaneLayout, RemCmdApp, RightSidebarView, SftpBrowserPlacement, SplitAxis,
-    TERMINAL_REDRAW_INTERVAL, TabLayout, TerminalModes, TerminalSession, Timer, Window,
-    encode_focus, point, px,
+    ActivePanel, ActiveTerminal, Context, FocusHandle, LOCAL_PROFILE_ID, PaneId, PaneLayout,
+    RemCmdApp, RightSidebarView, SftpBrowserPlacement, SplitAxis, TabLayout, TerminalModes,
+    TerminalSession, Window, encode_focus,
 };
 
 impl RemCmdApp {
@@ -125,22 +124,9 @@ impl RemCmdApp {
             return;
         }
 
-        self.titlebar_tabs_scroll_start = self.titlebar_tabs_scroll_handle.offset();
-        self.titlebar_tabs_scroll_transition_id += 1;
-        self.titlebar_tabs_scroll_active = true;
-        let transition_id = self.titlebar_tabs_scroll_transition_id;
-        let scroll_handle = self.titlebar_tabs_scroll_handle.clone();
-        self.titlebar_tabs_scroll_cleanup_task = Some(cx.spawn(async move |this, cx| {
-            Timer::after(MOTION_STANDARD_DURATION + TERMINAL_REDRAW_INTERVAL).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.titlebar_tabs_scroll_transition_id == transition_id {
-                    scroll_handle.set_offset(point(-scroll_handle.max_offset().width, px(0.0)));
-                    this.titlebar_tabs_scroll_active = false;
-                    this.titlebar_tabs_scroll_cleanup_task = None;
-                    cx.notify();
-                }
-            });
-        }));
+        self.titlebar_tab_strip
+            .get_mut()
+            .reveal_end(self.titlebar_tabs_scroll_handle.offset().x);
         cx.notify();
     }
 
@@ -200,10 +186,6 @@ impl RemCmdApp {
 
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.active_pane_id = pane_id;
-        }
-        if self.active_tab_id != Some(tab_id) {
-            self.previous_active_tab_id = self.active_tab_id;
-            self.titlebar_tab_transition_id += 1;
         }
         self.active_tab_id = Some(tab_id);
         self.active_pane_id = Some(pane_id);
