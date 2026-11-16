@@ -1,18 +1,69 @@
 {
   "fill": {
-    "solid": "srgb:0.00392,0.34902,0.81961,1.00000"
+    "solid": "srgb:0.01961,0.08627,0.24706,1.00000"
   },
   "groups": [
     {
-      "name": "RemCmd artwork",
-      "specular": false,
+      "name": "Prompt",
       "layers": [
         {
-          "image-name": "Artwork.svg",
-          "name": "Blue panels and RC",
+          "image-name": "Glyph.svg",
+          "name": "Prompt and cursor",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": true
+    },
+    {
+      "name": "Echo",
+      "layers": [
+        {
+          "image-name": "Echo.svg",
+          "name": "Echo",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.5
+      },
+      "specular": true
+    },
+    {
+      "name": "Backdrop",
+      "layers": [
+        {
+          "image-name": "Rings.svg",
+          "name": "Signal rings",
+          "glass": false
+        },
+        {
+          "image-name": "Backdrop.svg",
+          "name": "Aurora",
           "glass": false
         }
-      ]
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": false
     }
   ],
   "supported-platforms": {

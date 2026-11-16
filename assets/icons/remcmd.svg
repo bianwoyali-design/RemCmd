@@ -1,48 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
   <title id="title">RemCmd</title>
-  <desc id="desc">A rectangular RC lettermark and bidirectional remote connection symbol on three joined blue panels in the RemCmd theme colors.</desc>
+  <desc id="desc">A white command prompt with a mint cursor and a trailing echo, over signal rings on a blue aurora.</desc>
+  <!-- Flat preview of macos/RemCmd.icon, which is the source for every rendered icon. -->
   <defs>
-    <linearGradient id="letter-fill" x1="512" y1="304" x2="512" y2="546" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFFFF" />
-      <stop offset="1" stop-color="#F4F4F5" />
-    </linearGradient>
-    <linearGradient id="blue-bright" x1="0" y1="0" x2="1" y2="1">
-      <stop stop-color="#126BE0" />
-      <stop offset="1" stop-color="#0159D1" />
-    </linearGradient>
-    <linearGradient id="blue-deep" x1="0" y1="0" x2="1" y2="1">
-      <stop stop-color="#0149AD" />
-      <stop offset="1" stop-color="#014398" />
-    </linearGradient>
-    <linearGradient id="blue-primary" x1="0" y1="0" x2="1" y2="1">
-      <stop stop-color="#0159D1" />
-      <stop offset="1" stop-color="#014FB8" />
-    </linearGradient>
-    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
-      <stop stop-color="#FFF" stop-opacity=".25" />
-      <stop offset=".5" stop-color="#FFF" stop-opacity=".08" />
-      <stop offset="1" stop-color="#014398" stop-opacity=".22" />
-    </linearGradient>
-    <clipPath id="rectangle-outline">
-      <rect width="616" height="616" rx="128" />
-    </clipPath>
+    <clipPath id="shape"><rect width="1024" height="1024" rx="230"/></clipPath>
   </defs>
-  <g id="original-badge" transform="scale(1.6623376623376624) translate(-204 -208)">
-    <g id="joined-color-blocks" transform="translate(204 208)" clip-path="url(#rectangle-outline)">
-      <path id="blue-bright-block" d="M0 0H616V120L330 360L0 170Z" fill="url(#blue-bright)" />
-      <path id="blue-deep-block" d="M616 120V616H180L330 360Z" fill="url(#blue-deep)" />
-      <path id="blue-primary-block" d="M0 170L330 360L180 616H0Z" fill="url(#blue-primary)" />
-      <rect id="edge-highlight" x="1" y="1" width="614" height="614" rx="127" fill="none" stroke="url(#edge)" stroke-width="2" />
-    </g>
-    <g id="white-content" transform="translate(512 516) scale(0.90) translate(-512 -516)">
-      <g id="RC-lettermark" fill="url(#letter-fill)" fill-rule="evenodd" transform="translate(0 -30)">
-        <path id="R" d="M292 342H393C457 342 489 372 489 421C489 458 467 482 438 493L501 574H425L371 500H354V574H292Z M354 399V445H391C414 445 427 436 427 422C427 407 413 399 391 399Z" />
-        <path id="C" d="M738 372L697 417C682 401 663 394 642 394C604 394 580 417 580 455C580 493 604 516 642 516C662 516 679 508 694 491L738 535C713 561 681 576 640 576C568 576 515 528 515 455C515 382 568 334 642 334C681 334 712 347 738 372Z" />
-      </g>
-      <g id="remote-connect" fill="#FFFFFF">
-        <path id="terminal-endpoints" d="M340 628H290Q272 628 272 646V716Q272 734 290 734H340V710H298V652H340Z M684 628H734Q752 628 752 646V716Q752 734 734 734H684V710H726V652H684Z" />
-        <path id="bidirectional-arrows" d="M374 634H588V611L642 646L588 681V658H374Z M650 690H436V667L382 702L436 737V714H650Z" />
-      </g>
-    </g>
+  <g clip-path="url(#shape)">
+    <g id="aurora">
+<defs>
+<linearGradient id="sky" gradientUnits="userSpaceOnUse" x1="170" y1="0" x2="854" y2="1024">
+<stop offset="0" stop-color="#3B8CFF"/><stop offset="0.42" stop-color="#0D55DC"/><stop offset="1" stop-color="#05163F"/>
+</linearGradient>
+<radialGradient id="violet" gradientUnits="userSpaceOnUse" cx="930" cy="110" r="600">
+<stop offset="0" stop-color="#9A6BFF" stop-opacity="0.85"/><stop offset="1" stop-color="#9A6BFF" stop-opacity="0"/>
+</radialGradient>
+<radialGradient id="mint" gradientUnits="userSpaceOnUse" cx="130" cy="950" r="640">
+<stop offset="0" stop-color="#2CE8C7" stop-opacity="0.8"/><stop offset="1" stop-color="#2CE8C7" stop-opacity="0"/>
+</radialGradient>
+</defs>
+<rect width="1024" height="1024" fill="url(#sky)"/>
+<rect width="1024" height="1024" fill="url(#violet)"/>
+<rect width="1024" height="1024" fill="url(#mint)"/>
+</g>
+    <g id="signal-rings"><circle cx="588.3" cy="512.0" r="250" fill="none" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="5"/><circle cx="588.3" cy="512.0" r="390" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="5"/><circle cx="588.3" cy="512.0" r="530" fill="none" stroke="#FFFFFF" stroke-opacity="0.09" stroke-width="5"/><circle cx="588.3" cy="512.0" r="670" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="5"/></g>
+    <g id="echo"><path d="M227.39999999999998 331.6L474.79999999999995 512.0L227.39999999999998 692.4" fill="none" stroke="#FFFFFF" stroke-opacity="0.34" stroke-width="100.4" stroke-linecap="round" stroke-linejoin="round"/></g>
+    <g id="prompt"><defs><linearGradient id="cur" gradientUnits="userSpaceOnUse" x1="636.6" y1="0" x2="796.6" y2="0"><stop offset="0" stop-color="#7DFBE0"/><stop offset="1" stop-color="#35E7C8"/></linearGradient></defs>
+<path d="M340.9 331.6L588.3 512.0L340.9 692.4" fill="none" stroke="#FFFFFF" stroke-width="100.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M636.6 692.4H796.6" fill="none" stroke="url(#cur)" stroke-width="100.4" stroke-linecap="round"/></g>
   </g>
 </svg>

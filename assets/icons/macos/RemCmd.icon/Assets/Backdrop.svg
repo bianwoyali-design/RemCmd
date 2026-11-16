@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<defs>
+<linearGradient id="sky" gradientUnits="userSpaceOnUse" x1="170" y1="0" x2="854" y2="1024">
+<stop offset="0" stop-color="#3B8CFF"/><stop offset="0.42" stop-color="#0D55DC"/><stop offset="1" stop-color="#05163F"/>
+</linearGradient>
+<radialGradient id="violet" gradientUnits="userSpaceOnUse" cx="930" cy="110" r="600">
+<stop offset="0" stop-color="#9A6BFF" stop-opacity="0.85"/><stop offset="1" stop-color="#9A6BFF" stop-opacity="0"/>
+</radialGradient>
+<radialGradient id="mint" gradientUnits="userSpaceOnUse" cx="130" cy="950" r="640">
+<stop offset="0" stop-color="#2CE8C7" stop-opacity="0.8"/><stop offset="1" stop-color="#2CE8C7" stop-opacity="0"/>
+</radialGradient>
+</defs>
+<rect width="1024" height="1024" fill="url(#sky)"/>
+<rect width="1024" height="1024" fill="url(#violet)"/>
+<rect width="1024" height="1024" fill="url(#mint)"/>
+</svg>

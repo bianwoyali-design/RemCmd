@@ -24,7 +24,7 @@ pub(crate) type Handler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 pub(crate) struct Node {
     pub role: Role,
     pub label: SharedString,
-    pub value: Option<String>,
+    pub value: Option<SharedString>,
     pub enabled: bool,
     pub selected: bool,
     pub secure: bool,
@@ -50,10 +50,10 @@ impl Node {
             menu: false,
         }
     }
-    pub fn text(label: impl Into<SharedString>, value: String) -> Self {
+    pub fn text(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Self {
         Self {
             role: Role::StaticText,
-            value: Some(value),
+            value: Some(value.into()),
             ..Self::button(label, true)
         }
     }
@@ -198,15 +198,39 @@ mod native {
         pending: Vec<Record>,
         nodes: HashMap<Vec<ElementId>, Retained<Accessible>>,
         order: Vec<Vec<ElementId>>,
+        generation: u64,
     }
     thread_local! {
         static TREES: RefCell<HashMap<WindowId, Tree>> = RefCell::new(HashMap::new());
         static LAYER: Cell<u8> = const { Cell::new(0) };
     }
     type Dispatch = Rc<dyn Fn(Action)>;
+    #[derive(PartialEq)]
+    struct Published {
+        role: Role,
+        secure: bool,
+        label: SharedString,
+        enabled: bool,
+    }
+    /// Shared strings usually keep their allocation between frames; compare that first.
+    fn same_text(left: &Option<SharedString>, right: &Option<SharedString>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                (left.len() == right.len() && left.as_ptr() == right.as_ptr()) || left == right
+            }
+            _ => false,
+        }
+    }
     #[derive(Default)]
     pub struct Ivars {
-        value: RefCell<Option<String>>,
+        value: RefCell<Option<SharedString>>,
+        // Last attributes pushed to AppKit, so unchanged nodes cost no native calls per frame.
+        published: RefCell<Option<Published>>,
+        /// Frame in the parent view's coordinates: x, y, width, height.
+        published_frame: Cell<Option<[f64; 4]>>,
+        action_uses_handler: Cell<bool>,
+        generation: Cell<u64>,
         checked: Cell<Option<bool>>,
         focused: Cell<bool>,
         selected: Cell<bool>,
@@ -285,6 +309,8 @@ mod native {
         fn expire(&self) {
             self.ivars().action.borrow_mut().take();
             self.ivars().value.borrow_mut().take();
+            self.ivars().published.borrow_mut().take();
+            self.ivars().published_frame.set(None);
             self.ivars().editable.set(false);
             self.ivars().focusable.set(false);
             self.ivars().focused.set(false);
@@ -470,7 +496,11 @@ mod native {
                 .max()
                 .unwrap_or(0);
             let pending = std::mem::take(&mut tree.pending);
-            let mut order = Vec::new();
+            tree.generation = tree.generation.wrapping_add(1);
+            let generation = tree.generation;
+            let view_height = view.bounds().size.height;
+            let flipped = view.isFlipped();
+            let mut order = Vec::with_capacity(pending.len());
             for Record {
                 id,
                 spec,
@@ -482,44 +512,62 @@ mod native {
                     continue;
                 }
                 order.push(id.clone());
-                let node = tree
-                    .nodes
-                    .entry(id.clone())
-                    .or_insert_with(|| Accessible::new(mtm));
-                // SAFETY: These are immutable AppKit role constants.
-                let role = unsafe {
-                    match spec.role {
-                        Role::Button => NSAccessibilityButtonRole,
-                        Role::CheckBox => NSAccessibilityCheckBoxRole,
-                        Role::TextField => NSAccessibilityTextFieldRole,
-                        Role::TextArea => NSAccessibilityTextAreaRole,
-                        Role::StaticText => NSAccessibilityStaticTextRole,
-                    }
+                let node = tree.nodes.entry(id).or_insert_with(|| Accessible::new(mtm));
+                node.ivars().generation.set(generation);
+                let published = Published {
+                    role: spec.role,
+                    secure: spec.secure,
+                    label: spec.label,
+                    enabled: spec.enabled,
                 };
-                node.setAccessibilityRole(Some(role));
-                node.setAccessibilitySubrole(
-                    spec.secure
-                        .then_some(unsafe { NSAccessibilitySecureTextFieldSubrole }),
-                );
-                node.setAccessibilityLabel(Some(&NSString::from_str(&spec.label)));
-                node.setAccessibilityEnabled(spec.enabled);
-                node.setAccessibilityElement(true);
-                // SAFETY: NSView is the real parent; AppKit stores a weak reference.
-                unsafe {
-                    node.setAccessibilityParent(Some(view));
+                if node.ivars().published.borrow().as_ref() != Some(&published) {
+                    // SAFETY: These are immutable AppKit role constants.
+                    let role = unsafe {
+                        match published.role {
+                            Role::Button => NSAccessibilityButtonRole,
+                            Role::CheckBox => NSAccessibilityCheckBoxRole,
+                            Role::TextField => NSAccessibilityTextFieldRole,
+                            Role::TextArea => NSAccessibilityTextAreaRole,
+                            Role::StaticText => NSAccessibilityStaticTextRole,
+                        }
+                    };
+                    node.setAccessibilityRole(Some(role));
+                    node.setAccessibilitySubrole(
+                        published
+                            .secure
+                            .then_some(unsafe { NSAccessibilitySecureTextFieldSubrole }),
+                    );
+                    node.setAccessibilityLabel(Some(&NSString::from_str(&published.label)));
+                    node.setAccessibilityEnabled(published.enabled);
+                    node.setAccessibilityElement(true);
+                    // SAFETY: NSView is the real parent; AppKit stores a weak reference.
+                    unsafe {
+                        node.setAccessibilityParent(Some(view));
+                    }
+                    *node.ivars().published.borrow_mut() = Some(published);
                 }
-                let y = if view.isFlipped() {
+                // Scrolling moves every visible node; that alone only needs a new frame.
+                // Compare the converted frame: it also shifts when the view's height changes.
+                let y = if flipped {
                     f64::from(bounds.origin.y)
                 } else {
-                    view.bounds().size.height - f64::from(bounds.bottom())
+                    view_height - f64::from(bounds.bottom())
                 };
-                node.setAccessibilityFrameInParentSpace(NSRect::new(
-                    NSPoint::new(f64::from(bounds.origin.x), y),
-                    NSSize::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
-                ));
+                let frame = [
+                    f64::from(bounds.origin.x),
+                    y,
+                    f64::from(bounds.size.width),
+                    f64::from(bounds.size.height),
+                ];
+                if node.ivars().published_frame.replace(Some(frame)) != Some(frame) {
+                    node.setAccessibilityFrameInParentSpace(NSRect::new(
+                        NSPoint::new(frame[0], frame[1]),
+                        NSSize::new(frame[2], frame[3]),
+                    ));
+                }
                 let checked = (spec.role == Role::CheckBox).then_some(spec.selected);
                 let checked_changed = node.ivars().checked.replace(checked) != checked;
-                if checked_changed || *node.ivars().value.borrow() != spec.value {
+                if checked_changed || !same_text(&node.ivars().value.borrow(), &spec.value) {
                     *node.ivars().value.borrow_mut() = spec.value;
                     notifications.push((node.clone(), unsafe {
                         NSAccessibilityValueChangedNotification
@@ -544,41 +592,52 @@ mod native {
                 let actionable = spec.enabled
                     && (matches!(spec.role, Role::Button | Role::CheckBox)
                         || spec.handler.is_some());
-                *node.ivars().action.borrow_mut() = actionable.then(|| {
-                    let context = cx.to_async();
-                    let handle = window.window_handle();
-                    let handler = spec.handler;
-                    let weak_view = objc2::rc::Weak::new(view);
-                    let weak_node = objc2::rc::Weak::from_retained(node);
-                    Rc::new(move |action: Action| {
-                        let handler = handler.clone();
-                        let weak_view = weak_view.clone();
-                        let weak_node = weak_node.clone();
-                        context
-                            .spawn(async move |cx| {
-                                let Some(node) = weak_node.load() else {
-                                    return;
-                                };
-                                if node.ivars().action.borrow().is_none() {
-                                    return;
-                                }
-                                let Some(view) = weak_view.load() else {
-                                    return;
-                                };
-                                activate(&view);
-                                if let Some(handler) = handler {
-                                    let _ = handle
-                                        .update(cx, |_, window, cx| handler(action, window, cx));
-                                } else if matches!(action, Action::Press) {
-                                    press(&view, node.ivars().bounds.get());
-                                }
-                            })
-                            .detach();
-                    }) as Dispatch
-                });
+                if !actionable {
+                    node.ivars().action.borrow_mut().take();
+                    continue;
+                }
+                // A plain press reads the node's current bounds, so its callback never goes stale.
+                let uses_handler = spec.handler.is_some();
+                if !uses_handler
+                    && !node.ivars().action_uses_handler.get()
+                    && node.ivars().action.borrow().is_some()
+                {
+                    continue;
+                }
+                node.ivars().action_uses_handler.set(uses_handler);
+                let context = cx.to_async();
+                let handle = window.window_handle();
+                let handler = spec.handler;
+                let weak_view = objc2::rc::Weak::new(view);
+                let weak_node = objc2::rc::Weak::from_retained(node);
+                *node.ivars().action.borrow_mut() = Some(Rc::new(move |action: Action| {
+                    let handler = handler.clone();
+                    let weak_view = weak_view.clone();
+                    let weak_node = weak_node.clone();
+                    context
+                        .spawn(async move |cx| {
+                            let Some(node) = weak_node.load() else {
+                                return;
+                            };
+                            if node.ivars().action.borrow().is_none() {
+                                return;
+                            }
+                            let Some(view) = weak_view.load() else {
+                                return;
+                            };
+                            activate(&view);
+                            if let Some(handler) = handler {
+                                let _ =
+                                    handle.update(cx, |_, window, cx| handler(action, window, cx));
+                            } else if matches!(action, Action::Press) {
+                                press(&view, node.ivars().bounds.get());
+                            }
+                        })
+                        .detach();
+                }) as Dispatch);
             }
-            tree.nodes.retain(|id, node| {
-                let live = order.contains(id);
+            tree.nodes.retain(|_, node| {
+                let live = node.ivars().generation.get() == generation;
                 if !live {
                     node.expire();
                 }

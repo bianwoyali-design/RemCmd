@@ -506,11 +506,14 @@ impl RemCmdApp {
                         .text_sm()
                         .child(
                             div()
+                                .flex_none()
                                 .text_color(self.theme.text_muted)
                                 .child(self.tr("import-source")),
                         )
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .font_family(UI_MONOSPACE_FONT_FAMILY)
                                 .truncate()
                                 .child(source),

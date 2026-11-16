@@ -1,3 +1,4 @@
+use super::super::scrollbar::overlay_scrollbar;
 use super::super::{
     AnyElement, CancelSftpCreate, Context, ContextMenuEntry, FontWeight, IconName, IconTone,
     MouseButton, Range, RemCmdApp, RemoteFileKind, SessionId, SessionState, SftpTransferDirection,
@@ -5,11 +6,12 @@ use super::super::{
     icon_with_color, px, text_button, uniform_list,
 };
 use super::state::{
-    SftpAvailability, SftpBrowserPlacement, SftpCreateKind, SftpTransferState, SftpTreeRow,
-    format_remote_modified, format_remote_size, remote_breadcrumbs,
+    SftpAvailability, SftpBrowserPlacement, SftpCreateKind, SftpTransferState, format_remote_size,
+    remote_breadcrumbs,
 };
 use gpui::prelude::*;
 use remcmd_ssh::remote_path::remote_parent_path;
+use std::collections::HashSet;
 
 impl RemCmdApp {
     pub(in crate::app) fn open_sftp_context_menu(
@@ -236,8 +238,9 @@ impl RemCmdApp {
         let browser_state = session.sftp_browser(placement);
         let path = browser_state.path.clone();
         let tree = placement == SftpBrowserPlacement::Sidebar;
-        let entry_count = browser_state.visible_rows(tree).len();
-        let selected_entries = browser_state.selected_entries();
+        let entry_count = browser_state.list_rows(tree).len();
+        let has_selection = !browser_state.selected_paths.is_empty();
+        let has_downloadable_selection = browser_state.has_downloadable_selection();
         let scroll_handle = browser_state.scroll_handle.clone();
         let loading = browser_state.loading;
         let loaded = browser_state.loaded;
@@ -283,15 +286,30 @@ impl RemCmdApp {
                 .overflow_hidden()
                 .when(!tree, |this| this.child(self.render_sftp_column_header()))
                 .child(
-                    uniform_list(
-                        list_id,
-                        entry_count,
-                        cx.processor(move |this, range: Range<usize>, _, cx| {
-                            this.render_sftp_entry_rows(session_id, placement, range, cx)
-                        }),
-                    )
-                    .size_full()
-                    .track_scroll(scroll_handle),
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .child(
+                            uniform_list(
+                                list_id,
+                                entry_count,
+                                cx.processor(move |this, range: Range<usize>, _, cx| {
+                                    this.render_sftp_entry_rows(session_id, placement, range, cx)
+                                }),
+                            )
+                            .size_full()
+                            .track_scroll(scroll_handle.clone()),
+                        )
+                        .child(overlay_scrollbar(
+                            match placement {
+                                SftpBrowserPlacement::Center => "sftp-scrollbar-center",
+                                SftpBrowserPlacement::Sidebar => "sftp-scrollbar-sidebar",
+                            },
+                            scroll_handle.0.borrow().base_handle.clone(),
+                            self.theme.text_primary,
+                        )),
                 )
                 .into_any_element()
         };
@@ -334,11 +352,7 @@ impl RemCmdApp {
                 this.choose_sftp_uploads(session_id, placement, cx);
             }));
         }
-        let can_download = connected
-            && !loading
-            && selected_entries.iter().any(|entry| {
-                matches!(entry.kind, RemoteFileKind::File | RemoteFileKind::Directory)
-            });
+        let can_download = connected && !loading && has_downloadable_selection;
         let mut download_button = self.render_icon_button(
             SharedString::from(format!("sftp_download_selected_{element_suffix}")),
             IconName::Download,
@@ -351,7 +365,7 @@ impl RemCmdApp {
                 this.download_selected_sftp_entries(session_id, placement, cx);
             }));
         }
-        let can_delete = connected && !loading && !selected_entries.is_empty();
+        let can_delete = connected && !loading && has_selection;
         let browser_background = if placement == SftpBrowserPlacement::Sidebar {
             self.theme.transparent
         } else {
@@ -404,10 +418,13 @@ impl RemCmdApp {
                     .px_2()
                     .border_b_1()
                     .border_color(self.theme.border)
+                    // Navigation, transfers, and the destructive action read as three groups.
                     .child(parent_button)
                     .child(refresh_button)
+                    .child(self.render_toolbar_divider())
                     .child(upload_button)
                     .child(download_button)
+                    .child(self.render_toolbar_divider())
                     .child(delete_button)
                     .child(div().flex_1())
                     .when(loading && loaded, |this| {
@@ -645,71 +662,59 @@ impl RemCmdApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let tree = placement == SftpBrowserPlacement::Sidebar;
-        let range_start = range.start;
-        let Some((tree_rows, selected_paths, connected, loading)) =
-            self.session(session_id).map(|session| {
-                let browser = session.sftp_browser(placement);
-                let tree_rows = browser
-                    .visible_rows(tree)
-                    .get(range)
-                    .map_or_else(Vec::new, <[SftpTreeRow]>::to_vec);
-                (
-                    tree_rows,
-                    browser.selected_paths.clone(),
-                    session.connection_state == SessionState::Connected,
-                    browser.loading,
-                )
-            })
-        else {
+        let Some(session) = self.session(session_id) else {
             return Vec::new();
+        };
+        let browser = session.sftp_browser(placement);
+        let all_rows = browser.list_rows(tree);
+        let Some(visible_rows) = all_rows.get(range.clone()) else {
+            return Vec::new();
+        };
+        let connected = session.connection_state == SessionState::Connected;
+        let loading = browser.loading;
+        // Large selections are probed once per visible row; hash them instead of scanning.
+        let selected_paths = &browser.selected_paths;
+        let selected_lookup = (selected_paths.len() > SFTP_SELECTION_SCAN_LIMIT).then(|| {
+            selected_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        });
+        let is_selected = |path: &str| match &selected_lookup {
+            Some(lookup) => lookup.contains(path),
+            None => selected_paths.iter().any(|selected| selected == path),
         };
         let list_hover = self.theme.list_hover_bg;
         let pressed = self.theme.control_pressed_bg;
         // Finder-style lists: accent selection with white labels, zebra rows instead of rules.
         let selected_background = self.theme.accent_fill;
         let stripe_background = self.theme.settings_group_bg;
-        let element_suffix = placement.element_suffix();
-        let first_index = range_start;
-        let mut rows = Vec::with_capacity(tree_rows.len());
+        let (row_id, disclosure_id) = match placement {
+            SftpBrowserPlacement::Center => ("sftp-entry-center", "sftp-disclosure-center"),
+            SftpBrowserPlacement::Sidebar => ("sftp-entry-sidebar", "sftp-disclosure-sidebar"),
+        };
+        let mut rows = Vec::with_capacity(visible_rows.len());
 
-        for (offset, tree_row) in tree_rows.into_iter().enumerate() {
-            let entry = tree_row.entry;
-            let is_directory = entry.kind == RemoteFileKind::Directory;
-            let is_file = entry.kind == RemoteFileKind::File;
-            let is_hidden = entry.name.starts_with('.');
-            let entry_path = entry.path.clone();
+        for (index, list_row) in range.zip(visible_rows) {
+            let is_directory = list_row.kind == RemoteFileKind::Directory;
+            let is_file = list_row.kind == RemoteFileKind::File;
+            // Broken links stay selectable so they can be copied or deleted.
+            let is_interactive = is_directory || is_file || list_row.symlink;
+            let entry_path = list_row.path.clone();
             let context_entry_path = entry_path.clone();
-            let is_selected = selected_paths.contains(&entry_path);
-            let is_expanded = self.session(session_id).is_some_and(|session| {
-                session
-                    .sftp_browser(placement)
-                    .expanded_paths
-                    .contains(&entry_path)
-            });
+            let is_selected = is_selected(&entry_path);
             let icon_name = if is_directory {
                 IconName::Folder
             } else {
                 IconName::File
             };
-            let size = if is_directory {
-                "--".into()
-            } else {
-                entry
-                    .size
-                    .map(format_remote_size)
-                    .unwrap_or_else(|| "--".into())
-            };
-            let modified = entry
-                .modified
-                .map(format_remote_modified)
-                .unwrap_or_else(|| "--".into());
             let (name_color, detail_color, icon_color) = if is_selected {
                 (
                     self.theme.on_accent,
                     self.theme.on_accent.opacity(0.8),
                     self.theme.on_accent,
                 )
-            } else if is_hidden {
+            } else if list_row.hidden {
                 // Hidden entries read as secondary, as when Finder shows dotfiles.
                 (
                     self.theme.text_muted,
@@ -726,10 +731,7 @@ impl RemCmdApp {
             let disclosure = if tree && is_directory {
                 let disclosure_path = entry_path.clone();
                 div()
-                    .id(SharedString::from(format!(
-                        "sftp-disclosure-{element_suffix}-{}",
-                        entry.path
-                    )))
+                    .id((disclosure_id, index))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -738,7 +740,7 @@ impl RemCmdApp {
                     .rounded_md()
                     .cursor_pointer()
                     .child(icon_with_color(
-                        if is_expanded {
+                        if list_row.expanded {
                             IconName::Collapse
                         } else {
                             IconName::Expand
@@ -754,7 +756,7 @@ impl RemCmdApp {
                         this.toggle_remote_tree_directory(
                             session_id,
                             placement,
-                            disclosure_path.clone(),
+                            disclosure_path.to_string(),
                             cx,
                         );
                     }))
@@ -766,7 +768,7 @@ impl RemCmdApp {
             };
             let resting_background = if is_selected {
                 selected_background
-            } else if !tree && (first_index + offset) % 2 == 1 {
+            } else if !tree && index % 2 == 1 {
                 stripe_background
             } else {
                 self.theme.transparent
@@ -777,19 +779,13 @@ impl RemCmdApp {
                 list_hover
             };
             let mut row = div()
-                .id(SharedString::from(format!(
-                    "sftp-entry-{element_suffix}-{}",
-                    entry.path
-                )))
+                .id((row_id, index))
                 .relative()
                 .child(crate::accessibility::node(
                     "sftp-entry",
                     crate::accessibility::Node {
                         selected: is_selected,
-                        ..crate::accessibility::Node::button(
-                            entry.name.clone(),
-                            is_directory || is_file,
-                        )
+                        ..crate::accessibility::Node::button(list_row.name.clone(), is_interactive)
                     },
                 ))
                 .flex()
@@ -799,12 +795,12 @@ impl RemCmdApp {
                 .items_center()
                 .gap_2()
                 .h(px(SFTP_ROW_HEIGHT))
-                .pl(px(8.0 + tree_row.depth as f32 * 14.0))
+                .pl(px(8.0 + list_row.depth as f32 * 14.0))
                 .pr_3()
                 .when(tree, |this| this.rounded_md())
                 .bg(resting_background)
                 .child(disclosure)
-                .child(icon_with_color(icon_name, icon_color, 15.0))
+                .child(self.render_sftp_entry_icon(icon_name, icon_color, list_row.symlink))
                 .child(
                     div()
                         .flex_1()
@@ -812,7 +808,7 @@ impl RemCmdApp {
                         .truncate()
                         .text_sm()
                         .text_color(name_color)
-                        .child(entry.name),
+                        .child(list_row.name.clone()),
                 )
                 .when(!tree, |this| {
                     this.child(
@@ -822,7 +818,7 @@ impl RemCmdApp {
                             .truncate()
                             .text_xs()
                             .text_color(detail_color)
-                            .child(modified),
+                            .child(list_row.modified.clone()),
                     )
                 })
                 .child(
@@ -832,9 +828,9 @@ impl RemCmdApp {
                         .text_right()
                         .text_xs()
                         .text_color(detail_color)
-                        .child(size),
+                        .child(list_row.size.clone()),
                 );
-            if is_directory || is_file {
+            if is_interactive {
                 row = row
                     .cursor_pointer()
                     .hover(move |this| this.bg(row_hover))
@@ -867,14 +863,18 @@ impl RemCmdApp {
                                     this.request_sftp_directory(
                                         session_id,
                                         placement,
-                                        entry_path.clone(),
+                                        entry_path.to_string(),
                                         cx,
                                     );
                                 } else {
-                                    this.open_remote_directory(placement, entry_path.clone(), cx);
+                                    this.open_remote_directory(
+                                        placement,
+                                        entry_path.to_string(),
+                                        cx,
+                                    );
                                 }
-                            } else {
-                                this.open_remote_file(entry_path.clone(), true, cx);
+                            } else if is_file {
+                                this.open_remote_file(entry_path.to_string(), true, cx);
                             }
                         } else {
                             cx.notify();
@@ -885,6 +885,41 @@ impl RemCmdApp {
         }
 
         rows
+    }
+
+    /// Finder-style alias badge on the lower-left corner of linked entries.
+    fn render_sftp_entry_icon(
+        &self,
+        icon: IconName,
+        color: gpui::Hsla,
+        symlink: bool,
+    ) -> AnyElement {
+        if !symlink {
+            return icon_with_color(icon, color, 15.0);
+        }
+        div()
+            .relative()
+            .flex_none()
+            .size(px(15.0))
+            .child(icon_with_color(icon, color, 15.0))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(-2.0))
+                    .bottom(px(-2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(9.0))
+                    .rounded(px(2.0))
+                    .bg(self.theme.surface_bg)
+                    .child(icon_with_color(
+                        IconName::Alias,
+                        self.theme.text_primary,
+                        8.0,
+                    )),
+            )
+            .into_any_element()
     }
 
     fn render_sftp_column_header(&self) -> gpui::Div {
@@ -922,25 +957,25 @@ impl RemCmdApp {
         placement: SftpBrowserPlacement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (tasks, batch_progress) = self
+        let (task_count, has_finished, batch_progress) = self
             .session(session_id)
             .map(|session| {
-                let direction = session.transfers.latest_batch_direction();
+                let transfers = &session.transfers;
+                let direction = transfers.latest_batch_direction();
                 (
-                    session.transfers.tasks.clone(),
+                    transfers.tasks.len(),
+                    transfers.tasks.iter().any(|task| task.state.is_finished()),
                     direction.and_then(|direction| {
-                        session
-                            .transfers
+                        transfers
                             .latest_batch_progress(direction)
                             .map(|progress| (direction, progress))
                     }),
                 )
             })
             .unwrap_or_default();
-        if tasks.is_empty() {
+        if task_count == 0 {
             return div().into_any_element();
         }
-        let has_finished = tasks.iter().any(|task| task.state.is_finished());
         let element_suffix = placement.element_suffix();
 
         let mut clear_button = self.render_icon_button(
@@ -963,7 +998,6 @@ impl RemCmdApp {
             .flex()
             .flex_none()
             .flex_col()
-            .max_h(px(220.0))
             .border_t_1()
             .border_color(self.theme.border)
             .bg(self.theme.surface_bg)
@@ -1073,14 +1107,41 @@ impl RemCmdApp {
             );
         }
 
-        let mut rows = div()
-            .id(SharedString::from(format!(
+        // Only the visible tasks are built; a folder transfer can queue thousands.
+        let rows = uniform_list(
+            SharedString::from(format!(
                 "sftp-transfer-rows-{element_suffix}-{}",
                 session_id.0
-            )))
-            .flex()
-            .flex_col()
-            .overflow_y_scroll();
+            )),
+            task_count,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                this.render_sftp_transfer_rows(session_id, placement, range, cx)
+            }),
+        )
+        .flex_none()
+        .w_full()
+        .h(px(
+            (task_count as f32).min(SFTP_TRANSFER_VISIBLE_ROWS) * SFTP_TRANSFER_ROW_HEIGHT
+        ));
+
+        queue.child(rows).into_any_element()
+    }
+
+    fn render_sftp_transfer_rows(
+        &self,
+        session_id: SessionId,
+        placement: SftpBrowserPlacement,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(tasks) = self
+            .session(session_id)
+            .and_then(|session| session.transfers.tasks.get(range))
+        else {
+            return Vec::new();
+        };
+        let element_suffix = placement.element_suffix();
+        let mut rows = Vec::with_capacity(tasks.len());
         for task in tasks {
             let transfer_id = task.id;
             let direction = task.direction;
@@ -1163,12 +1224,14 @@ impl RemCmdApp {
             }
 
             let row = div()
+                .relative()
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap_2()
+                .w_full()
+                .h(px(SFTP_TRANSFER_ROW_HEIGHT))
                 .px_3()
-                .py_2()
                 .border_t_1()
                 .border_color(self.theme.border)
                 .child(self.render_sidebar_icon(
@@ -1184,7 +1247,7 @@ impl RemCmdApp {
                         .flex_1()
                         .min_w(px(0.0))
                         .flex_col()
-                        .gap_1()
+                        .gap(px(2.0))
                         .child(
                             div()
                                 .truncate()
@@ -1198,37 +1261,39 @@ impl RemCmdApp {
                                 .text_xs()
                                 .text_color(status_color)
                                 .child(task.status_text(&self.localizer)),
-                        )
-                        .when(
-                            matches!(
-                                state,
-                                SftpTransferState::Running | SftpTransferState::Cancelling
-                            ),
-                            |this| {
-                                this.child(
-                                    div()
-                                        .h(px(3.0))
-                                        .w_full()
-                                        .overflow_hidden()
-                                        .rounded_full()
-                                        .bg(self.theme.control_bg)
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(gpui::relative(progress))
-                                                .rounded_full()
-                                                .bg(self.theme.accent),
-                                        ),
-                                )
-                            },
                         ),
                 )
-                .child(controls);
-            rows = rows.child(row);
+                .child(controls)
+                .when(
+                    matches!(
+                        state,
+                        SftpTransferState::Running | SftpTransferState::Cancelling
+                    ),
+                    |this| {
+                        // Pinned to the row's lower edge so every row keeps one height.
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(px(12.0))
+                                .right(px(12.0))
+                                .bottom(px(2.0))
+                                .h(px(2.0))
+                                .overflow_hidden()
+                                .rounded_full()
+                                .bg(self.theme.control_bg)
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(progress))
+                                        .rounded_full()
+                                        .bg(self.theme.accent),
+                                ),
+                        )
+                    },
+                );
+            rows.push(row.into_any_element());
         }
-
-        queue = queue.child(rows);
-        queue.into_any_element()
+        rows
     }
 
     pub(in crate::app) fn render_sftp_file(
@@ -1403,5 +1468,10 @@ impl RemCmdApp {
 }
 
 const SFTP_ROW_HEIGHT: f32 = 26.0;
+/// Selections up to this size are scanned per row; larger ones are hashed once per frame.
+const SFTP_SELECTION_SCAN_LIMIT: usize = 8;
+const SFTP_TRANSFER_ROW_HEIGHT: f32 = 46.0;
+/// The queue shows this many rows before scrolling; the half row hints at more.
+const SFTP_TRANSFER_VISIBLE_ROWS: f32 = 3.5;
 const SFTP_MODIFIED_COLUMN_WIDTH: f32 = 116.0;
 const SFTP_SIZE_COLUMN_WIDTH: f32 = 72.0;

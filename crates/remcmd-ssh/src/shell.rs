@@ -7,7 +7,9 @@ use crate::{SshError, SshErrorKind, shell_integration};
 const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
 const INTEGRATION_READY_MARKER: &[u8] = b"\x1b]777;remcmd-shell-ready\x07";
 const INTEGRATION_READY_COMMAND: &str = "printf '\\033]777;remcmd-shell-ready\\007'; printf '\\r\\033[2K\\033]7;file://%s\\007' \"$PWD\"\r";
-const INTEGRATION_STARTUP_TIMEOUT: Duration = Duration::from_millis(750);
+// Covers a slow first prompt (cold Starship caches) after the hook was queued;
+// releasing output earlier would expose the echoed integration command.
+const INTEGRATION_STARTUP_TIMEOUT: Duration = Duration::from_millis(1_500);
 const MAX_INTEGRATION_STARTUP_BYTES: usize = 64 * 1024;
 
 pub use remcmd_core::PtySize;

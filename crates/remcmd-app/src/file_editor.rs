@@ -79,8 +79,11 @@ struct EditorLineLayout {
 pub struct FileEditor {
     focus_handle: FocusHandle,
     content: String,
-    line_count: usize,
+    /// Byte offset where each line begins, so scrolling never rescans the file.
+    line_starts: Vec<usize>,
     content_width: f32,
+    /// Content shared with assistive clients, copied once per edit rather than per frame.
+    accessibility_text: Option<SharedString>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -107,12 +110,13 @@ impl FileEditor {
     }
 
     fn with_read_only(cx: &mut Context<Self>, content: String, read_only: bool) -> Self {
-        let (line_count, content_width) = content_metrics(&content);
+        let (line_starts, content_width) = content_metrics(&content);
         Self {
             focus_handle: cx.focus_handle(),
             content,
-            line_count,
+            line_starts,
             content_width,
+            accessibility_text: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -136,7 +140,7 @@ impl FileEditor {
 
     pub fn replace_all(&mut self, content: String, cx: &mut Context<Self>) {
         self.content = content;
-        (self.line_count, self.content_width) = content_metrics(&self.content);
+        self.content_changed();
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -150,6 +154,11 @@ impl FileEditor {
         cx.notify();
     }
 
+    fn content_changed(&mut self) {
+        (self.line_starts, self.content_width) = content_metrics(&self.content);
+        self.accessibility_text = None;
+    }
+
     fn snapshot(&self) -> EditorSnapshot {
         EditorSnapshot {
             content: self.content.clone(),
@@ -160,6 +169,7 @@ impl FileEditor {
 
     fn restore(&mut self, snapshot: EditorSnapshot, cx: &mut Context<Self>) {
         self.content = snapshot.content;
+        self.content_changed();
         self.selected_range = snapshot.selection;
         self.selection_reversed = snapshot.selection_reversed;
         self.marked_range = None;
@@ -580,7 +590,7 @@ impl EntityInputHandler for FileEditor {
 
         self.push_undo();
         self.content.replace_range(range.clone(), new_text);
-        (self.line_count, self.content_width) = content_metrics(&self.content);
+        self.content_changed();
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
@@ -610,7 +620,7 @@ impl EntityInputHandler for FileEditor {
             .unwrap_or(self.selected_range.clone());
         self.push_undo();
         self.content.replace_range(range.clone(), new_text);
-        (self.line_count, self.content_width) = content_metrics(&self.content);
+        self.content_changed();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_selected_range_utf16
@@ -698,7 +708,8 @@ impl Element for FileEditorElement {
         let editor = self.editor.read(cx);
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = px(editor.line_count as f32 * LINE_HEIGHT + PADDING_Y * 2.0).into();
+        style.size.height =
+            px(editor.line_starts.len() as f32 * LINE_HEIGHT + PADDING_Y * 2.0).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -730,9 +741,11 @@ impl Element for FileEditorElement {
         } else {
             64
         };
-        let last_line = (first_line + visible_line_count).min(editor.line_count);
+        let last_line = first_line + visible_line_count;
 
-        for (index, range) in visible_line_ranges(&editor.content, first_line..last_line) {
+        for (index, range) in
+            visible_line_ranges(&editor.content, &editor.line_starts, first_line..last_line)
+        {
             let text: SharedString = editor.content[range.clone()].to_owned().into();
             let runs = text_runs_for_line(
                 &style,
@@ -850,7 +863,11 @@ impl Render for FileEditor {
             })
             .detach();
         }
-        let mut accessibility = crate::accessibility::Node::text("", self.content.clone());
+        let accessibility_text = self
+            .accessibility_text
+            .get_or_insert_with(|| SharedString::new(self.content.as_str()))
+            .clone();
+        let mut accessibility = crate::accessibility::Node::text("", accessibility_text);
         accessibility.role = crate::accessibility::Role::TextArea;
         accessibility.focused = self.focus_handle.is_focused(window);
         let focus = self.focus_handle.clone();
@@ -920,38 +937,29 @@ fn line_ranges(content: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-fn visible_line_ranges(content: &str, requested_lines: Range<usize>) -> Vec<(usize, Range<usize>)> {
-    let mut ranges = Vec::with_capacity(requested_lines.len());
-    let mut line_index = 0;
-    let mut line_start = 0;
-
-    for (index, byte) in content.bytes().enumerate() {
-        if byte != b'\n' {
-            continue;
-        }
-        if requested_lines.contains(&line_index) {
-            ranges.push((line_index, line_start..index));
-        }
-        line_index += 1;
-        line_start = index + 1;
-        if line_index >= requested_lines.end {
-            return ranges;
-        }
-    }
-
-    if requested_lines.contains(&line_index) {
-        ranges.push((line_index, line_start..content.len()));
-    }
-    ranges
+fn visible_line_ranges(
+    content: &str,
+    line_starts: &[usize],
+    requested_lines: Range<usize>,
+) -> Vec<(usize, Range<usize>)> {
+    (requested_lines.start..requested_lines.end.min(line_starts.len()))
+        .map(|line| {
+            let end = line_starts
+                .get(line + 1)
+                .map_or(content.len(), |next_start| next_start - 1);
+            (line, line_starts[line]..end)
+        })
+        .collect()
 }
 
-fn content_metrics(content: &str) -> (usize, f32) {
-    let mut line_count = 1;
+/// Line starts and an estimated width for the widest line.
+fn content_metrics(content: &str) -> (Vec<usize>, f32) {
+    let mut line_starts = vec![0];
     let mut widest_line = 0.0_f32;
     let mut line_width = 0.0_f32;
-    for grapheme in content.graphemes(true) {
-        if grapheme == "\n" {
-            line_count += 1;
+    for (offset, grapheme) in content.grapheme_indices(true) {
+        if grapheme.ends_with('\n') {
+            line_starts.push(offset + grapheme.len());
             widest_line = widest_line.max(line_width);
             line_width = 0.0;
         } else {
@@ -959,7 +967,7 @@ fn content_metrics(content: &str) -> (usize, f32) {
         }
     }
     widest_line = widest_line.max(line_width);
-    (line_count, widest_line + PADDING_X * 2.0)
+    (line_starts, widest_line + PADDING_X * 2.0)
 }
 
 fn approximate_text_width(text: &str) -> f32 {
@@ -1067,16 +1075,20 @@ mod tests {
     #[test]
     fn visible_ranges_only_materialize_the_requested_lines() {
         assert_eq!(
-            visible_line_ranges("zero\none\ntwo\nthree", 1..3),
+            visible_line_ranges("zero\none\ntwo\nthree", &[0, 5, 9, 13], 1..3),
             vec![(1, 5..8), (2, 9..12)]
+        );
+        assert_eq!(
+            visible_line_ranges("zero\none", &[0, 5], 1..9),
+            vec![(1, 5..8)]
         );
     }
 
     #[test]
     fn content_metrics_count_lines_and_wide_text_without_layouts() {
-        let (lines, width) = content_metrics("short\n中文\n");
+        let (line_starts, width) = content_metrics("short\n中文\n");
 
-        assert_eq!(lines, 3);
+        assert_eq!(line_starts, vec![0, 6, 13]);
         assert!(width >= PADDING_X * 2.0 + FONT_SIZE * 2.0);
     }
 }

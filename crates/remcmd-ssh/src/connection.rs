@@ -22,11 +22,11 @@ use crate::{
     host_key::HostKeyDecision,
     performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
     remote_files::{FileCommand, RemoteFiles},
+    shell_integration,
     transport::TransportOpen,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Commands sent from the application to one running SSH session.
 ///
@@ -36,6 +36,11 @@ const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration:
 pub enum ConnectionCommand {
     /// Sends raw keyboard or paste bytes to the remote shell.
     Input(Vec<u8>),
+
+    /// Sends bytes the terminal emulator answers with on its own, such as focus
+    /// and cursor position reports. They reach the shell like input but are not the
+    /// user typing a command.
+    TerminalReply(Vec<u8>),
 
     /// Reports a new terminal size to the remote PTY.
     Resize(PtySize),
@@ -173,6 +178,11 @@ impl ConnectionHandle {
     /// Sends raw input bytes to the running shell.
     pub fn send_input(&self, data: impl Into<Vec<u8>>) -> Result<(), SshError> {
         self.send(ConnectionCommand::Input(data.into()))
+    }
+
+    /// Sends an automatic terminal answer (focus, cursor position, colors) to the shell.
+    pub fn send_terminal_reply(&self, data: impl Into<Vec<u8>>) -> Result<(), SshError> {
+        self.send(ConnectionCommand::TerminalReply(data.into()))
     }
 
     /// Requests a remote PTY resize.
@@ -464,7 +474,7 @@ where
                     Some(ConnectionCommand::Resize(size)) => {
                         *latest_size = size;
                     }
-                    Some(ConnectionCommand::Input(_)) => {
+                    Some(ConnectionCommand::Input(_) | ConnectionCommand::TerminalReply(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
                     Some(ConnectionCommand::Files(_) | ConnectionCommand::SetPerformanceMonitoring(_)) => {
@@ -500,7 +510,7 @@ async fn wait_for_host_key_decision(
                     Some(ConnectionCommand::Resize(size)) => {
                         *latest_size = size;
                     }
-                    Some(ConnectionCommand::Input(_)) => {
+                    Some(ConnectionCommand::Input(_) | ConnectionCommand::TerminalReply(_)) => {
                         // Keyboard input is ignored until the shell is ready.
                     }
                     Some(ConnectionCommand::Files(_) | ConnectionCommand::SetPerformanceMonitoring(_)) => {
@@ -851,6 +861,7 @@ async fn run_connection_plan(
     let mut shell_probe = Box::pin(transport.detect_shell());
     let mut detected_shell = None;
     let mut shell_output_seen = false;
+    let mut install_gate = shell_integration::InstallGate::default();
     let mut shell_integration_deadline = None;
     let mut performance_monitor = None;
 
@@ -909,8 +920,7 @@ async fn run_connection_plan(
                     if let Ok(Some(shell)) = shell {
                         detected_shell = Some(shell);
                         if shell_output_seen {
-                            shell_integration_deadline =
-                                Some(Instant::now() + SHELL_INTEGRATION_QUIET_PERIOD);
+                            shell_integration_deadline = install_deadline(&install_gate);
                         }
                     }
                     continue;
@@ -939,12 +949,14 @@ async fn run_connection_plan(
                         &shell_event,
                         ShellEvent::Output(_) | ShellEvent::ExtendedOutput { .. }
                     );
-                    if is_output {
+                    if let ShellEvent::Output(data) = &shell_event {
                         shell_output_seen = true;
-                        if detected_shell.is_some() {
-                            shell_integration_deadline =
-                                Some(Instant::now() + SHELL_INTEGRATION_QUIET_PERIOD);
-                        }
+                        install_gate.observe_output(data);
+                    } else if is_output {
+                        shell_output_seen = true;
+                    }
+                    if is_output && detected_shell.is_some() {
+                        shell_integration_deadline = install_deadline(&install_gate);
                     }
 
                     if events
@@ -974,6 +986,22 @@ async fn run_connection_plan(
 
         match command {
             Some(ConnectionCommand::Input(data)) => {
+                if shell_probe_pending || detected_shell.is_some() {
+                    // The hook has not been typed yet, and these keystrokes are about
+                    // to change the line. Drop the pending deadline; the output that
+                    // follows reschedules it if the prompt is still the hook's to use.
+                    install_gate.observe_input(&data);
+                    shell_integration_deadline = None;
+                }
+                if let Err(error) = writer.send_input(data).await {
+                    report_failure(&mut session, error, &events).await;
+                    close_resources(&transport, Some(&writer)).await;
+                    return;
+                }
+            }
+            Some(ConnectionCommand::TerminalReply(data)) => {
+                // Prompts query the terminal while they draw; answering must not be
+                // mistaken for the user claiming the command line.
                 if let Err(error) = writer.send_input(data).await {
                     report_failure(&mut session, error, &events).await;
                     close_resources(&transport, Some(&writer)).await;
@@ -1021,6 +1049,15 @@ async fn run_connection_plan(
             }
         }
     }
+}
+
+/// When the hidden hook may be typed, or `None` while the user owns the command line.
+///
+/// Waits for a quiet period unless the line editor already reported that it is
+/// reading a command line; typing the hook earlier lets a slow first prompt
+/// expose its echo after the hidden-output window closes.
+fn install_deadline(gate: &shell_integration::InstallGate) -> Option<Instant> {
+    gate.delay().map(|delay| Instant::now() + delay)
 }
 
 async fn send_state(events: &mpsc::Sender<ConnectionEvent>, state: SessionState) -> bool {

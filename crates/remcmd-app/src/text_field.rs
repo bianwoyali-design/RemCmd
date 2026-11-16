@@ -826,11 +826,14 @@ impl Render for TextField {
         let mut accessibility = crate::accessibility::Node::button(self.placeholder.clone(), true);
         accessibility.role = crate::accessibility::Role::TextField;
         accessibility.secure = self.is_secure;
-        accessibility.value = Some(if self.is_secure {
-            secure_mask(&self.content)
-        } else {
-            self.content.clone()
-        });
+        accessibility.value = Some(
+            if self.is_secure {
+                secure_mask(&self.content)
+            } else {
+                self.content.clone()
+            }
+            .into(),
+        );
         accessibility.focused = self.focus_handle.is_focused(window);
         accessibility.handler = Some(std::rc::Rc::new(move |action, window, cx| {
             let _ = input.update(cx, |input, cx| {

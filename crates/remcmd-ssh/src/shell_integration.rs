@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub(crate) const DETECT_SHELL_COMMAND: &str = r#"printf '%s\n' "${SHELL-}" "${0-}"; awk -F: -v u="$(id -un 2>/dev/null)" '$1 == u { print $7; exit }' /etc/passwd 2>/dev/null || true"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +49,108 @@ pub(crate) fn install_command_for_shell(shell: ShellKind, ready_command: &str) -
         ShellKind::Zsh => ZSH_INSTALL_COMMAND,
         ShellKind::Ash => ASH_INSTALL_COMMAND,
     };
-    format!(" eval {}\r {ready_command}", shell_single_quote(hook))
+    // One command line: a second line would wait for another prompt render
+    // (for example Starship's precmd) before reporting readiness.
+    format!(" eval {}; {ready_command}", shell_single_quote(hook))
+}
+
+/// Reports whether the latest bracketed-paste mode change in `output` turned it
+/// on. zsh's ZLE and bash 5.1+ readline enable it only while waiting for a
+/// command line, so it marks a prompt that is ready to accept hidden input.
+pub(crate) fn line_editor_state(output: &[u8]) -> Option<bool> {
+    let last = |needle: &[u8]| {
+        output
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    };
+    match (last(b"\x1b[?2004h"), last(b"\x1b[?2004l")) {
+        (None, None) => None,
+        (enabled, disabled) => Some(enabled > disabled),
+    }
+}
+
+/// Quiet time required before typing the hook when the shell gives no better signal.
+const INSTALL_QUIET_PERIOD: Duration = Duration::from_millis(120);
+/// Short settle once the line editor is reading input, letting a prompt finish
+/// drawing before the hidden hook is typed.
+const INSTALL_READY_SETTLE: Duration = Duration::from_millis(30);
+
+/// What the user has done on the command line the hook would be typed into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UserLine {
+    /// The shell's prompt with nothing typed on it.
+    #[default]
+    Empty,
+    /// Text is on the line. `erasable` counts characters that backspace can still
+    /// remove; `None` once an editing key makes the line's contents unknowable.
+    Typing { erasable: Option<usize> },
+    /// A command was run. What reads the terminal now may not be the shell.
+    Submitted,
+}
+
+/// Decides when the hidden hook may be typed without landing in the user's input.
+///
+/// The hook is sent as keystrokes, so it joins whatever is already on the line and
+/// goes to whatever program is reading the terminal. Until the hook is installed the
+/// shell cannot say when it is back at a prompt: programs such as `psql`, a Python
+/// REPL, or a nested `ssh` enable bracketed paste exactly as a shell prompt does. So
+/// once the user has run a command, that signal is no longer taken as an invitation.
+#[derive(Debug, Default)]
+pub(crate) struct InstallGate {
+    line_editor_seen: bool,
+    line_editor_ready: bool,
+    user_line: UserLine,
+}
+
+impl InstallGate {
+    pub(crate) fn observe_output(&mut self, output: &[u8]) {
+        if let Some(ready) = line_editor_state(output) {
+            self.line_editor_seen = true;
+            self.line_editor_ready = ready;
+        }
+    }
+
+    pub(crate) fn observe_input(&mut self, input: &[u8]) {
+        for &byte in input {
+            self.user_line = match (self.user_line, byte) {
+                (UserLine::Submitted, _) => UserLine::Submitted,
+                // Return on an empty line runs nothing; the shell just prompts again.
+                (UserLine::Empty, b'\r' | b'\n') => UserLine::Empty,
+                (UserLine::Typing { .. }, b'\r' | b'\n') => UserLine::Submitted,
+                // Ctrl-C and Ctrl-U discard the line being edited.
+                (_, 0x03 | 0x15) => UserLine::Empty,
+                (UserLine::Empty, 0x08 | 0x7f) => UserLine::Empty,
+                (UserLine::Typing { erasable: Some(1) }, 0x08 | 0x7f) => UserLine::Empty,
+                (UserLine::Typing { erasable }, 0x08 | 0x7f) => UserLine::Typing {
+                    erasable: erasable.map(|count| count.saturating_sub(1)),
+                },
+                // Escape sequences and other controls (history, cursor keys,
+                // completion) can change the line in ways that cannot be followed.
+                (_, 0x00..=0x1f) => UserLine::Typing { erasable: None },
+                // Continuation bytes belong to the character already counted.
+                (line @ UserLine::Typing { .. }, 0x80..=0xbf) => line,
+                (UserLine::Empty, _) => UserLine::Typing { erasable: Some(1) },
+                (UserLine::Typing { erasable }, _) => UserLine::Typing {
+                    erasable: erasable.map(|count| count + 1),
+                },
+            };
+        }
+    }
+
+    /// How long output must stay quiet before the hook is typed, or `None` while the
+    /// line belongs to the user or to a program the user started.
+    pub(crate) fn delay(&self) -> Option<Duration> {
+        match self.user_line {
+            UserLine::Empty if self.line_editor_ready => Some(INSTALL_READY_SETTLE),
+            UserLine::Empty => Some(INSTALL_QUIET_PERIOD),
+            UserLine::Typing { .. } => None,
+            // Seeing bracketed paste switch on again does not prove the shell is back.
+            UserLine::Submitted if self.line_editor_seen => None,
+            // Shells that never announce a prompt keep the behaviour they always
+            // had: wait for the output to go quiet after the command.
+            UserLine::Submitted => Some(INSTALL_QUIET_PERIOD),
+        }
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -106,6 +209,100 @@ mod tests {
         let ash = install_command_for_shell(ShellKind::Ash, ":");
         assert!(ash.contains("cd(){"));
         assert!(!ash.contains("PROMPT_COMMAND"));
+    }
+
+    #[test]
+    fn shell_specific_install_reports_readiness_on_the_same_command_line() {
+        let command = install_command_for_shell(ShellKind::Zsh, "printf ready\r");
+
+        assert_eq!(command.matches('\r').count(), 1);
+        assert!(command.ends_with("; printf ready\r"));
+    }
+
+    #[test]
+    fn line_editor_state_follows_the_latest_bracketed_paste_change() {
+        assert_eq!(line_editor_state(b"Last login: today\r\n"), None);
+        assert_eq!(line_editor_state(b"\x1b[?2004h~ \xe2\x9d\xaf "), Some(true));
+        assert_eq!(
+            line_editor_state(b"\x1b[?2004h\r\n\x1b[?2004l"),
+            Some(false)
+        );
+        assert_eq!(
+            line_editor_state(b"\x1b[?2004l\r\n\x1b[?2004h$ "),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn install_never_joins_a_line_the_user_is_typing() {
+        let mut gate = InstallGate::default();
+        assert_eq!(gate.delay(), Some(INSTALL_QUIET_PERIOD));
+        gate.observe_output(b"\x1b[?2004h~ $ ");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+
+        // Typing claims the line: its echo must not let the hook join the command.
+        gate.observe_input(b"l");
+        gate.observe_output(b"l");
+        assert_eq!(gate.delay(), None);
+        gate.observe_input(b"s");
+        assert_eq!(gate.delay(), None);
+
+        // Erasing everything, or discarding the line, hands the prompt back.
+        gate.observe_input(b"\x7f\x7f");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+        gate.observe_input("caf\u{e9}".as_bytes());
+        gate.observe_input(b"\x7f\x7f\x7f");
+        assert_eq!(gate.delay(), None);
+        gate.observe_input(b"\x7f");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+        gate.observe_input(b"ls -l\x15");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+
+        // Return on an empty line runs nothing, so the prompt is still the shell's.
+        gate.observe_input(b"\r");
+        gate.observe_output(b"\x1b[?2004l\r\n\x1b[?2004h~ $ ");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+
+        // History and cursor keys change the line unseen; only discarding it helps.
+        gate.observe_input(b"\x1b[A");
+        gate.observe_input(b"\x7f\x7f\x7f\x7f");
+        assert_eq!(gate.delay(), None);
+        gate.observe_input(b"\x03");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+    }
+
+    #[test]
+    fn a_program_the_user_started_is_not_mistaken_for_the_shell_prompt() {
+        let mut gate = InstallGate::default();
+        gate.observe_output(b"\x1b[?2004h~ $ ");
+        gate.observe_input(b"psql\r");
+        gate.observe_output(b"psql\r\n\x1b[?2004l");
+        assert_eq!(gate.delay(), None);
+
+        // The program enables bracketed paste for its own prompt, as a shell would.
+        gate.observe_output(b"psql (16.2)\r\n\x1b[?2004hdb=# ");
+        assert_eq!(gate.delay(), None);
+
+        // Nothing typed into it, and none of its later prompts, reopens the gate.
+        gate.observe_input(b"select 1;\r");
+        gate.observe_output(b"\x1b[?2004l 1\r\n\x1b[?2004hdb=# ");
+        assert_eq!(gate.delay(), None);
+        gate.observe_input(b"\x03");
+        gate.observe_output(b"^C\r\n\x1b[?2004hdb=# ");
+        assert_eq!(gate.delay(), None);
+    }
+
+    #[test]
+    fn shells_without_prompt_signals_install_after_the_typed_line_is_gone() {
+        let mut gate = InstallGate::default();
+        gate.observe_output(b"~ $ ");
+        gate.observe_input(b"pw");
+        gate.observe_output(b"pw");
+        assert_eq!(gate.delay(), None);
+
+        gate.observe_input(b"d\r");
+        gate.observe_output(b"d\r\n/root\r\n~ $ ");
+        assert_eq!(gate.delay(), Some(INSTALL_QUIET_PERIOD));
     }
 
     #[cfg(unix)]

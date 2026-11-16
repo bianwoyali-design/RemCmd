@@ -8,7 +8,7 @@ use std::{
 };
 
 use russh_sftp::{
-    client::SftpSession,
+    client::{SftpSession, fs::DirEntry},
     protocol::{FileType, OpenFlags},
 };
 use tokio::{
@@ -17,7 +17,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::remote_path::remote_path_depth;
+use crate::remote_path::{remote_join_path, remote_parent_path, remote_path_depth};
 use crate::transfer::{
     TRANSFER_CHUNK_BYTES, TransferContext, TransferResult, local_transfer_temporary_path,
     remote_transfer_temporary_path, transfer_io_error, transfer_temporary_suffix,
@@ -58,7 +58,9 @@ pub enum RemoteFileKind {
 pub struct RemoteFileEntry {
     pub name: String,
     pub path: String,
+    /// Resolved target kind for links; `Symlink` only remains for broken links.
     pub kind: RemoteFileKind,
+    pub symlink: bool,
     pub size: Option<u64>,
     pub modified: Option<u32>,
 }
@@ -83,6 +85,7 @@ pub struct RemoteFile {
 }
 
 const DOWNLOAD_PIPELINE_STREAMS: usize = 4;
+const SYMLINK_LOOKUP_CONCURRENCY: usize = 32;
 const MIN_DOWNLOAD_SEGMENT_BYTES: u64 = 1024 * 1024;
 
 pub(crate) async fn upload_file(
@@ -534,7 +537,7 @@ fn download_segment_ranges(total: u64) -> Vec<Range<u64>> {
 }
 
 pub(crate) async fn read_directory(
-    session: &SftpSession,
+    session: &Arc<SftpSession>,
     path: String,
 ) -> Result<RemoteDirectory, SshError> {
     let path = session.canonicalize(path).await.map_err(SshError::from)?;
@@ -542,25 +545,15 @@ pub(crate) async fn read_directory(
         .read_dir(path.clone())
         .await
         .map_err(SshError::from)?;
-    let mut entries = entries
-        .map(|entry| {
-            let metadata = entry.metadata();
-            RemoteFileEntry {
-                name: entry.file_name(),
-                path: entry.path(),
-                kind: remote_file_kind(entry.file_type()),
-                size: metadata.size,
-                modified: metadata.mtime,
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut entries = entries.map(remote_file_entry).collect::<Vec<_>>();
+    resolve_symlinks(session, &mut entries).await;
     sort_entries(&mut entries);
 
     Ok(RemoteDirectory { path, entries })
 }
 
 pub(crate) async fn read_directory_tree(
-    session: &SftpSession,
+    session: &Arc<SftpSession>,
     path: String,
 ) -> Result<RemoteDirectoryTree, SshError> {
     let root = session.canonicalize(path).await.map_err(SshError::from)?;
@@ -570,24 +563,25 @@ pub(crate) async fn read_directory_tree(
 
     while let Some(directory) = pending.pop() {
         let entries = session.read_dir(directory).await.map_err(SshError::from)?;
+        let mut entries = entries.map(remote_file_entry).collect::<Vec<_>>();
+        resolve_symlinks(session, &mut entries).await;
         for entry in entries {
-            let metadata = entry.metadata();
-            match remote_file_kind(entry.file_type()) {
-                RemoteFileKind::Directory => {
-                    let path = entry.path();
-                    directories.push(path.clone());
-                    pending.push(path);
+            match entry.kind {
+                // Linked directories are not followed so cycles cannot recurse forever.
+                RemoteFileKind::Directory if !entry.symlink => {
+                    directories.push(entry.path.clone());
+                    pending.push(entry.path);
                 }
-                RemoteFileKind::File | RemoteFileKind::Other if metadata.size.is_some() => {
+                RemoteFileKind::File | RemoteFileKind::Other if entry.size.is_some() => {
                     files.push(RemoteFileEntry {
-                        name: entry.file_name(),
-                        path: entry.path(),
                         kind: RemoteFileKind::File,
-                        size: metadata.size,
-                        modified: metadata.mtime,
+                        ..entry
                     });
                 }
-                RemoteFileKind::File | RemoteFileKind::Symlink | RemoteFileKind::Other => {}
+                RemoteFileKind::Directory
+                | RemoteFileKind::File
+                | RemoteFileKind::Symlink
+                | RemoteFileKind::Other => {}
             }
         }
     }
@@ -603,6 +597,50 @@ pub(crate) async fn read_directory_tree(
         directories,
         files,
     })
+}
+
+fn remote_file_entry(entry: DirEntry) -> RemoteFileEntry {
+    let metadata = entry.metadata();
+    let kind = remote_file_kind(entry.file_type());
+    RemoteFileEntry {
+        name: entry.file_name(),
+        path: entry.path(),
+        kind,
+        symlink: kind == RemoteFileKind::Symlink,
+        size: metadata.size,
+        modified: metadata.mtime,
+    }
+}
+
+/// Follows links so linked directories and files behave like their targets.
+/// Broken or unreadable links keep the `Symlink` kind.
+async fn resolve_symlinks(session: &Arc<SftpSession>, entries: &mut [RemoteFileEntry]) {
+    let mut links = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == RemoteFileKind::Symlink)
+        .map(|(index, entry)| (index, entry.path.clone()))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut lookups = JoinSet::new();
+    loop {
+        while lookups.len() < SYMLINK_LOOKUP_CONCURRENCY
+            && let Some((index, path)) = links.next()
+        {
+            let session = session.clone();
+            lookups.spawn(async move { (index, session.metadata(path).await) });
+        }
+        let Some(result) = lookups.join_next().await else {
+            break;
+        };
+        let Ok((index, Ok(metadata))) = result else {
+            continue;
+        };
+        let entry = &mut entries[index];
+        entry.kind = remote_file_kind(metadata.file_type());
+        entry.size = metadata.size;
+        entry.modified = metadata.mtime;
+    }
 }
 
 pub(crate) async fn create_file(session: &SftpSession, path: String) -> Result<String, SshError> {
@@ -661,10 +699,7 @@ pub(crate) async fn delete_paths(session: &SftpSession, paths: &[String]) -> Res
     }
 
     for requested_path in paths {
-        let path = session
-            .canonicalize(requested_path.clone())
-            .await
-            .map_err(SshError::from)?;
+        let path = canonicalize_without_following_link(session, requested_path).await?;
         if path == "/" {
             return Err(SshError::new(
                 SshErrorKind::Sftp,
@@ -722,6 +757,28 @@ pub(crate) async fn delete_paths(session: &SftpSession, paths: &[String]) -> Res
         }
     }
     Ok(())
+}
+
+/// Resolves the parent only, so deleting a link removes the link rather than its target.
+async fn canonicalize_without_following_link(
+    session: &SftpSession,
+    path: &str,
+) -> Result<String, SshError> {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    match remote_parent_path(path) {
+        Some(parent) if !name.is_empty() && name != "." && name != ".." => {
+            let parent = session.canonicalize(parent).await.map_err(SshError::from)?;
+            Ok(remote_join_path(&parent, name))
+        }
+        _ => session
+            .canonicalize(path.to_owned())
+            .await
+            .map_err(SshError::from),
+    }
 }
 
 pub(crate) async fn read_file(session: &SftpSession, path: String) -> Result<RemoteFile, SshError> {

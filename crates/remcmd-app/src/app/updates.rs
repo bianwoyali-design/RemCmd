@@ -1,6 +1,6 @@
 use super::{
     ActivePanel, Context, FontWeight, IconName, IconTone, RemCmdApp, SshRuntime, Task,
-    TextButtonTone, Timer, Window, div, icon, px, text_button,
+    TextButtonTone, Timer, Window, div, px, text_button,
 };
 use gpui::prelude::*;
 use remcmd_core::UpdateSettings;
@@ -297,37 +297,6 @@ impl RemCmdApp {
         cx.notify();
     }
 
-    pub(super) fn render_update_entry(&self, cx: &mut Context<Self>) -> gpui::Div {
-        div().mt_6().child(
-            div()
-                .id("open-updates")
-                .relative()
-                .child(crate::accessibility::node(
-                    "open-updates",
-                    crate::accessibility::Node::button(self.tr("updates-title"), true),
-                ))
-                .tab_index(0)
-                .flex()
-                .items_center()
-                .justify_between()
-                .min_h(px(38.0))
-                .px(px(10.0))
-                .rounded_lg()
-                .bg(self.theme.settings_group_bg)
-                .text_sm()
-                .cursor_pointer()
-                .hover(|style| style.bg(self.theme.control_hover_bg))
-                .focus(|style| style.bg(self.theme.list_selected_bg))
-                .child(self.tr(if self.updates.release.is_some() {
-                    "updates-available-entry"
-                } else {
-                    "updates-title"
-                }))
-                .child(icon(IconName::Expand, self.theme, IconTone::Default, 15.0))
-                .on_click(cx.listener(|this, _, window, cx| this.show_updates(window, cx))),
-        )
-    }
-
     pub(super) fn render_updates_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut args = fluent_bundle::FluentArgs::new();
         args.set("version", env!("CARGO_PKG_VERSION"));
@@ -449,6 +418,17 @@ impl RemCmdApp {
             )
             .on_click(move |_, _, cx| cx.open_url(&url)),
         );
+        let back = self
+            .render_icon_button(
+                "updates-back-to-settings",
+                IconName::ArrowLeft,
+                self.tr("settings-back"),
+                IconTone::Default,
+                true,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_settings(window, cx);
+            }));
         let accessibility_status = match self.updates.error.as_ref() {
             Some(error) => format!("{current}\n{status}\n{error}"),
             None => format!("{current}\n{status}"),
@@ -460,10 +440,19 @@ impl RemCmdApp {
             .max_w(px(640.0))
             .py_6()
             .child(
+                // The way back sits beside the title, as on the other Settings pages.
                 div()
-                    .text_size(px(22.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr("updates-title")),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .ml(px(-6.0))
+                    .child(back)
+                    .child(
+                        div()
+                            .text_size(px(22.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.tr("updates-title")),
+                    ),
             )
             .child(
                 div()

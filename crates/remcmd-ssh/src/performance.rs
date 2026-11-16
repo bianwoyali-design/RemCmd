@@ -12,29 +12,80 @@ use crate::{ConnectionEvent, SshError, SshErrorKind, SshTransport};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
-const PERFORMANCE_COMMAND: &str = r#"if [ ! -r /proc/stat ] || [ ! -r /proc/meminfo ]; then
+const PROC_CHECK: &str = r#"if [ ! -r /proc/stat ] || [ ! -r /proc/meminfo ]; then
     printf '%s\n' 'Performance monitoring requires a Linux server with /proc' >&2
     exit 69
 fi
-printf 'hostname=%s\n' "$(uname -n 2>/dev/null || printf 'Remote host')"
-awk '$1 == "cpu" || $1 ~ /^cpu[0-9]+$/ { total=0; for (i=2; i<=9 && i<=NF; i++) total += $i; idle=$5+$6; if ($1 == "cpu") printf "cpu_total=%.0f\ncpu_idle=%.0f\ncpu_iowait=%.0f\n", total, idle, $6; else printf "cpu_core=%s,%.0f,%.0f\n", substr($1, 4), total, idle }' /proc/stat
-awk '/^MemTotal:/ { total=$2 } /^MemAvailable:/ { available=$2; found=1 } /^MemFree:/ { free=$2 } /^Buffers:/ { buffers=$2 } /^Cached:/ { cached=$2 } /^SwapTotal:/ { swap_total=$2 } /^SwapFree:/ { swap_free=$2 } END { if (!found) available=free+buffers+cached; printf "memory_total_bytes=%.0f\nmemory_available_bytes=%.0f\nswap_total_bytes=%.0f\nswap_free_bytes=%.0f\n", total*1024, available*1024, swap_total*1024, swap_free*1024 }' /proc/meminfo
-awk '{ split($4, processes, "/"); printf "load_one_milli=%.0f\nload_five_milli=%.0f\nload_fifteen_milli=%.0f\nprocesses_running=%s\nprocesses_total=%s\n", $1*1000, $2*1000, $3*1000, processes[1], processes[2] }' /proc/loadavg
-awk '{ printf "uptime_seconds=%.0f\n", $1 }' /proc/uptime
-awk 'NR > 2 { rx += $2; tx += $10 } END { printf "network_rx_bytes=%.0f\nnetwork_tx_bytes=%.0f\n", rx, tx }' /proc/net/dev
-if [ -r /proc/diskstats ] && [ -d /sys/dev/block ]; then
-    disk_read_sectors=0
-    disk_write_sectors=0
-    while read -r major minor name reads reads_merged sectors_read read_ms writes writes_merged sectors_written rest; do
-        if [ ! -e "/sys/dev/block/$major:$minor/partition" ]; then
-            disk_read_sectors=$((disk_read_sectors + sectors_read))
-            disk_write_sectors=$((disk_write_sectors + sectors_written))
-        fi
-    done < /proc/diskstats
-    printf 'disk_read_bytes=%s\ndisk_write_bytes=%s\n' "$((disk_read_sectors * 512))" "$((disk_write_sectors * 512))"
-fi
-df -Pk / 2>/dev/null | awk 'NR == 2 { printf "disk_total_bytes=%.0f\ndisk_available_bytes=%.0f\n", $2*1024, $4*1024 }'
-printf 'cpu_count=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+"#;
+
+// One awk process reads every counter so each sample forks only `df` and
+// `awk`. Loopback traffic and loop/RAM block devices are excluded because they
+// do not represent host network or disk activity.
+const SAMPLE_PIPELINE: &str = r#"df -Pk / 2>/dev/null | awk -v proc=/proc -v sys=/sys '
+NR == 2 { disk_total = $2; disk_available = $4 }
+END {
+    if ((getline host < (proc "/sys/kernel/hostname")) <= 0) host = "Remote host"
+    printf "hostname=%s\n", host
+    cpus = 0
+    while ((getline line < (proc "/stat")) > 0) {
+        n = split(line, f, " ")
+        if (f[1] != "cpu" && f[1] !~ /^cpu[0-9]+$/) continue
+        total = 0
+        for (i = 2; i <= 9 && i <= n; i++) total += f[i]
+        if (f[1] == "cpu") {
+            printf "cpu_total=%.0f\ncpu_idle=%.0f\ncpu_iowait=%.0f\n", total, f[5] + f[6], f[6]
+        } else {
+            printf "cpu_core=%s,%.0f,%.0f\n", substr(f[1], 4), total, f[5] + f[6]
+            cpus++
+        }
+    }
+    while ((getline line < (proc "/meminfo")) > 0) {
+        split(line, f, " ")
+        memory[f[1]] = f[2]
+    }
+    available = ("MemAvailable:" in memory) ? memory["MemAvailable:"] : memory["MemFree:"] + memory["Buffers:"] + memory["Cached:"]
+    printf "memory_total_bytes=%.0f\nmemory_available_bytes=%.0f\nswap_total_bytes=%.0f\nswap_free_bytes=%.0f\n", memory["MemTotal:"] * 1024, available * 1024, memory["SwapTotal:"] * 1024, memory["SwapFree:"] * 1024
+    if ((getline line < (proc "/loadavg")) > 0) {
+        split(line, f, " ")
+        split(f[4], processes, "/")
+        printf "load_one_milli=%.0f\nload_five_milli=%.0f\nload_fifteen_milli=%.0f\nprocesses_running=%s\nprocesses_total=%s\n", f[1] * 1000, f[2] * 1000, f[3] * 1000, processes[1], processes[2]
+    }
+    if ((getline line < (proc "/uptime")) > 0) {
+        split(line, f, " ")
+        printf "uptime_seconds=%.0f\n", f[1]
+    }
+    rx = 0
+    tx = 0
+    while ((getline line < (proc "/net/dev")) > 0) {
+        separator = index(line, ":")
+        if (!separator) continue
+        name = substr(line, 1, separator - 1)
+        gsub(/[ \t]/, "", name)
+        if (name == "lo") continue
+        split(substr(line, separator + 1), f, " ")
+        rx += f[1]
+        tx += f[9]
+    }
+    printf "network_rx_bytes=%.0f\nnetwork_tx_bytes=%.0f\n", rx, tx
+    disk = 0
+    while ((getline line < (proc "/diskstats")) > 0) {
+        split(line, f, " ")
+        if (f[3] ~ /^(loop|ram|zram)/) continue
+        device = sys "/dev/block/" f[1] ":" f[2]
+        readable = (getline value < (device "/dev")) > 0
+        close(device "/dev")
+        if (!readable) continue
+        partition = (getline value < (device "/partition")) > 0
+        close(device "/partition")
+        if (partition) continue
+        disk = 1
+        sectors_read += f[6]
+        sectors_written += f[10]
+    }
+    if (disk) printf "disk_read_bytes=%.0f\ndisk_write_bytes=%.0f\n", sectors_read * 512, sectors_written * 512
+    if (disk_total != "") printf "disk_total_bytes=%.0f\ndisk_available_bytes=%.0f\n", disk_total * 1024, disk_available * 1024
+    printf "cpu_count=%d\n", (cpus > 0 ? cpus : 1)
+}'
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,7 +169,9 @@ impl Drop for PerformanceMonitorHandle {
 
 async fn collect_snapshot(transport: &SshTransport) -> Result<ServerPerformanceSnapshot, SshError> {
     let started_at = Instant::now();
-    let output = transport.execute(PERFORMANCE_COMMAND).await?;
+    let output = transport
+        .execute(&format!("{PROC_CHECK}{SAMPLE_PIPELINE}"))
+        .await?;
     let mut snapshot = parse_snapshot(&output)?;
     snapshot.ssh_response_time = started_at.elapsed();
     Ok(snapshot)
@@ -317,6 +370,73 @@ cpu_count=8\n";
 
         assert_eq!(snapshot.disk_total_bytes, None);
         assert_eq!(snapshot.disk_available_bytes, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sample_pipeline_reads_linux_counters_in_one_awk_process() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, contents: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        write("proc/sys/kernel/hostname", "demo\n");
+        write(
+            "proc/stat",
+            "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 60 0 20 400 20 0 0 0 0 0\ncpu1 40 0 30 400 30 0 0 0 0 0\nintr 1 2 3\n",
+        );
+        write(
+            "proc/meminfo",
+            "MemTotal:       8000 kB\nMemFree:        1000 kB\nMemAvailable:   5000 kB\nSwapTotal:      2000 kB\nSwapFree:       1500 kB\n",
+        );
+        write("proc/loadavg", "0.12 0.25 0.50 2/184 999\n");
+        write("proc/uptime", "86461.42 1000.00\n");
+        write(
+            "proc/net/dev",
+            "Inter-|   Receive |  Transmit\n face |bytes packets|bytes\n    lo: 999 1 0 0 0 0 0 0 999 1 0 0 0 0 0 0\n  eth0:1000 1 0 0 0 0 0 0 500 1 0 0 0 0 0 0\n  eth1: 24 1 0 0 0 0 0 0 12 1 0 0 0 0 0 0\n",
+        );
+        write(
+            "proc/diskstats",
+            "   8       0 sda 1 0 10 0 1 0 20 0 0 0 0\n   8       1 sda1 1 0 7 0 1 0 9 0 0 0 0\n   7       0 loop0 1 0 99 0 1 0 99 0 0 0 0\n",
+        );
+        write("sys/dev/block/8:0/dev", "8:0\n");
+        write("sys/dev/block/8:1/dev", "8:1\n");
+        write("sys/dev/block/8:1/partition", "1\n");
+        write("sys/dev/block/7:0/dev", "7:0\n");
+
+        let script = SAMPLE_PIPELINE.replacen(
+            "-v proc=/proc -v sys=/sys",
+            &format!("-v proc={0}/proc -v sys={0}/sys", root.path().display()),
+            1,
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .expect("POSIX shell should run the sample pipeline");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let snapshot = parse_snapshot(&output.stdout).expect("pipeline output should parse");
+        assert_eq!(snapshot.hostname, "demo");
+        assert_eq!(snapshot.cpu_total, 1000);
+        assert_eq!(snapshot.cpu_idle, 850);
+        assert_eq!(snapshot.cpu_iowait, 50);
+        assert_eq!(snapshot.cpu_count, 2);
+        assert_eq!(snapshot.logical_cpus.len(), 2);
+        assert_eq!(snapshot.memory_available_bytes, 5000 * 1024);
+        assert_eq!(snapshot.swap_free_bytes, 1500 * 1024);
+        assert_eq!(snapshot.load_five_milli, 250);
+        assert_eq!(snapshot.processes_total, 184);
+        assert_eq!(snapshot.uptime_seconds, 86461);
+        assert_eq!(snapshot.network_rx_bytes, 1024);
+        assert_eq!(snapshot.network_tx_bytes, 512);
+        assert_eq!(snapshot.disk_read_bytes, Some(10 * 512));
+        assert_eq!(snapshot.disk_write_bytes, Some(20 * 512));
+        assert!(snapshot.disk_total_bytes.is_some());
     }
 
     #[test]

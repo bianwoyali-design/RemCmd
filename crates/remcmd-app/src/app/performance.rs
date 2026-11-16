@@ -2,8 +2,11 @@ use super::{
     AnyElement, FontWeight, IconName, IntoElement, RemCmdApp, RightSidebarView,
     ServerPerformanceSnapshot, SessionId, SessionState, SharedString, div, format_remote_size, px,
 };
-use gpui::prelude::*;
-use std::time::{Duration, Instant};
+use gpui::{Bounds, PathBuilder, canvas, fill, point, prelude::*, size};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 impl RemCmdApp {
     pub(super) fn sync_performance_monitoring(&mut self) {
@@ -92,7 +95,6 @@ impl RemCmdApp {
                 .into_any_element();
         };
 
-        let cpu_usage = performance.cpu_usage.unwrap_or(0.0);
         let memory_used = snapshot
             .memory_total_bytes
             .saturating_sub(snapshot.memory_available_bytes);
@@ -110,69 +112,135 @@ impl RemCmdApp {
         } else {
             self.theme.status_ok
         };
+        let collecting = || self.tr("performance-collecting");
 
-        let mut content = div()
-            .id("server_performance")
+        let header = div()
             .flex()
-            .flex_1()
-            .min_h(px(0.0))
-            .flex_col()
-            .overflow_y_scroll()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .pt_1()
+            .pb_1()
+            .child(div().size(px(7.0)).rounded_full().bg(status_color))
             .child(
                 div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .px_1()
-                    .pt_2()
-                    .pb_3()
-                    .child(div().size(px(7.0)).rounded_full().bg(status_color))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(snapshot.hostname.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(self.theme.text_muted)
-                            .child(if performance.error.is_some() {
-                                self.tr("performance-retrying")
-                            } else {
-                                self.tr("performance-live")
-                            }),
-                    ),
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(snapshot.hostname.clone()),
             )
-            .child(self.render_performance_meter(
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(self.theme.text_muted)
+                    .child(if performance.error.is_some() {
+                        self.tr("performance-retrying")
+                    } else {
+                        self.tr("performance-live")
+                    }),
+            );
+
+        let cpu_card = self
+            .render_performance_card(
                 self.tr("performance-cpu").into(),
-                cpu_usage,
-                if performance.cpu_usage.is_some() {
-                    format!("{cpu_usage:.0}%")
-                } else {
-                    self.tr("performance-collecting")
-                },
-                self.theme.accent,
+                performance
+                    .cpu_usage
+                    .map_or_else(collecting, |usage| format!("{usage:.0}%")),
+            )
+            .child(sparkline(
+                vec![SparklineSeries {
+                    values: performance.cpu_history.iter().copied().collect(),
+                    color: self.theme.accent,
+                    filled: true,
+                }],
+                100.0,
+                SPARKLINE_HEIGHT,
+                self.theme.control_bg,
             ))
-            .child(self.render_logical_cpu_usage(snapshot, performance))
-            .child(self.render_performance_meter(
-                self.tr("performance-memory").into(),
-                memory_usage,
-                format!(
-                    "{} / {}",
-                    format_remote_size(memory_used),
-                    format_remote_size(snapshot.memory_total_bytes)
+            .when(!snapshot.logical_cpus.is_empty(), |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(self.theme.text_muted)
+                        .child(self.tr("performance-logical-cpus"))
+                        .child({
+                            let mut args = fluent_bundle::FluentArgs::new();
+                            args.set("count", snapshot.logical_cpus.len());
+                            self.tr_with("performance-thread-count", &args)
+                        }),
+                )
+                .child(core_bars(
+                    snapshot
+                        .logical_cpus
+                        .iter()
+                        .map(|cpu| performance.logical_usage(cpu.id))
+                        .collect(),
+                    self.theme.control_bg,
+                    self.theme.accent,
+                    self.theme.status_warn,
+                ))
+            })
+            .child(
+                self.render_performance_value_row(
+                    self.tr("performance-io-wait").into(),
+                    performance
+                        .cpu_iowait_usage
+                        .map_or_else(collecting, |usage| format!("{usage:.1}%")),
                 ),
-                if memory_usage >= 85.0 {
-                    self.theme.status_warn
-                } else {
-                    self.theme.accent
-                },
+            )
+            .child(self.render_performance_value_row(
+                self.tr("performance-load-average").into(),
+                format!(
+                    "{:.2}  {:.2}  {:.2}",
+                    snapshot.load_one_milli as f32 / 1000.0,
+                    snapshot.load_five_milli as f32 / 1000.0,
+                    snapshot.load_fifteen_milli as f32 / 1000.0,
+                ),
             ))
+            .child(div().text_xs().text_color(self.theme.text_faint).child({
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", snapshot.cpu_count);
+                self.tr_with("performance-load-periods", &args)
+            }));
+
+        let memory_color = usage_color(
+            memory_usage,
+            85.0,
+            self.theme.accent,
+            self.theme.status_warn,
+        );
+        let memory_card = self
+            .render_performance_card(
+                self.tr("performance-memory").into(),
+                format!("{memory_usage:.0}%"),
+            )
+            .child(sparkline(
+                vec![SparklineSeries {
+                    values: performance.memory_history.iter().copied().collect(),
+                    color: memory_color,
+                    filled: true,
+                }],
+                100.0,
+                SPARKLINE_HEIGHT,
+                self.theme.control_bg,
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(self.theme.text_muted)
+                    .child(format!(
+                        "{} / {}",
+                        format_remote_size(memory_used),
+                        format_remote_size(snapshot.memory_total_bytes)
+                    )),
+            )
             .child(self.render_performance_meter(
                 self.tr("performance-swap").into(),
                 swap_usage,
@@ -185,178 +253,128 @@ impl RemCmdApp {
                         format_remote_size(snapshot.swap_total_bytes)
                     )
                 },
-                if swap_usage >= 85.0 {
-                    self.theme.status_warn
-                } else {
-                    self.theme.accent
-                },
+                usage_color(swap_usage, 85.0, self.theme.accent, self.theme.status_warn),
+            ));
+
+        let network_peak = performance
+            .network_rx_history
+            .iter()
+            .chain(&performance.network_tx_history)
+            .fold(MIN_NETWORK_SCALE, |peak, value| peak.max(*value));
+        let network_card = self
+            .render_performance_card(self.tr("performance-network").into(), String::new())
+            .child(sparkline(
+                vec![
+                    SparklineSeries {
+                        values: performance.network_rx_history.iter().copied().collect(),
+                        color: self.theme.accent,
+                        filled: true,
+                    },
+                    SparklineSeries {
+                        values: performance.network_tx_history.iter().copied().collect(),
+                        color: self.theme.status_ok,
+                        filled: false,
+                    },
+                ],
+                network_peak,
+                SPARKLINE_HEIGHT,
+                self.theme.control_bg,
             ))
             .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .flex_col()
-                    .gap_2()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(self.theme.border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_sm()
-                            .child(self.tr("performance-load-average"))
-                            .child(div().text_color(self.theme.text_muted).child(format!(
-                                "{:.2}  {:.2}  {:.2}",
-                                snapshot.load_one_milli as f32 / 1000.0,
-                                snapshot.load_five_milli as f32 / 1000.0,
-                                snapshot.load_fifteen_milli as f32 / 1000.0,
-                            ))),
-                    )
-                    .child(div().text_xs().text_color(self.theme.text_faint).child({
-                        let mut args = fluent_bundle::FluentArgs::new();
-                        args.set("count", snapshot.cpu_count);
-                        self.tr_with("performance-load-periods", &args)
-                    })),
+                self.render_performance_legend_row(
+                    self.tr("performance-download").into(),
+                    performance
+                        .network_rx_per_second
+                        .map_or_else(collecting, format_byte_rate),
+                    self.theme.accent,
+                ),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .flex_col()
-                    .gap_2()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(self.theme.border)
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(self.tr("performance-network")),
-                    )
-                    .child(
-                        self.render_performance_value_row(
-                            self.tr("performance-download").into(),
-                            performance
-                                .network_rx_per_second
-                                .map(format_byte_rate)
-                                .unwrap_or_else(|| self.tr("performance-collecting")),
-                        ),
-                    )
-                    .child(
-                        self.render_performance_value_row(
-                            self.tr("performance-upload").into(),
-                            performance
-                                .network_tx_per_second
-                                .map(format_byte_rate)
-                                .unwrap_or_else(|| self.tr("performance-collecting")),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .flex_col()
-                    .gap_2()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(self.theme.border)
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(self.tr("performance-disk-io")),
-                    )
-                    .child(
-                        self.render_performance_value_row(
-                            self.tr("performance-read").into(),
-                            performance
-                                .disk_read_per_second
-                                .map(format_byte_rate)
-                                .unwrap_or_else(|| {
-                                    if snapshot.disk_read_bytes.is_some() {
-                                        self.tr("performance-collecting")
-                                    } else {
-                                        self.tr("performance-unavailable")
-                                    }
-                                }),
-                        ),
-                    )
-                    .child(
-                        self.render_performance_value_row(
-                            self.tr("performance-write").into(),
-                            performance
-                                .disk_write_per_second
-                                .map(format_byte_rate)
-                                .unwrap_or_else(|| {
-                                    if snapshot.disk_write_bytes.is_some() {
-                                        self.tr("performance-collecting")
-                                    } else {
-                                        self.tr("performance-unavailable")
-                                    }
-                                }),
-                        ),
-                    ),
+                self.render_performance_legend_row(
+                    self.tr("performance-upload").into(),
+                    performance
+                        .network_tx_per_second
+                        .map_or_else(collecting, format_byte_rate),
+                    self.theme.status_ok,
+                ),
             );
 
-        if let Some((disk_total, disk_available)) = disk {
-            let disk_used = disk_total.saturating_sub(disk_available);
-            let disk_usage = percent(disk_used, disk_total);
-            content = content.child(self.render_performance_meter(
-                self.tr("performance-root-disk").into(),
-                disk_usage,
-                format!(
-                    "{} / {}",
-                    format_remote_size(disk_used),
-                    format_remote_size(disk_total)
-                ),
-                if disk_usage >= 90.0 {
-                    self.theme.danger
-                } else {
-                    self.theme.accent
+        let disk_rate = |rate: Option<f64>, counter: Option<u64>| {
+            rate.map_or_else(
+                || {
+                    if counter.is_some() {
+                        self.tr("performance-collecting")
+                    } else {
+                        self.tr("performance-unavailable")
+                    }
                 },
-            ));
-        }
-
-        content
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .flex_col()
-                    .gap_2()
-                    .py_3()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(self.tr("performance-system")),
-                    )
-                    .child(self.render_performance_value_row(
-                        self.tr("performance-uptime").into(),
-                        format_uptime(snapshot.uptime_seconds),
-                    ))
-                    .child(self.render_performance_value_row(
-                        self.tr("performance-processes").into(),
-                        {
-                            let mut args = fluent_bundle::FluentArgs::new();
-                            args.set("running", snapshot.processes_running);
-                            args.set("total", snapshot.processes_total);
-                            self.tr_with("performance-process-count", &args)
-                        },
-                    ))
-                    .child(self.render_performance_value_row(
-                        self.tr("performance-ssh-response").into(),
-                        format_response_time(snapshot.ssh_response_time),
-                    )),
+                format_byte_rate,
             )
+        };
+        let disk_card = self
+            .render_performance_card(self.tr("performance-disk-io").into(), String::new())
+            .child(self.render_performance_value_row(
+                self.tr("performance-read").into(),
+                disk_rate(performance.disk_read_per_second, snapshot.disk_read_bytes),
+            ))
+            .child(self.render_performance_value_row(
+                self.tr("performance-write").into(),
+                disk_rate(performance.disk_write_per_second, snapshot.disk_write_bytes),
+            ))
+            .when_some(disk, |card, (disk_total, disk_available)| {
+                let disk_used = disk_total.saturating_sub(disk_available);
+                let disk_usage = percent(disk_used, disk_total);
+                card.child(self.render_performance_meter(
+                    self.tr("performance-root-disk").into(),
+                    disk_usage,
+                    format!(
+                        "{} / {}",
+                        format_remote_size(disk_used),
+                        format_remote_size(disk_total)
+                    ),
+                    usage_color(disk_usage, 90.0, self.theme.accent, self.theme.danger),
+                ))
+            });
+
+        let system_card = self
+            .render_performance_card(self.tr("performance-system").into(), String::new())
+            .child(self.render_performance_value_row(
+                self.tr("performance-uptime").into(),
+                format_uptime(snapshot.uptime_seconds),
+            ))
+            .child(
+                self.render_performance_value_row(self.tr("performance-processes").into(), {
+                    let mut args = fluent_bundle::FluentArgs::new();
+                    args.set("running", snapshot.processes_running);
+                    args.set("total", snapshot.processes_total);
+                    self.tr_with("performance-process-count", &args)
+                }),
+            )
+            .child(self.render_performance_value_row(
+                self.tr("performance-ssh-response").into(),
+                format_response_time(snapshot.ssh_response_time),
+            ));
+
+        div()
+            .id("server_performance")
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .gap_2()
+            .pb_2()
+            .overflow_y_scroll()
+            .child(header)
+            .child(cpu_card)
+            .child(memory_card)
+            .child(network_card)
+            .child(disk_card)
+            .child(system_card)
             .when_some(performance.error.as_ref(), |this, error| {
                 this.child(
                     div()
                         .flex_none()
-                        .pb_2()
+                        .px_1()
                         .text_xs()
                         .text_color(self.theme.error_text)
                         .child(error.clone()),
@@ -365,91 +383,36 @@ impl RemCmdApp {
             .into_any_element()
     }
 
-    fn render_logical_cpu_usage(
-        &self,
-        snapshot: &ServerPerformanceSnapshot,
-        performance: &ServerPerformanceState,
-    ) -> gpui::Div {
-        let logical_cpus = snapshot.logical_cpus.iter().map(|cpu| {
-            let usage = performance
-                .logical_cpu_usage
-                .iter()
-                .find_map(|(id, usage)| (*id == cpu.id).then_some(*usage));
-
-            div()
-                .flex()
-                .min_w(px(0.0))
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_1()
-                        .text_xs()
-                        .child(format!("CPU {}", cpu.id))
-                        .child(div().text_color(self.theme.text_muted).child(
-                            usage.map_or_else(|| "...".into(), |usage| format!("{usage:.0}%")),
-                        )),
-                )
-                .child(
-                    div()
-                        .h(px(3.0))
-                        .w_full()
-                        .overflow_hidden()
-                        .rounded_full()
-                        .bg(self.theme.control_bg)
-                        .child(
-                            div()
-                                .h_full()
-                                .w(gpui::relative(
-                                    usage.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0,
-                                ))
-                                .rounded_full()
-                                .bg(self.theme.accent),
-                        ),
-                )
-        });
-
+    fn render_performance_card(&self, title: SharedString, value: String) -> gpui::Div {
         div()
             .flex()
             .flex_none()
             .flex_col()
             .gap_2()
-            .py_3()
-            .border_b_1()
-            .border_color(self.theme.border)
+            .p_3()
+            .rounded_lg()
+            .bg(self.theme.settings_group_bg)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .text_sm()
-                    .child(self.tr("performance-logical-cpus"))
-                    .child(div().text_color(self.theme.text_muted).child({
-                        let mut args = fluent_bundle::FluentArgs::new();
-                        args.set("count", snapshot.logical_cpus.len());
-                        self.tr_with("performance-thread-count", &args)
-                    })),
-            )
-            .child(
-                self.render_performance_value_row(
-                    self.tr("performance-io-wait").into(),
-                    performance
-                        .cpu_iowait_usage
-                        .map(|usage| format!("{usage:.1}%"))
-                        .unwrap_or_else(|| self.tr("performance-collecting")),
-                ),
-            )
-            .child(
-                div()
-                    .grid()
-                    .grid_cols(2)
-                    .gap_x_3()
-                    .gap_y_2()
-                    .children(logical_cpus),
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(self.theme.text_muted)
+                            .child(value),
+                    ),
             )
     }
 
@@ -462,28 +425,9 @@ impl RemCmdApp {
     ) -> gpui::Div {
         div()
             .flex()
-            .flex_none()
             .flex_col()
-            .gap_2()
-            .py_3()
-            .border_b_1()
-            .border_color(self.theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .text_sm()
-                    .child(label)
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_color(self.theme.text_muted)
-                            .child(detail),
-                    ),
-            )
+            .gap_1()
+            .child(self.render_performance_value_row(label, detail))
             .child(
                 div()
                     .h(px(4.0))
@@ -501,6 +445,27 @@ impl RemCmdApp {
             )
     }
 
+    fn render_performance_legend_row(
+        &self,
+        label: SharedString,
+        value: String,
+        color: gpui::Hsla,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .child(div().flex_none().size(px(6.0)).rounded_full().bg(color))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(self.theme.text_muted)
+                    .child(label),
+            )
+            .child(div().min_w(px(0.0)).truncate().child(value))
+    }
+
     fn render_performance_value_row(&self, label: SharedString, value: String) -> gpui::Div {
         div()
             .flex()
@@ -511,6 +476,139 @@ impl RemCmdApp {
             .child(div().text_color(self.theme.text_muted).child(label))
             .child(div().min_w(px(0.0)).truncate().child(value))
     }
+
+    pub(super) fn performance_is_rendered(&self, session_id: SessionId) -> bool {
+        self.right_sidebar_open
+            && self.right_sidebar_view == RightSidebarView::Performance
+            && self.active_session_id == Some(session_id)
+    }
+}
+
+const HISTORY_SAMPLES: usize = 60;
+const SPARKLINE_HEIGHT: f32 = 36.0;
+const CORE_COLUMNS: usize = 16;
+const CORE_ROW_HEIGHT: f32 = 14.0;
+const CORE_GAP: f32 = 2.0;
+/// Keeps idle links from magnifying background chatter into a full-height chart.
+const MIN_NETWORK_SCALE: f32 = 16.0 * 1024.0;
+
+struct SparklineSeries {
+    values: Vec<f32>,
+    color: gpui::Hsla,
+    filled: bool,
+}
+
+/// History chart painted in one canvas; the newest sample sits on the right edge.
+fn sparkline(
+    series: Vec<SparklineSeries>,
+    max: f32,
+    height: f32,
+    background: gpui::Hsla,
+) -> gpui::Div {
+    div()
+        .h(px(height))
+        .w_full()
+        .overflow_hidden()
+        .rounded_md()
+        .bg(background)
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, (), window, _| {
+                    let step = bounds.size.width / (HISTORY_SAMPLES - 1) as f32;
+                    let inset = px(2.0);
+                    let plot_height = bounds.size.height - inset;
+                    for series in series {
+                        if series.values.len() < 2 {
+                            continue;
+                        }
+                        let start = bounds.right() - step * (series.values.len() - 1) as f32;
+                        let points = series
+                            .values
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| {
+                                point(
+                                    start + step * index as f32,
+                                    bounds.bottom() - plot_height * (value / max).clamp(0.0, 1.0),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if series.filled {
+                            let mut area = PathBuilder::fill();
+                            area.move_to(point(start, bounds.bottom()));
+                            for point in &points {
+                                area.line_to(*point);
+                            }
+                            area.line_to(point(bounds.right(), bounds.bottom()));
+                            area.close();
+                            if let Ok(path) = area.build() {
+                                window.paint_path(path, series.color.opacity(0.18));
+                            }
+                        }
+                        let mut line = PathBuilder::stroke(px(1.25));
+                        line.move_to(points[0]);
+                        for point in &points[1..] {
+                            line.line_to(*point);
+                        }
+                        if let Ok(path) = line.build() {
+                            window.paint_path(path, series.color);
+                        }
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
+/// Per-core usage as compact vertical gauges, scaling to many-core hosts
+/// without laying out a text element per core.
+fn core_bars(
+    usages: Vec<Option<f32>>,
+    track: gpui::Hsla,
+    color: gpui::Hsla,
+    busy_color: gpui::Hsla,
+) -> impl IntoElement {
+    let columns = usages.len().clamp(1, CORE_COLUMNS);
+    let rows = usages.len().div_ceil(columns);
+    let height = rows as f32 * (CORE_ROW_HEIGHT + CORE_GAP) - CORE_GAP;
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let gap = px(CORE_GAP);
+            let row_height = px(CORE_ROW_HEIGHT);
+            let width = (bounds.size.width - gap * (columns - 1) as f32) / columns as f32;
+            for (index, usage) in usages.iter().enumerate() {
+                let origin = point(
+                    bounds.left() + (width + gap) * (index % columns) as f32,
+                    bounds.top() + (row_height + gap) * (index / columns) as f32,
+                );
+                window.paint_quad(
+                    fill(Bounds::new(origin, size(width, row_height)), track).corner_radii(px(2.0)),
+                );
+                let Some(usage) = usage else {
+                    continue;
+                };
+                let filled = row_height * (usage / 100.0).clamp(0.0, 1.0);
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(origin.x, origin.y + row_height - filled),
+                            size(width, filled),
+                        ),
+                        usage_color(*usage, 85.0, color, busy_color),
+                    )
+                    .corner_radii(px(2.0)),
+                );
+            }
+        },
+    )
+    .w_full()
+    .h(px(height))
+}
+
+fn usage_color(usage: f32, threshold: f32, normal: gpui::Hsla, high: gpui::Hsla) -> gpui::Hsla {
+    if usage >= threshold { high } else { normal }
 }
 
 #[derive(Debug)]
@@ -537,6 +635,10 @@ pub(super) struct ServerPerformanceState {
     pub(super) network_tx_per_second: Option<f64>,
     pub(super) disk_read_per_second: Option<f64>,
     pub(super) disk_write_per_second: Option<f64>,
+    pub(super) cpu_history: VecDeque<f32>,
+    pub(super) memory_history: VecDeque<f32>,
+    pub(super) network_rx_history: VecDeque<f32>,
+    pub(super) network_tx_history: VecDeque<f32>,
     pub(super) monitoring: bool,
     pub(super) loading: bool,
     pub(super) error: Option<String>,
@@ -544,12 +646,22 @@ pub(super) struct ServerPerformanceState {
 
 impl ServerPerformanceState {
     pub(super) fn update(&mut self, snapshot: ServerPerformanceSnapshot, captured_at: Instant) {
+        push_history(
+            &mut self.memory_history,
+            percent(
+                snapshot
+                    .memory_total_bytes
+                    .saturating_sub(snapshot.memory_available_bytes),
+                snapshot.memory_total_bytes,
+            ),
+        );
         if let Some(previous) = self.previous.as_ref() {
             let total_delta = snapshot.cpu_total.saturating_sub(previous.cpu_total);
             let idle_delta = snapshot.cpu_idle.saturating_sub(previous.cpu_idle);
             if total_delta > 0 && idle_delta <= total_delta {
-                self.cpu_usage =
-                    Some((total_delta - idle_delta) as f32 / total_delta as f32 * 100.0);
+                let usage = (total_delta - idle_delta) as f32 / total_delta as f32 * 100.0;
+                self.cpu_usage = Some(usage);
+                push_history(&mut self.cpu_history, usage);
                 let iowait_delta = snapshot.cpu_iowait.saturating_sub(previous.cpu_iowait);
                 self.cpu_iowait_usage = (iowait_delta <= total_delta)
                     .then_some(iowait_delta as f32 / total_delta as f32 * 100.0);
@@ -570,6 +682,14 @@ impl ServerPerformanceState {
                         .network_tx_bytes
                         .saturating_sub(previous.network_tx_bytes) as f64
                         / elapsed,
+                );
+                push_history(
+                    &mut self.network_rx_history,
+                    self.network_rx_per_second.unwrap_or_default() as f32,
+                );
+                push_history(
+                    &mut self.network_tx_history,
+                    self.network_tx_per_second.unwrap_or_default() as f32,
                 );
                 self.disk_read_per_second = snapshot
                     .disk_read_bytes
@@ -621,6 +741,14 @@ impl ServerPerformanceState {
         self.error = None;
     }
 
+    /// `logical_cpu_usage` follows the snapshot's id order.
+    fn logical_usage(&self, id: u32) -> Option<f32> {
+        self.logical_cpu_usage
+            .binary_search_by_key(&id, |(cpu, _)| *cpu)
+            .ok()
+            .map(|index| self.logical_cpu_usage[index].1)
+    }
+
     pub(super) fn clear_connection(&mut self) {
         self.snapshot = None;
         self.previous = None;
@@ -631,10 +759,21 @@ impl ServerPerformanceState {
         self.network_tx_per_second = None;
         self.disk_read_per_second = None;
         self.disk_write_per_second = None;
+        self.cpu_history.clear();
+        self.memory_history.clear();
+        self.network_rx_history.clear();
+        self.network_tx_history.clear();
         self.monitoring = false;
         self.loading = false;
         self.error = None;
     }
+}
+
+fn push_history(history: &mut VecDeque<f32>, value: f32) {
+    if history.len() == HISTORY_SAMPLES {
+        history.pop_front();
+    }
+    history.push_back(value);
 }
 
 fn format_byte_rate(bytes_per_second: f64) -> String {
@@ -699,6 +838,22 @@ mod tests {
         assert_eq!(performance.disk_write_per_second, Some(6_000.0));
         assert!(!performance.loading);
         assert!(performance.error.is_none());
+        assert_eq!(performance.cpu_history, [75.0]);
+        assert_eq!(performance.memory_history, [50.0, 50.0]);
+        assert_eq!(performance.network_rx_history, [2_000.0]);
+        assert_eq!(performance.logical_usage(1), Some(75.0));
+        assert_eq!(performance.logical_usage(7), None);
+    }
+
+    #[test]
+    fn performance_history_keeps_a_bounded_window() {
+        let mut history = VecDeque::new();
+        for value in 0..HISTORY_SAMPLES + 5 {
+            push_history(&mut history, value as f32);
+        }
+
+        assert_eq!(history.len(), HISTORY_SAMPLES);
+        assert_eq!(history.front(), Some(&5.0));
     }
 
     #[test]
