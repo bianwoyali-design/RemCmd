@@ -739,7 +739,7 @@ impl RemCmdApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        if let Err(error) = session.write_terminal_input(data) {
+        if let Err(error) = session.write_terminal_reply(data) {
             session.connection_error = Some(error.into());
         }
     }
@@ -1471,6 +1471,20 @@ impl TerminalSession {
                 .ok_or_else(|| "local terminal handle is missing".to_owned())?
                 .send_input(data)
                 .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Sends an answer the terminal produced on its own rather than a keystroke, so
+    /// an SSH session can tell it apart from the user typing a command.
+    pub(super) fn write_terminal_reply(&self, data: Vec<u8>) -> Result<(), String> {
+        match self.kind {
+            TerminalSessionKind::Ssh => self
+                .connection_handle
+                .as_ref()
+                .ok_or_else(|| "SSH connection handle is missing".to_owned())?
+                .send_terminal_reply(data)
+                .map_err(|error| error.to_string()),
+            TerminalSessionKind::Local => self.write_terminal_input(data),
         }
     }
 

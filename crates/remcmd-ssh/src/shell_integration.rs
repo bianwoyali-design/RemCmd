@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub(crate) const DETECT_SHELL_COMMAND: &str = r#"printf '%s\n' "${SHELL-}" "${0-}"; awk -F: -v u="$(id -un 2>/dev/null)" '$1 == u { print $7; exit }' /etc/passwd 2>/dev/null || true"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +66,68 @@ pub(crate) fn line_editor_state(output: &[u8]) -> Option<bool> {
     match (last(b"\x1b[?2004h"), last(b"\x1b[?2004l")) {
         (None, None) => None,
         (enabled, disabled) => Some(enabled > disabled),
+    }
+}
+
+/// Quiet time required before typing the hook when the shell gives no better signal.
+const INSTALL_QUIET_PERIOD: Duration = Duration::from_millis(120);
+/// Short settle once the line editor is reading input, letting a prompt finish
+/// drawing before the hidden hook is typed.
+const INSTALL_READY_SETTLE: Duration = Duration::from_millis(30);
+
+/// What the user has done on the command line the hook would be typed into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UserLine {
+    #[default]
+    Untouched,
+    Typing,
+    Submitted,
+}
+
+/// Decides when the hidden hook may be typed without landing in the user's input.
+///
+/// The hook is sent as keystrokes, so it joins whatever is already on the line. Once
+/// the user starts typing, installation waits for the next empty prompt.
+#[derive(Debug, Default)]
+pub(crate) struct InstallGate {
+    line_editor_seen: bool,
+    line_editor_ready: bool,
+    user_line: UserLine,
+}
+
+impl InstallGate {
+    pub(crate) fn observe_output(&mut self, output: &[u8]) {
+        if let Some(ready) = line_editor_state(output) {
+            self.line_editor_seen = true;
+            self.line_editor_ready = ready;
+            if ready {
+                // The line editor started a new, empty command line.
+                self.user_line = UserLine::Untouched;
+            }
+        }
+    }
+
+    pub(crate) fn observe_input(&mut self, input: &[u8]) {
+        self.user_line = match input.last() {
+            None => self.user_line,
+            // Return submits the line and Ctrl-C abandons it; either way it is gone.
+            Some(b'\r' | b'\n' | 0x03) => UserLine::Submitted,
+            Some(_) => UserLine::Typing,
+        };
+    }
+
+    /// How long output must stay quiet before the hook is typed, or `None` while the
+    /// line belongs to the user.
+    pub(crate) fn delay(&self) -> Option<Duration> {
+        match self.user_line {
+            UserLine::Untouched if self.line_editor_ready => Some(INSTALL_READY_SETTLE),
+            UserLine::Untouched => Some(INSTALL_QUIET_PERIOD),
+            UserLine::Typing => None,
+            // A shell that announces its prompts will announce the next one; others
+            // can only be judged by the output going quiet after the command.
+            UserLine::Submitted if self.line_editor_seen => None,
+            UserLine::Submitted => Some(INSTALL_QUIET_PERIOD),
+        }
     }
 }
 
@@ -145,6 +209,44 @@ mod tests {
             line_editor_state(b"\x1b[?2004l\r\n\x1b[?2004h$ "),
             Some(true)
         );
+    }
+
+    #[test]
+    fn install_waits_for_an_empty_prompt_once_the_user_types() {
+        let mut gate = InstallGate::default();
+        assert_eq!(gate.delay(), Some(INSTALL_QUIET_PERIOD));
+        gate.observe_output(b"\x1b[?2004h~ $ ");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+
+        // Typing claims the line: its echo must not let the hook join the command.
+        gate.observe_input(b"l");
+        gate.observe_output(b"l");
+        assert_eq!(gate.delay(), None);
+        gate.observe_input(b"s\r");
+        gate.observe_output(b"s\r\n\x1b[?2004lfile.txt\r\n");
+        assert_eq!(gate.delay(), None);
+
+        // The next prompt is empty again.
+        gate.observe_output(b"\x1b[?2004h~ $ ");
+        assert_eq!(gate.delay(), Some(INSTALL_READY_SETTLE));
+    }
+
+    #[test]
+    fn shells_without_prompt_signals_install_after_the_typed_line_is_gone() {
+        let mut gate = InstallGate::default();
+        gate.observe_output(b"~ $ ");
+        gate.observe_input(b"pw");
+        gate.observe_output(b"pw");
+        assert_eq!(gate.delay(), None);
+
+        gate.observe_input(b"d\r");
+        gate.observe_output(b"d\r\n/root\r\n~ $ ");
+        assert_eq!(gate.delay(), Some(INSTALL_QUIET_PERIOD));
+
+        gate.observe_input(b"ls");
+        assert_eq!(gate.delay(), None);
+        gate.observe_input(b"\x03");
+        assert_eq!(gate.delay(), Some(INSTALL_QUIET_PERIOD));
     }
 
     #[cfg(unix)]
