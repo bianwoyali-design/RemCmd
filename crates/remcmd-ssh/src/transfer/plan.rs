@@ -168,6 +168,7 @@ mod tests {
             name: crate::remote_path::remote_file_name(path).into(),
             path: path.into(),
             kind,
+            symlink: false,
             size: (kind == RemoteFileKind::File).then_some(12),
             modified: None,
         }

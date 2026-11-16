@@ -22,11 +22,15 @@ use crate::{
     host_key::HostKeyDecision,
     performance::{PerformanceMonitorHandle, ServerPerformanceSnapshot},
     remote_files::{FileCommand, RemoteFiles},
+    shell_integration,
     transport::TransportOpen,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
+/// Short settle once the line editor is reading input, letting a prompt finish
+/// drawing before the hidden hook is typed.
+const SHELL_INTEGRATION_READY_SETTLE: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// Commands sent from the application to one running SSH session.
 ///
@@ -851,6 +855,7 @@ async fn run_connection_plan(
     let mut shell_probe = Box::pin(transport.detect_shell());
     let mut detected_shell = None;
     let mut shell_output_seen = false;
+    let mut line_editor_ready = false;
     let mut shell_integration_deadline = None;
     let mut performance_monitor = None;
 
@@ -910,7 +915,7 @@ async fn run_connection_plan(
                         detected_shell = Some(shell);
                         if shell_output_seen {
                             shell_integration_deadline =
-                                Some(Instant::now() + SHELL_INTEGRATION_QUIET_PERIOD);
+                                Some(shell_integration_delay(line_editor_ready));
                         }
                     }
                     continue;
@@ -939,12 +944,17 @@ async fn run_connection_plan(
                         &shell_event,
                         ShellEvent::Output(_) | ShellEvent::ExtendedOutput { .. }
                     );
-                    if is_output {
+                    if let ShellEvent::Output(data) = &shell_event {
                         shell_output_seen = true;
-                        if detected_shell.is_some() {
-                            shell_integration_deadline =
-                                Some(Instant::now() + SHELL_INTEGRATION_QUIET_PERIOD);
+                        if let Some(ready) = shell_integration::line_editor_state(data) {
+                            line_editor_ready = ready;
                         }
+                    } else if is_output {
+                        shell_output_seen = true;
+                    }
+                    if is_output && detected_shell.is_some() {
+                        shell_integration_deadline =
+                            Some(shell_integration_delay(line_editor_ready));
                     }
 
                     if events
@@ -1021,6 +1031,18 @@ async fn run_connection_plan(
             }
         }
     }
+}
+
+/// Waits for a quiet period unless the line editor already reported that it is
+/// reading a command line; typing the hook earlier lets a slow first prompt
+/// expose its echo after the hidden-output window closes.
+fn shell_integration_delay(line_editor_ready: bool) -> Instant {
+    Instant::now()
+        + if line_editor_ready {
+            SHELL_INTEGRATION_READY_SETTLE
+        } else {
+            SHELL_INTEGRATION_QUIET_PERIOD
+        }
 }
 
 async fn send_state(events: &mpsc::Sender<ConnectionEvent>, state: SessionState) -> bool {

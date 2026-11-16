@@ -23,6 +23,7 @@ fn entry(name: &str, kind: RemoteFileKind) -> RemoteFileEntry {
         name: name.into(),
         path: format!("/home/test/{name}"),
         kind,
+        symlink: false,
         size: None,
         modified: None,
     }
@@ -82,7 +83,19 @@ struct TestSftpServer {
     directory_reads: HashSet<String>,
     directories: Arc<Mutex<HashSet<String>>>,
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    links: Arc<Mutex<HashMap<String, String>>>,
     read_offsets: Arc<Mutex<Vec<u64>>>,
+}
+
+impl TestSftpServer {
+    fn follow_link(&self, path: String) -> String {
+        self.links
+            .lock()
+            .unwrap()
+            .get(&path)
+            .cloned()
+            .unwrap_or(path)
+    }
 }
 
 impl Default for TestSftpServer {
@@ -95,6 +108,7 @@ impl Default for TestSftpServer {
                 "/home/test/projects".into(),
             ]))),
             files: Arc::new(Mutex::new(files)),
+            links: Arc::new(Mutex::new(HashMap::new())),
             read_offsets: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -119,7 +133,7 @@ impl server::Handler for TestSftpServer {
         let path = if path == "." {
             "/home/test".into()
         } else {
-            path
+            self.follow_link(path)
         };
         Ok(Name {
             id,
@@ -128,8 +142,9 @@ impl server::Handler for TestSftpServer {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let path = self.follow_link(path);
         if self.directories.lock().unwrap().contains(&path) {
-            let mut attrs = FileAttributes::default();
+            let mut attrs = FileAttributes::empty();
             attrs.set_dir(true);
             return Ok(Attrs { id, attrs });
         }
@@ -137,15 +152,20 @@ impl server::Handler for TestSftpServer {
         let Some(contents) = files.get(&path) else {
             return Err(StatusCode::NoSuchFile);
         };
-        let mut attrs = FileAttributes::default();
+        let mut attrs = FileAttributes::empty();
         attrs.set_regular(true);
         attrs.size = Some(contents.len() as u64);
         Ok(Attrs { id, attrs })
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        if self.links.lock().unwrap().contains_key(&path) {
+            let mut attrs = FileAttributes::empty();
+            attrs.set_symlink(true);
+            return Ok(Attrs { id, attrs });
+        }
         if self.directories.lock().unwrap().contains(&path) {
-            let mut attrs = FileAttributes::default();
+            let mut attrs = FileAttributes::empty();
             attrs.set_dir(true);
             return Ok(Attrs { id, attrs });
         }
@@ -153,7 +173,7 @@ impl server::Handler for TestSftpServer {
         let Some(contents) = files.get(&path) else {
             return Err(StatusCode::NoSuchFile);
         };
-        let mut attrs = FileAttributes::default();
+        let mut attrs = FileAttributes::empty();
         attrs.set_regular(true);
         attrs.size = Some(contents.len() as u64);
         Ok(Attrs { id, attrs })
@@ -222,6 +242,9 @@ impl server::Handler for TestSftpServer {
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        if self.links.lock().unwrap().remove(&filename).is_some() {
+            return Ok(ok_status(id));
+        }
         if self.files.lock().unwrap().remove(&filename).is_none() {
             return Err(StatusCode::NoSuchFile);
         }
@@ -300,7 +323,7 @@ impl server::Handler for TestSftpServer {
             .filter_map(|path| {
                 let name = path.strip_prefix(&prefix)?;
                 (!name.is_empty() && !name.contains('/')).then(|| {
-                    let mut attrs = FileAttributes::default();
+                    let mut attrs = FileAttributes::empty();
                     attrs.set_dir(true);
                     File::new(name, attrs)
                 })
@@ -314,7 +337,7 @@ impl server::Handler for TestSftpServer {
                 .filter_map(|(path, contents)| {
                     let name = path.strip_prefix(&prefix)?;
                     (!name.is_empty() && !name.contains('/')).then(|| {
-                        let mut attrs = FileAttributes::default();
+                        let mut attrs = FileAttributes::empty();
                         attrs.set_regular(true);
                         attrs.size = Some(contents.len() as u64);
                         attrs.mtime = Some(1_700_000_000);
@@ -322,6 +345,15 @@ impl server::Handler for TestSftpServer {
                     })
                 }),
         );
+        files.extend(self.links.lock().unwrap().keys().filter_map(|path| {
+            let name = path.strip_prefix(&prefix)?;
+            (!name.is_empty() && !name.contains('/')).then(|| {
+                let mut attrs = FileAttributes::empty();
+                attrs.set_symlink(true);
+                attrs.size = Some(path.len() as u64);
+                File::new(name, attrs)
+            })
+        }));
 
         Ok(Name { id, files })
     }
@@ -344,9 +376,11 @@ fn ok_status(id: u32) -> Status {
 async fn reads_and_maps_a_remote_directory_over_sftp() {
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     server::run(server_stream, TestSftpServer::default()).await;
-    let session = SftpSession::new(client_stream)
-        .await
-        .expect("SFTP client should initialize");
+    let session = Arc::new(
+        SftpSession::new(client_stream)
+            .await
+            .expect("SFTP client should initialize"),
+    );
 
     let directory = read_directory(&session, ".".into())
         .await
@@ -381,7 +415,7 @@ async fn recursively_reads_regular_files_and_preserves_empty_directories() {
     ]);
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     server::run(server_stream, server).await;
-    let session = SftpSession::new(client_stream).await.unwrap();
+    let session = Arc::new(SftpSession::new(client_stream).await.unwrap());
 
     let tree = read_directory_tree(&session, "/home/test".into())
         .await
@@ -452,6 +486,95 @@ async fn creates_and_recursively_deletes_remote_items() {
             .unwrap()
             .iter()
             .any(|path| path.starts_with("/home/test/new"))
+    );
+}
+
+#[tokio::test]
+async fn symlinks_resolve_to_their_target_kind() {
+    let server = TestSftpServer::default();
+    server.links.lock().unwrap().extend([
+        ("/home/test/linked-dir".into(), "/home/test/projects".into()),
+        (
+            "/home/test/linked-notes".into(),
+            "/home/test/notes.txt".into(),
+        ),
+        ("/home/test/broken".into(), "/home/test/missing".into()),
+    ]);
+    let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    server::run(server_stream, server).await;
+    let session = Arc::new(SftpSession::new(client_stream).await.unwrap());
+
+    let directory = read_directory(&session, "/home/test".into()).await.unwrap();
+    let summary = directory
+        .entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.kind, entry.symlink, entry.size))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        summary,
+        vec![
+            ("linked-dir", RemoteFileKind::Directory, true, None),
+            ("projects", RemoteFileKind::Directory, false, None),
+            ("broken", RemoteFileKind::Symlink, true, Some(17)),
+            (
+                "linked-notes",
+                RemoteFileKind::File,
+                true,
+                Some(b"original contents".len() as u64)
+            ),
+            (
+                "notes.txt",
+                RemoteFileKind::File,
+                false,
+                Some(b"original contents".len() as u64)
+            ),
+        ]
+    );
+
+    let tree = read_directory_tree(&session, "/home/test".into())
+        .await
+        .unwrap();
+    assert_eq!(tree.directories, vec!["/home/test/projects".to_owned()]);
+    assert_eq!(
+        tree.files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/home/test/linked-notes", "/home/test/notes.txt"]
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_symlink_keeps_its_target() {
+    let server = TestSftpServer::default();
+    let directories = server.directories.clone();
+    let files = server.files.clone();
+    let links = server.links.clone();
+    server
+        .files
+        .lock()
+        .unwrap()
+        .insert("/home/test/projects/keep.txt".into(), b"keep".to_vec());
+    links
+        .lock()
+        .unwrap()
+        .insert("/home/test/linked-dir".into(), "/home/test/projects".into());
+    let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    server::run(server_stream, server).await;
+    let session = SftpSession::new(client_stream).await.unwrap();
+
+    delete_paths(&session, &["/home/test/linked-dir".into()])
+        .await
+        .unwrap();
+
+    assert!(links.lock().unwrap().is_empty());
+    assert!(directories.lock().unwrap().contains("/home/test/projects"));
+    assert!(
+        files
+            .lock()
+            .unwrap()
+            .contains_key("/home/test/projects/keep.txt")
     );
 }
 

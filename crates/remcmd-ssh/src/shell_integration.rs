@@ -47,7 +47,24 @@ pub(crate) fn install_command_for_shell(shell: ShellKind, ready_command: &str) -
         ShellKind::Zsh => ZSH_INSTALL_COMMAND,
         ShellKind::Ash => ASH_INSTALL_COMMAND,
     };
-    format!(" eval {}\r {ready_command}", shell_single_quote(hook))
+    // One command line: a second line would wait for another prompt render
+    // (for example Starship's precmd) before reporting readiness.
+    format!(" eval {}; {ready_command}", shell_single_quote(hook))
+}
+
+/// Reports whether the latest bracketed-paste mode change in `output` turned it
+/// on. zsh's ZLE and bash 5.1+ readline enable it only while waiting for a
+/// command line, so it marks a prompt that is ready to accept hidden input.
+pub(crate) fn line_editor_state(output: &[u8]) -> Option<bool> {
+    let last = |needle: &[u8]| {
+        output
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    };
+    match (last(b"\x1b[?2004h"), last(b"\x1b[?2004l")) {
+        (None, None) => None,
+        (enabled, disabled) => Some(enabled > disabled),
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -106,6 +123,28 @@ mod tests {
         let ash = install_command_for_shell(ShellKind::Ash, ":");
         assert!(ash.contains("cd(){"));
         assert!(!ash.contains("PROMPT_COMMAND"));
+    }
+
+    #[test]
+    fn shell_specific_install_reports_readiness_on_the_same_command_line() {
+        let command = install_command_for_shell(ShellKind::Zsh, "printf ready\r");
+
+        assert_eq!(command.matches('\r').count(), 1);
+        assert!(command.ends_with("; printf ready\r"));
+    }
+
+    #[test]
+    fn line_editor_state_follows_the_latest_bracketed_paste_change() {
+        assert_eq!(line_editor_state(b"Last login: today\r\n"), None);
+        assert_eq!(line_editor_state(b"\x1b[?2004h~ \xe2\x9d\xaf "), Some(true));
+        assert_eq!(
+            line_editor_state(b"\x1b[?2004h\r\n\x1b[?2004l"),
+            Some(false)
+        );
+        assert_eq!(
+            line_editor_state(b"\x1b[?2004l\r\n\x1b[?2004h$ "),
+            Some(true)
+        );
     }
 
     #[cfg(unix)]

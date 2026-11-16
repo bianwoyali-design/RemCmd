@@ -1675,7 +1675,7 @@ impl RemCmdApp {
                 if let Some(session) = self.session_mut(session_id) {
                     session.performance.update(snapshot, Instant::now());
                 }
-                true
+                self.performance_is_rendered(session_id)
             }
             ConnectionEvent::PerformanceFailed(error) => {
                 let message = format!(
@@ -1688,7 +1688,7 @@ impl RemCmdApp {
                     session.performance.loading = false;
                     session.performance.error = Some(message);
                 }
-                true
+                self.performance_is_rendered(session_id)
             }
             ConnectionEvent::Resized(size) => {
                 let dimensions_changed = self

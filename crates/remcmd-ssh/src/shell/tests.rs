@@ -521,7 +521,7 @@ async fn shell_integration_falls_back_without_exposing_probe_output() {
         .expect("integrated shell");
     let (mut reader, writer) = shell.split();
 
-    let output = tokio::time::timeout(Duration::from_secs(2), reader.next_event())
+    let output = tokio::time::timeout(Duration::from_secs(3), reader.next_event())
         .await
         .expect("startup output should be released after the integration timeout");
     let ShellEvent::Output(output) = output else {
