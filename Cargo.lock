@@ -5331,7 +5331,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remcmd-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "directories",
@@ -5360,7 +5360,7 @@ dependencies = [
 
 [[package]]
 name = "remcmd-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5368,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "remcmd-diagnostics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "directories",
@@ -5386,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "remcmd-local"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "portable-pty",
  "remcmd-core",
@@ -5395,7 +5395,7 @@ dependencies = [
 
 [[package]]
 name = "remcmd-ssh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "directories",
@@ -5412,7 +5412,7 @@ dependencies = [
 
 [[package]]
 name = "remcmd-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "glob",
@@ -5428,14 +5428,14 @@ dependencies = [
 
 [[package]]
 name = "remcmd-terminal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
 ]
 
 [[package]]
 name = "remcmd-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "semver",

@@ -4,6 +4,8 @@ All notable changes to RemCmd are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-15
+
 ### Added
 
 - A Spotlight-style search panel on macOS, Windows, and Linux that finds open
@@ -13,6 +15,15 @@ All notable changes to RemCmd are documented in this file.
 - Previous and next terminal commands (Cmd+Shift+[ / Cmd+Shift+] and
   Ctrl+Tab / Ctrl+Shift+Tab), and a Close Other Terminals tab menu item.
 - Name, Date Modified, and Size columns in the SFTP file list.
+- SFTP listings follow symbolic links: a linked folder opens and a linked file
+  edits like its target, both carry an alias badge, and broken links stay
+  visible so they can be copied or deleted. Deleting a link removes the link,
+  not its target.
+- CPU, memory, and network history charts and per-core usage gauges in the
+  performance panel.
+- A scroll indicator in SFTP file lists that appears under the pointer, can be
+  dragged, and jumps when its track is clicked.
+- A way back to Settings from Software Update.
 
 ### Changed
 
@@ -26,16 +37,46 @@ All notable changes to RemCmd are documented in this file.
   Connections header, and shows each connection's new-terminal button on hover
   or selection.
 - Refreshed control, tab, and accent colours in light and dark themes.
+- A new app icon: a command prompt with a mint cursor over signal rings. On
+  macOS before 26 the icon now keeps the standard margin and shadow instead of
+  filling its canvas.
+- All in-app icons are redrawn in one style, with soft fills marking the part
+  each icon is about.
+- Opening, closing, and switching titlebar tabs is animated with motion that
+  continues smoothly when interrupted. Tab titles are centred with their icon,
+  and the selected tab scrolls into view.
+- Settings is centred again and groups Software Update, Diagnostics, and
+  OpenSSH import together.
+- Connection status stays at the trailing edge of the toolbar, and the SFTP
+  toolbar separates navigation, transfers, and delete.
+- The bottom panel puts its collapse control on the first row and runs the
+  quick terminal edge to edge.
 
 ### Removed
 
 - The inline sidebar connection search, replaced by the Spotlight panel.
+
+### Fixed
+
+- The shell integration that reports the working directory no longer types
+  itself into a command you have started entering, or into a program you
+  launched before it was installed.
+- Undo and redo in the remote file editor keep the scrollable height in step
+  with the text.
+- Long paths on the OpenSSH import page and narrow Diagnostics filter rows stay
+  inside their panels.
 
 ### Performance
 
 - A focused text field or the remote file editor no longer redraws the whole
   window on every caret blink; the window now redraws only when text changes.
 - Closed Settings pickers no longer build their option lists on every frame.
+- Scrolling SFTP lists, the transfer queue, and the remote file editor does far
+  less work per frame, most noticeably in large folders and large files.
+- Accessibility information is updated incrementally instead of being rebuilt
+  on every frame.
+- Performance sampling reads all counters in one remote process, and its
+  events only redraw the window while the panel is showing.
 
 ## [0.1.0] - 2026-09-08
 
@@ -158,6 +199,7 @@ All notable changes to RemCmd are documented in this file.
 - Windows alpha installers are not yet Authenticode-signed.
 - SFTP features require an SFTP subsystem on the remote server.
 
-[0.1.0]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-beta.1...HEAD
+[0.1.1]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-beta.1...v0.1.0
 [0.1.0-beta.1]: https://github.com/bianwoyali-design/RemCmd/compare/v0.1.0-alpha.1...v0.1.0-beta.1
 [0.1.0-alpha.1]: https://github.com/bianwoyali-design/RemCmd/releases/tag/v0.1.0-alpha.1
