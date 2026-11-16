@@ -3,7 +3,9 @@ use super::super::{
     ScrollHandle, SessionId, SftpOperation, SftpTransferDirection, SharedString, TextField,
     UniformListScrollHandle,
 };
-use remcmd_ssh::remote_path::{remote_file_name, remote_path_depth, remote_path_is_descendant};
+use remcmd_ssh::remote_path::{
+    remote_file_name, remote_join_path, remote_path_depth, remote_path_is_descendant,
+};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -156,9 +158,17 @@ impl SftpBrowserState {
         directory: RemoteDirectory,
     ) -> bool {
         if let Some(requested_path) = self.tree_requests.remove(&request_id) {
-            // Keep children under the row that requested them; a linked directory
-            // canonicalizes to its target path.
-            self.tree_entries.insert(requested_path, directory.entries);
+            // Keep children under the row that requested them. A linked directory
+            // canonicalizes to its target, so its children are re-rooted on the link:
+            // downloads then keep the folder the tree shows, and a child still counts
+            // as nested in the link. The server resolves the link in either path.
+            let mut entries = directory.entries;
+            if directory.path != requested_path {
+                for entry in &mut entries {
+                    entry.path = remote_join_path(&requested_path, &entry.name);
+                }
+            }
+            self.tree_entries.insert(requested_path, entries);
             self.invalidate_list_rows();
             self.clear_error();
             return true;
@@ -1218,6 +1228,45 @@ mod tests {
         browser.expand_loaded("/home/test/projects".into());
         assert_eq!(browser.list_rows(false).len(), 1);
         assert!(!browser.list_rows(false)[0].expanded);
+    }
+
+    #[test]
+    fn linked_directory_children_stay_under_the_link_in_the_tree() {
+        let mut link = remote_entry("/home/test/shared", RemoteFileKind::Directory);
+        link.symlink = true;
+        let mut browser = SftpBrowserState {
+            path: "/home/test".into(),
+            entries: vec![link.clone()],
+            ..SftpBrowserState::default()
+        };
+
+        let request_id = browser.begin_tree_request("/home/test/shared".into());
+        assert!(browser.complete_request(
+            request_id,
+            RemoteDirectory {
+                // The server reports the link's target, which lies outside the browser root.
+                path: "/srv/shared".into(),
+                entries: vec![remote_entry("/srv/shared/report.txt", RemoteFileKind::File)],
+            },
+        ));
+
+        let child = browser.list_rows(true)[1].clone();
+        assert_eq!(child.path.as_ref(), "/home/test/shared/report.txt");
+        assert_eq!(child.depth, 1);
+        // A download keeps the folder the tree shows instead of dropping to the file name.
+        assert_eq!(
+            remcmd_ssh::remote_path::remote_relative_path("/home/test", &child.path),
+            Some("shared/report.txt")
+        );
+        // Selecting the link together with its child transfers the child once.
+        let child_entry = browser
+            .entry("/home/test/shared/report.txt")
+            .cloned()
+            .expect("the child is addressed by its tree path");
+        assert_eq!(
+            collapse_nested_remote_entries(vec![link.clone(), child_entry]),
+            vec![link]
+        );
     }
 
     #[test]
